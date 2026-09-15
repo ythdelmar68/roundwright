@@ -27,6 +27,80 @@ ISSUE = re.compile(r"#1(?:1[2-9]|20)\Z")
 DISPOSITIONS = frozenset({"adopt", "reframe", "merge", "defer", "retire"})
 STATUSES = frozenset({"proposed", "blocked", "owner-routed"})
 CONFIDENCES = frozenset({"low", "medium", "high"})
+ISSUE_136_REQUIREMENTS = {
+    "issue": "136",
+    "destinations": [
+        "trusted-advisory-admission", "accepted-guidance-resolution",
+        "typed-advisory-configuration", "public-safe-advisory-qualification",
+    ],
+}
+ISSUE_136_ARTIFACTS = {
+    "advisory-policy-v3": "src/roundwright/role_capability_policy.py",
+    "advisory-policy-adversarial-tests-v2": "tests/test_role_capability_policy.py",
+    "advisory-role-budget-ledger-tests-v1": "tests/test_role_budget_ledger.py",
+    "advisory-migration-v2": "docs/migration/issue-136-trusted-advisory-role-coverage.md",
+    "advisory-authority-model-v2": "docs/architecture/authority-model.md",
+    "advisory-configuration-v1": "src/roundwright/configuration.py",
+    "advisory-worker-seam-v1": "src/roundwright/codex_worker.py",
+    "advisory-worker-seam-tests-v1": "tests/test_codex_worker.py",
+    "advisory-supervisor-seam-v1": "src/roundwright/codex_supervisor.py",
+    "advisory-dependency-review-seam-v1": "src/roundwright/codex_dependency_review.py",
+    "advisory-native-supervisor-bridge-v1": "src/roundwright/supervisor_toolbox.py",
+    "advisory-native-supervisor-bridge-tests-v1": "tests/test_codex_supervisor.py",
+    "advisory-native-dependency-review-bridge-v1": "src/roundwright/dependency_review_toolbox.py",
+    "advisory-native-dependency-review-bridge-tests-v1": "tests/test_codex_dependency_review.py",
+    "advisory-provider-attempt-runtime-v1": "src/roundwright/provider_attempt_runtime.py",
+    "advisory-provider-attempt-runtime-tests-v1": "tests/test_provider_attempt_runtime.py",
+    "advisory-worker-toolbox-v1": "src/roundwright/worker_toolbox.py",
+    "advisory-worker-toolbox-tests-v1": "tests/test_worker_toolbox.py",
+    "advisory-worker-shadow-v1": "src/roundwright/worker_shadow.py",
+    "advisory-worker-shadow-tests-v1": "tests/test_worker_shadow.py",
+    "advisory-supervisor-shadow-v1": "src/roundwright/supervisor_shadow.py",
+    "advisory-external-validation-v1": "src/roundwright/external_validation.py",
+    "advisory-external-validation-tests-v1": "tests/test_external_validation.py",
+    "advisory-runtime-defaults-v1": "src/roundwright/runtime-defaults.toml",
+    "advisory-runtime-defaults-tests-v1": "tests/test_configuration.py",
+    "advisory-coding-tools-v1": "src/roundwright/coding_tools.py",
+    "advisory-coding-tools-tests-v1": "tests/test_coding_tools.py",
+    "advisory-production-coding-runtime-tests-v1": "tests/test_production_coding_runtime.py",
+    "advisory-admission-fixture-v1": "tests/role_admission_fixture.py",
+    "advisory-semantic-receipt-runner-v1": "ci/phase5_semantic_receipt.py",
+    "advisory-qualification-validator-v1": "ci/validate_phase5_coverage.py",
+    "advisory-qualification-validator-tests-v1": "tests/test_phase5_coverage.py",
+}
+
+# Hashes establish candidate inventory, but do not by themselves establish
+# that the listed artifacts still enforce the Phase 5 boundary.  These named
+# assertions bind the read-back to the exact executable semantic contracts and
+# adversarial tests that must remain present on the candidate.
+SEMANTIC_CONTRACTS = {
+    "src/roundwright/worker_toolbox.py": (
+        "require_external_production_activation()",
+        "class ProductionCodingWorkerRuntime",
+        "production coding activation is unavailable",
+    ),
+    "src/roundwright/coding_tools.py": (
+        "TEST_INPUT_SET", "NETWORK", "RESOURCE",
+        "bounded coding scope root is invalid",
+        "_require_static_validation_descriptors",
+    ),
+    "src/roundwright/role_capability_policy.py": (
+        "class TrustedProviderLaunchContext",
+        "_authenticated_payload",
+        "trusted provider launch context is immutable",
+        "role effect descriptors are not admitted",
+    ),
+    "tests/test_production_coding_runtime.py": (
+        "test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
+        "test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
+    ),
+    "tests/test_coding_tools.py": (
+        "test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
+    ),
+    "tests/test_worker_toolbox.py": (
+        "test_sealed_launch_context_rejects_coherent_public_instruction_mutation",
+    ),
+}
 
 # This is intentionally independent of the rendered map.  Adding, dropping,
 # or reassigning a selected identifier requires a reviewed code change.
@@ -205,8 +279,20 @@ def _require_current_candidate(candidate: str) -> None:
 
 def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     document = _read_json(source)
-    if set(document) != {"schema", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
+    if set(document) != {"schema", "implementation_requirements", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
         raise CoverageError("coverage map schema is invalid")
+    requirements = document["implementation_requirements"]
+    if type(requirements) is not dict or {key: requirements.get(key) for key in ("issue", "destinations")} != ISSUE_136_REQUIREMENTS:
+        raise CoverageError("issue 136 implementation coverage has drifted")
+    artifacts = requirements.get("artifacts")
+    if type(artifacts) is not list or {item.get("identity"): item.get("path") for item in artifacts if type(item) is dict} != ISSUE_136_ARTIFACTS or len(artifacts) != len(ISSUE_136_ARTIFACTS):
+        raise CoverageError("issue 136 artifact identities have drifted")
+    for artifact in artifacts:
+        if set(artifact) != {"identity", "path", "sha256"} or type(artifact["sha256"]) is not str or not SHA256.fullmatch(artifact["sha256"]):
+            raise CoverageError("issue 136 artifact digest is invalid")
+        if _git_blob_sha256(artifact["path"]) != artifact["sha256"]:
+            raise CoverageError("issue 136 artifact digest has drifted")
+    _validate_semantic_contracts()
     if type(document["sources"]) is not dict or set(document["sources"]) != {"ledger_sha256", "test_disposition_sha256"}:
         raise CoverageError("coverage source bindings are invalid")
     source_bindings = document["sources"]
@@ -264,19 +350,74 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     return document
 
 
-def render(source: Path, ledger: Path, tests: Path, candidate: str, output: Path) -> None:
+def _validate_semantic_contracts() -> None:
+    """Fail closed if candidate code or its adversarial tests lose a boundary."""
+    for relative_path, markers in SEMANTIC_CONTRACTS.items():
+        try:
+            source = (ROOT / relative_path).read_text(encoding="utf-8")
+        except OSError as error:
+            raise CoverageError("Phase 5 semantic contract is unavailable") from error
+        if any(marker not in source for marker in markers):
+            raise CoverageError("Phase 5 semantic contract has drifted")
+
+
+def _semantic_contract_digest() -> str:
+    """Candidate-local identity of every required executable/test contract."""
+    payload = {
+        relative_path: {
+            "markers": markers,
+            "sha256": _canonical_source_digest(ROOT / relative_path),
+        }
+        for relative_path, markers in sorted(SEMANTIC_CONTRACTS.items())
+    }
+    return _digest(_canonical(payload))
+
+
+_SEMANTIC_TESTS = (
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
+    "tests.test_worker_toolbox.WorkerToolboxTests.test_sealed_launch_context_rejects_coherent_public_instruction_mutation",
+    "tests.test_coding_tools.BoundedCodingToolsTests.test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
+    "tests.test_role_capability_policy.RoleCapabilityPolicyTests.test_scope_traversal_unknown_descriptors_and_capability_expansion_fail_closed",
+)
+
+def _semantic_execution(path: Path, candidate: str) -> str:
+    try:
+        actual = _read_json(path)
+    except CoverageError as error:
+        raise CoverageError("Phase 5 semantic execution receipt is unavailable") from error
+    payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": list(_SEMANTIC_TESTS), "status": "passed"}
+    if actual != {**payload, "receipt_digest": "sha256:" + _digest(_canonical(payload))}:
+        raise CoverageError("Phase 5 semantic execution receipt is stale or forged")
+    return actual["receipt_digest"]
+
+
+def _git_blob_sha256(relative_path: object) -> str:
+    """Hash the tracked Git blob, never platform-transformed checkout bytes."""
+    if type(relative_path) is not str or not relative_path or relative_path.startswith("/") or "\\" in relative_path or ".." in relative_path.split("/"):
+        raise CoverageError("issue 136 artifact path is invalid")
+    try:
+        result = subprocess.run(["git", "-C", str(ROOT), "show", f"HEAD:{relative_path}"], check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError as error:
+        raise CoverageError("issue 136 artifact Git content is unavailable") from error
+    if result.returncode:
+        raise CoverageError("issue 136 artifact Git content is unavailable")
+    return hashlib.sha256(result.stdout).hexdigest()
+
+
+def render(source: Path, ledger: Path, tests: Path, candidate: str, output: Path, semantic_receipt: Path) -> None:
     _require_current_candidate(candidate)
     document = validate(source, ledger, tests)
-    payload = {"schema": "roundwright-phase5-coverage-readback/v1", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "items": document["items"]}
+    payload = {"schema": "roundwright-phase5-coverage-readback/v2", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "semantic_contract_digest": _semantic_contract_digest(), "semantic_execution_receipt": _semantic_execution(semantic_receipt,candidate), "items": document["items"]}
     receipt = {**payload, "coverage_digest": _digest(_canonical(payload))}
     output.write_bytes(_canonical(receipt) + b"\n")
 
 
-def verify(source: Path, ledger: Path, tests: Path, candidate: str, manifest: Path) -> None:
+def verify(source: Path, ledger: Path, tests: Path, candidate: str, manifest: Path, semantic_receipt: Path) -> None:
     _require_current_candidate(candidate)
     document = validate(source, ledger, tests)
     actual = _read_json(manifest)
-    payload = {"schema": "roundwright-phase5-coverage-readback/v1", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "items": document["items"]}
+    payload = {"schema": "roundwright-phase5-coverage-readback/v2", "candidate_sha": candidate, "source_digest": _digest(_canonical(document)), "semantic_contract_digest": _semantic_contract_digest(), "semantic_execution_receipt": _semantic_execution(semantic_receipt,candidate), "items": document["items"]}
     expected = {**payload, "coverage_digest": _digest(_canonical(payload))}
     if actual != expected:
         raise CoverageError("candidate-bound coverage manifest does not match")
@@ -291,17 +432,18 @@ def main() -> int:
     parser.add_argument("--candidate")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--semantic-receipt", type=Path)
     arguments = parser.parse_args()
     if arguments.operation == "validate":
         validate(arguments.source, arguments.ledger, arguments.tests)
     elif arguments.operation == "render":
-        if not arguments.candidate or arguments.output is None:
+        if not arguments.candidate or arguments.output is None or arguments.semantic_receipt is None:
             raise CoverageError("render requires a candidate and output")
-        render(arguments.source, arguments.ledger, arguments.tests, arguments.candidate, arguments.output)
+        render(arguments.source, arguments.ledger, arguments.tests, arguments.candidate, arguments.output, arguments.semantic_receipt)
     else:
-        if not arguments.candidate or arguments.manifest is None:
+        if not arguments.candidate or arguments.manifest is None or arguments.semantic_receipt is None:
             raise CoverageError("verify requires a candidate and manifest")
-        verify(arguments.source, arguments.ledger, arguments.tests, arguments.candidate, arguments.manifest)
+        verify(arguments.source, arguments.ledger, arguments.tests, arguments.candidate, arguments.manifest, arguments.semantic_receipt)
     return 0
 
 

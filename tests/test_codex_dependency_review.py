@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from roundwright.codex_dependency_review import (
     CodexDependencyReviewAdapter, DependencyReviewRequest, DependencyReviewResultKind, DependencyReviewService,
-    NativeDependencyReviewResponse,
+    NativeDependencyReviewResponse, DependencyReviewDispatchError, prepare_dependency_review_host,
 )
 from roundwright.dependency_review_toolbox import (
     HarnessNativeCodexDependencyReviewBackend, _Turn, _schema,
@@ -30,9 +31,11 @@ from roundwright.dependency_review import (
     EdgeKind, ProposedEdge, RequestedDisposition, SourceOwnedRelation, DependencyReviewStore,
 )
 from roundwright.git_identity import acquire_transition_lease
-from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
+from tests.role_admission_fixture import independent_execution, sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
 
 def digest(character: str) -> str:
@@ -77,6 +80,40 @@ class Backend:
 
 
 class DependencyReviewServiceTests(unittest.TestCase):
+    @staticmethod
+    def admission(profile):
+        return sealed_execution(AdvisoryRole.DEPENDENCY_REVIEW, profile)
+
+    @staticmethod
+    def expectation(profile):
+        return independent_execution(AdvisoryRole.DEPENDENCY_REVIEW, profile)
+
+    def launch_context(self, repository, profile):
+        return trusted_provider_launch_context(
+            self.admission(profile), cwd=repository.root,
+        )
+
+    def effect_kwargs(self, repository, subset, binding, adapter, *, attempt_id, source_owned_relations=()):
+        material = DependencyReviewStore().model_input(
+            subset, attempt_id=attempt_id, profile_identity=binding.profile_identity,
+            source_owned_relations=source_owned_relations,
+        )
+        request = DependencyReviewRequest(
+            attempt_id, material,
+            "sha256:" + hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest(),
+            binding.profile_identity,
+        )
+        request_material, preflight_material = adapter.effect_material(request)
+        return {
+            "advisory_execution": sealed_execution_for_effect(
+                AdvisoryRole.DEPENDENCY_REVIEW, adapter._profile,
+                request_identity=attempt_id, request_material=request_material,
+                preflight_material=preflight_material,
+            ),
+            "execution_host": trusted_execution_host(AdvisoryRole.DEPENDENCY_REVIEW, adapter._profile),
+            "budget_ledger_path": repository.root / f"{attempt_id}-role-budget.sqlite",
+        }
+
     def repository(self, root: Path) -> RepositoryIdentity:
         repository = object.__new__(RepositoryIdentity)
         object.__setattr__(repository, "root", root.resolve())
@@ -118,7 +155,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
         )
         self.assertNotIn("const", str(schema))
 
-    def test_native_bridge_uses_supported_ephemeral_read_only_controls_without_an_opaque_tools_override(self) -> None:
+    def test_injected_native_factory_cannot_bypass_not_activated(self) -> None:
         session_calls: list[dict[str, object]] = []
         turn_calls: list[tuple[dict[str, object], dict[str, object]]] = []
 
@@ -143,25 +180,24 @@ class DependencyReviewServiceTests(unittest.TestCase):
             backend = HarnessNativeCodexDependencyReviewBackend(
                 cwd=repository.root, completion=CompletionDeadline(100, 600), codex_factory=Codex,
                 approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+                launch_context=self.launch_context(repository, profile),
             )
-            session = backend.open_fresh_session(profile)
-            try:
-                material = {"schema": "roundwright-dependency-review-input/v1"}
-                input_digest = "sha256:" + hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
-                session.start_turn(DependencyReviewRequest("attempt-116", material, input_digest, audit.profile_identity))
-                self.assertEqual(session_calls[0]["approval_mode"], "deny-all")
-                self.assertEqual(session_calls[0]["sandbox"], "read-only")
-                self.assertTrue(session_calls[0]["ephemeral"])
-                self.assertNotEqual(Path(session_calls[0]["cwd"]), repository.root)
-                self.assertIn("Deny all tools", session_calls[0]["developer_instructions"])
-                self.assertFalse({"tools", "tool_choice", "config"} & set(session_calls[0]))
-                prompt, controls = turn_calls[0]
-                self.assertEqual(prompt["capability_contract"], "behavioral-zero-tool-use/v1")
-                self.assertNotIn("tools", prompt)
-                self.assertFalse({"tools", "tool_choice", "config"} & set(controls))
-                self.assertEqual((controls["approval_mode"], controls["sandbox"], controls["cwd"]), ("deny-all", "read-only", str(session.cwd)))
-            finally:
-                session.close()
+            with self.assertRaisesRegex(CodexAdapterError, "sdk-incompatible"):
+                backend.open_fresh_session(profile)
+            self.assertEqual(session_calls, [])
+            self.assertEqual(turn_calls, [])
+
+    def test_native_dependency_review_requires_a_sealed_launch_context_before_factory_creation(self) -> None:
+        calls = []
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, _subset, _binding, _profile, _audit = self.setup(Path(temporary))
+            with self.assertRaises(TypeError):
+                HarnessNativeCodexDependencyReviewBackend(
+                    cwd=repository.root, completion=CompletionDeadline(100, 600),
+                    codex_factory=lambda: calls.append("factory"),
+                    approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+                )
+        self.assertEqual(calls, [])
 
     def test_native_bridge_rejects_every_tool_event_before_accepting_schema_output(self) -> None:
         class Handle:
@@ -208,7 +244,8 @@ class DependencyReviewServiceTests(unittest.TestCase):
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116")))
             adapter = CodexDependencyReviewAdapter(backend, profile, audit)
-            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda session: self.assertEqual(session, "session-116"), checkpoint_turn=lambda session, turn: self.assertEqual((session, turn), ("session-116", "turn-116")), source_owned_relations=(SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),))
+            relations = (SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),)
+            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda session: self.assertEqual(session, "session-116"), checkpoint_turn=lambda session, turn: self.assertEqual((session, turn), ("session-116", "turn-116")), source_owned_relations=relations, **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116", source_owned_relations=relations))
             self.assertEqual(result.kind, DependencyReviewResultKind.ACCEPTED)
             self.assertEqual(len(backend.sessions), 1)
             request = backend.sessions[0].requests[0]
@@ -237,9 +274,10 @@ class DependencyReviewServiceTests(unittest.TestCase):
             ))
             result = DependencyReviewService().run(
                 repository, subset, attempt_id="attempt-116", binding=binding,
-                adapter=CodexDependencyReviewAdapter(backend, profile, audit),
+                adapter=(adapter := CodexDependencyReviewAdapter(backend, profile, audit)),
                 checkpoint_session=lambda _session: None,
                 checkpoint_turn=lambda _session, _turn: None,
+                **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
             )
             self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.INVALID, "tool-event-observed"))
             snapshot = DependencyReviewStore().terminal_snapshot(repository, attempt_id="attempt-116", binding=binding)
@@ -253,7 +291,8 @@ class DependencyReviewServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
-            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=CodexDependencyReviewAdapter(backend, profile, audit), checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None)
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None, **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"))
             self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn"))
             connection = sqlite3.connect(database_path(repository))
             try:
@@ -270,8 +309,9 @@ class DependencyReviewServiceTests(unittest.TestCase):
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
             result = DependencyReviewService().run(
                 repository, subset, attempt_id="attempt-116", binding=binding,
-                adapter=CodexDependencyReviewAdapter(backend, profile, audit),
+                adapter=(adapter := CodexDependencyReviewAdapter(backend, profile, audit)),
                 checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
             )
             self.assertEqual((result.kind, result.reason_code, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn", 0))
 
@@ -285,8 +325,9 @@ class DependencyReviewServiceTests(unittest.TestCase):
             )
             result = DependencyReviewService().run(
                 repository, subset, attempt_id="attempt-116", binding=binding,
-                adapter=CodexDependencyReviewAdapter(backend, profile, audit),
+                adapter=(adapter := CodexDependencyReviewAdapter(backend, profile, audit)),
                 checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
             )
             self.assertEqual(result.kind, DependencyReviewResultKind.AMBIGUOUS)
             DependencyReviewStore().require_turn_claim(
@@ -294,6 +335,37 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 session_identity="01a07bb4-2916-73b1-97c6-68712c35667c",
                 turn_identity="01a07bb4-2916-73b1-97c6-68712c35667d",
             )
+
+    def test_adapter_rejects_the_removed_expected_execution_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, _subset, _binding, profile, audit = self.setup(Path(temporary))
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            material = {"schema": "roundwright-dependency-review-input/v1"}
+            request = DependencyReviewRequest("attempt-116", material, "sha256:" + hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(), audit.profile_identity)
+            with self.assertRaises(TypeError):
+                CodexDependencyReviewAdapter(backend, profile, audit).dispatch(
+                    request, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None,
+                    advisory_execution=self.admission(profile), expected_execution=object(),  # type: ignore[call-arg]
+                )
+            self.assertEqual(backend.sessions, [])
+
+    def test_service_rejects_the_removed_expected_execution_argument(self) -> None:
+        """A caller cannot substitute an effect binding at the service seam."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116"),
+            ))
+            with self.assertRaises(TypeError):
+                DependencyReviewService().run(
+                    repository, subset, attempt_id="attempt-116", binding=binding,
+                    adapter=CodexDependencyReviewAdapter(backend, profile, audit),
+                    checkpoint_session=lambda _session: None,
+                    checkpoint_turn=lambda _session, _turn: None,
+                    advisory_execution=self.admission(profile), expected_execution=object(),  # type: ignore[call-arg]
+                )
+            self.assertEqual(backend.sessions, [])
 
     def test_live_lane_preflight_is_candidate_bound_and_provider_free(self) -> None:
         plan = SimpleNamespace(
@@ -383,8 +455,15 @@ class DependencyReviewServiceTests(unittest.TestCase):
             repository, subset, binding, _profile, audit = self.setup(Path(temporary))
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal(subset.snapshot_id)))
             base_sha = "a" * 40
+            effect = self.effect_kwargs(
+                repository, subset, binding,
+                CodexDependencyReviewAdapter(backend, audit.profile, audit),
+                attempt_id=subset.snapshot_id,
+            )
             inputs = external_validation.DependencyReviewRequestInputs(
-                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, backend,
+                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17,
+                effect["advisory_execution"], backend,
+                execution_host=effect["execution_host"],
             )
             prepared, readiness, capsule = external_validation.prepare_dependency_review_attempt_profile(inputs, Path(temporary).resolve())
             self.assertEqual(prepared.native_control_digest, dependency_review_native_control_digest())
@@ -421,13 +500,23 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 external_validation.materialize_dependency_review_attempt_profile(capsule, Path(temporary).resolve())
             self.assertEqual(len(backend.sessions), 0)
             fresh_inputs = external_validation.DependencyReviewRequestInputs(
-                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17, backend,
+                repository, base_sha, subset, binding, audit, subset.snapshot_id, 17,
+                effect["advisory_execution"], backend,
+                execution_host=effect["execution_host"],
             )
             _prepared, _readiness, fresh_capsule = external_validation.prepare_dependency_review_attempt_profile(fresh_inputs, Path(temporary).resolve())
             external_validation.materialize_dependency_review_attempt_profile(fresh_capsule, Path(temporary).resolve())
             self.assertEqual(len(backend.sessions), 1)
             with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "unavailable"):
                 external_validation.materialize_dependency_review_attempt_profile(fresh_capsule, Path(temporary).resolve())
+
+class ProductionActivationTests(unittest.TestCase):
+    def test_missing_external_root_denies_before_input_construction(self) -> None:
+        with self.assertRaisesRegex(DependencyReviewDispatchError, "activation is unavailable"):
+            prepare_dependency_review_host(
+                None, None, None, None, advisory_execution=None,
+                execution_host=None, budget_ledger_path=None,
+            )  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

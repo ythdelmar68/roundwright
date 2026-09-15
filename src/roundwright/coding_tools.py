@@ -16,8 +16,23 @@ import signal
 import subprocess
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+
+from .role_capability_policy import RoleCapability, RoleCapabilityError, RoleScope, ScopeKind, ScopedDescriptor
+
+
+# Keep concrete filesystem effects on the same conservative Win32 spelling
+# boundary as admitted role scopes.  Windows resolves device stems regardless
+# of extension and aliases names with trailing dots/spaces; accepting any of
+# those spellings would let an allowlisted display path mean a different
+# filesystem object at execution time.
+_WINDOWS_RESERVED = frozenset({
+    "con", "prn", "aux", "nul", "clock$", "conin$", "conout$",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+})
 
 
 class CodingToolError(ValueError):
@@ -147,6 +162,11 @@ class BoundedCodingCapability:
     timeout_seconds: int = 30
     output_limit: int = 65_536
     sandbox_identity: str | None = None
+    # Every concrete local effect is additionally admitted through the role
+    # scope.  The path/command allowlists below are deliberately not a second
+    # authority source: they only narrow an already admitted operation.
+    role_scope: RoleScope | None = None
+    scope_root_identity: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -166,8 +186,20 @@ class BoundedCodingCapability:
                 for command in self.validation_commands
             )
             or (self.sandbox_identity is not None and (type(self.sandbox_identity) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", self.sandbox_identity)))
+            or type(self.role_scope) is not RoleScope
+            or type(self.scope_root_identity) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", self.scope_root_identity) is None
         ):
             raise CodingToolError("bounded coding capability is invalid")
+        try:
+            resolved = self.root.resolve(strict=True)
+        except OSError as error:
+            raise CodingToolError("selected workspace is invalid") from error
+        if not resolved.is_dir() or self.scope_root_identity != _root_identity(resolved):
+            # The scope label is never caller-selected authority.  It must be
+            # mechanically derived from the exact root that will be used for
+            # every subsequent filesystem and process effect.
+            raise CodingToolError("bounded coding scope root is invalid")
 
 
 class BoundedCodingTools:
@@ -188,6 +220,14 @@ class BoundedCodingTools:
         elif capability.sandbox_identity is not None:
             raise CodingToolError("reviewed validation sandbox is required")
         self._validation_sandbox = validation_sandbox
+        try:
+            # The scope is bound once at construction and then checked again
+            # for each concrete path/process effect below.  A generic mapping
+            # capability is never sufficient to open a local-effect path.
+            capability.role_scope.require(RoleCapability.BOUNDED_CODING)
+            self._require_static_validation_descriptors()
+        except RoleCapabilityError as error:
+            raise CodingToolError("bounded coding role scope is denied") from error
 
     @property
     def capability_root(self) -> Path:
@@ -221,9 +261,12 @@ class BoundedCodingTools:
             "output_limit": self._capability.output_limit,
             "sandbox_identity": self._capability.sandbox_identity,
             "sandbox_receipt": self._validation_sandbox.receipt_digest if self._validation_sandbox is not None else None,
+            "role_scope": self._capability.role_scope.identity,
+            "scope_root_identity": self._capability.scope_root_identity,
         })
 
     def read(self, relative_path: str) -> tuple[str, CodingToolEvent]:
+        self._require_scope_path(relative_path)
         path, display = self._path(relative_path, self._capability.readable_paths)
         try:
             with path.open("rb") as source:
@@ -238,6 +281,7 @@ class BoundedCodingTools:
     def write(self, relative_path: str, content: str) -> CodingToolEvent:
         if type(content) is not str or len(content.encode("utf-8")) > self._capability.output_limit:
             raise CodingToolError("workspace write content is invalid")
+        self._require_scope_path(relative_path)
         path, display = self._path(relative_path, self._capability.writable_paths)
         try:
             before = path.read_bytes() if path.exists() else None
@@ -264,6 +308,7 @@ class BoundedCodingTools:
         """
         if type(command) is not tuple or command not in self._capability.validation_commands:
             raise CodingToolError("validation command is not allowlisted")
+        self._require_scope_process(command)
         # The command tuple itself is the sealed executable identity.  Hosted
         # CPython installations commonly expose that exact executable through
         # a launcher symlink, so reject only a missing or non-file resolved
@@ -337,12 +382,73 @@ class BoundedCodingTools:
             raise CodingToolError("workspace path crosses a link")
         return resolved, relative_path
 
+    def _require_scope_path(self, relative_path: str) -> None:
+        try:
+            self._capability.role_scope.require(
+                RoleCapability.BOUNDED_CODING,
+                (ScopedDescriptor(ScopeKind.PATH, self._capability.scope_root_identity, relative_path),),
+            )
+        except RoleCapabilityError as error:
+            raise CodingToolError("workspace path is outside the admitted role scope") from error
+
+    def _require_scope_process(self, command: tuple[str, ...]) -> None:
+        # Scope names are deliberately non-secret symbolic identifiers.  The
+        # command itself stays in the sealed capability digest; its executable
+        # is not widened by a display name here.
+        identity = _object_digest({"command": command})[7:]
+        try:
+            self._capability.role_scope.require(
+                RoleCapability.BOUNDED_CODING,
+                (ScopedDescriptor(ScopeKind.PROCESS, self._capability.scope_root_identity, identity),),
+            )
+        except RoleCapabilityError as error:
+            raise CodingToolError("validation process is outside the admitted role scope") from error
+
+    def _require_static_validation_descriptors(self) -> None:
+        """Require closed resource, test-input, and deny-network bounds.
+
+        The process descriptor alone describes an executable, not its test
+        input set, resource seal, or network posture.  Bind all of them before
+        the local launcher or sandbox can be reached.
+        """
+        root_identity = self._capability.scope_root_identity
+        assert root_identity is not None
+        descriptors = [
+            ScopedDescriptor(ScopeKind.NETWORK, root_identity, "network-disabled"),
+            ScopedDescriptor(ScopeKind.RESOURCE, root_identity, _resource_identity(self._capability.sandbox_identity)),
+        ]
+        descriptors.extend(
+            ScopedDescriptor(ScopeKind.TEST_INPUT_SET, root_identity, _command_identity(command))
+            for command in self._capability.validation_commands
+        )
+        try:
+            self._capability.role_scope.require(RoleCapability.BOUNDED_CODING, tuple(descriptors))
+        except RoleCapabilityError as error:
+            raise CodingToolError("validation descriptors are outside the admitted role scope") from error
+
 
 def _relative(value: object) -> bool:
     if type(value) is not str or not value or "\\" in value:
         return False
     path = Path(value)
-    return not path.is_absolute() and ".." not in path.parts and all(part not in {"", "."} for part in path.parts)
+    if path.is_absolute() or ".." in path.parts or any(part in {"", "."} for part in path.parts):
+        return False
+    for part in path.parts:
+        # ``NFKC`` folds compatibility characters such as full-width device
+        # names.  Reject rather than normalize: normalizing an approved
+        # string would silently widen the capability the caller selected.
+        normalized = unicodedata.normalize("NFKC", part)
+        stem = normalized.split(".", 1)[0].rstrip(". ").casefold()
+        if (
+            normalized != part
+            or ":" in part
+            or any(character in part for character in '*?<>|"')
+            or any(ord(character) < 32 for character in part)
+            or part.endswith((".", " "))
+            or stem in _WINDOWS_RESERVED
+        ):
+            return False
+    return True
 
 
 def _is_link(path: Path) -> bool:
@@ -359,6 +465,18 @@ def _digest(value: bytes) -> str:
 def _object_digest(value: object) -> str:
     import json
     return _digest(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+
+
+def _root_identity(root: Path) -> str:
+    return _object_digest({"schema": "roundwright-bounded-coding-root/v1", "root": str(root)})
+
+
+def _command_identity(command: tuple[str, ...]) -> str:
+    return _object_digest({"command": command})[7:]
+
+
+def _resource_identity(sandbox_identity: str | None) -> str:
+    return _object_digest({"sandbox_identity": sandbox_identity})[7:]
 
 
 def _bounded_output(process: subprocess.Popen[bytes], timeout_seconds: int, output_limit: int) -> bytes:

@@ -21,6 +21,7 @@ from .codex_supervisor import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure
+from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
 from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field, _turn_failure, _value
 
 
@@ -33,7 +34,7 @@ def _schema(contract: SupervisorResponseContract = SupervisorResponseContract.VE
 class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
     """Fresh native Codex sessions with no tool, approval, or write authority."""
 
-    def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, *, cwd: Path, completion: CompletionDeadline, launch_context: TrustedProviderLaunchContext, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(cwd, Path):
             raise CodexSupervisorError("native Supervisor working directory is invalid")
         if (
@@ -47,23 +48,35 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
                 codex_factory is None
                 and any(item is not None for item in (approval_mode, sandbox, effort_factory))
             )
+            or type(launch_context) is not TrustedProviderLaunchContext
         ):
             raise CodexSupervisorError("reviewed native Supervisor SDK binding is invalid")
-        self._cwd, self._completion, self._factory, self._approval, self._sandbox, self._effort, self._clock = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock
+        self._cwd, self._completion, self._factory, self._approval, self._sandbox, self._effort, self._clock, self._launch = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock, launch_context
 
     def open_fresh_session(self, profile: ProviderProfile) -> NativeSupervisorSession:
         if type(profile) is not ProviderProfile:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         try:
+            self._launch.verify(cwd=self._cwd, profile=profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
+            # A caller supplied factory is not a trust boundary.  Production
+            # provider construction remains unavailable until external host
+            # composition and a native discovery-off control are reviewed.
+            require_external_production_activation()
             factory, approval, sandbox, effort = self._native_binding()
             codex = factory()
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
-            thread = client.thread_start()
+            thread = client.thread_start(
+                approval_mode=approval, cwd=str(self._cwd),
+                developer_instructions=self._launch.developer_instructions,
+                ephemeral=True, model=profile.model, sandbox=sandbox,
+            )
             if not isinstance(getattr(thread, "id", None), str):
                 raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
-            return _Session(thread, codex, self._cwd, profile, approval, sandbox, effort, self._completion, self._clock)
-        except CodexAdapterError:
+            return _Session(thread, codex, self._cwd, profile, approval, sandbox, effort, self._completion, self._clock, self._launch)
+        except (CodexAdapterError, RoleCapabilityError) as error:
             _close(locals().get("codex"))
+            if isinstance(error, RoleCapabilityError):
+                raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
             raise
         except Exception:
             _close(locals().get("codex"))
@@ -92,8 +105,8 @@ class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
 
 
 class _Session(NativeSupervisorSession):
-    def __init__(self, thread: object, codex: object, cwd: Path, profile: ProviderProfile, approval: object, sandbox: object, effort: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float]) -> None:
-        self._thread, self._codex, self._cwd, self._profile, self._approval, self._sandbox, self._effort, self._completion, self._clock, self._started, self._closed = thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, False, False
+    def __init__(self, thread: object, codex: object, cwd: Path, profile: ProviderProfile, approval: object, sandbox: object, effort: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float], launch_context: TrustedProviderLaunchContext) -> None:
+        self._thread, self._codex, self._cwd, self._profile, self._approval, self._sandbox, self._effort, self._completion, self._clock, self._started, self._closed, self._launch = thread, codex, cwd, profile, approval, sandbox, effort, completion, clock, False, False, launch_context
 
     def identity(self) -> str:
         value = getattr(self._thread, "id", None)
@@ -109,6 +122,10 @@ class _Session(NativeSupervisorSession):
         if self._started or type(request) is not CodexSupervisorRequest:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
+        try:
+            self._launch.verify(cwd=self._cwd, profile=self._profile, required_capability=RoleCapability.READ_ONLY_REVIEW)
+        except RoleCapabilityError as error:
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         instruction = "Review only this canonical immutable material. Do not use tools, inspect repositories, or request credentials. Return only the schema and copy its binding exactly."
         if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
             instruction = "Decide only prospective pre-dispatch accounting-transition eligibility from the sealed material. The current PREPARED attempt has a consumed one-shot dispatch claim and no session, turn, completion, invalidation, recovery, or acceptance by design; complete means this exact response may create one completion and one accepted formal review after binding validation, not that either already exists. Return blocked only for missing, contradictory, drifted, or insufficient immutable eligibility facts. Do not inspect repositories or assess broad candidate correctness. Return only the strict accounting schema."

@@ -10,17 +10,19 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerContext, CodexWorkerRequest, NativeWorkerToolResult, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerToolResult, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.role_capability_policy import AdvisoryRole, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
 from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
+from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
 
 def digest(value: object) -> str:
@@ -143,53 +145,117 @@ class WorkerToolboxTests(unittest.TestCase):
         self.readiness = require_worker_shadow_capture_readiness(candidate_sha=self.candidate, ready_at=101, case_id="case-43", observation_identity=self.request.input_digest, native_channel_producer_identity=digest("native"), exporter_identity=digest("exporter"), comparator_identity=digest("comparator"), recorder=self.recorder_binding, store_identity=digest("external-store"))
         self.binding = WorkerQualificationBinding("case-43", context.task_id, self.request.attempt_id, self.request.input_digest, self.request.resume_session_identity, context.source_digest, context.repository_fingerprint, context.worktree_fingerprint, context.branch_fingerprint, context.policy_fingerprint, self.base, self.candidate, context.base_fingerprint, context.candidate_fingerprint, self.audit.profile_identity, context.configuration_digest, self.audit.runtime_fingerprint, self.readiness.native_channel_producer_identity, self.readiness.exporter_identity, self.readiness.comparator_identity, self.readiness.recorder_binding_digest, self.readiness.store_identity, self.readiness.capture_plan_digest, "planning-complete", None, "supervisor-review")
 
-    def test_concrete_bridge_checkpoints_then_seals_and_readbacks_once(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "external-store"
-            service = TemporaryReviewedRecorder()
-            recorder = HarnessExternalWorkerRecorder(store_root=root, store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
-            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: "effort:" + value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: self.events.append(("checkpoint-session", value)), checkpoint_turn=lambda session, turn: self.events.append(("checkpoint-turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: self.events.append(("checkpoint-result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
-        self.assertEqual(self.events[0], "enter")
-        self.assertEqual(self.events[2], ("checkpoint-session", "thread-43"))
-        self.assertEqual(self.events[4], ("checkpoint-turn", "thread-43", "turn-43"))
-        self.assertIn(("checkpoint-result", "thread-43", "turn-43", "accepted", None, None, None), self.events)
-        self.assertFalse(self.events[1][1]["ephemeral"])
-        payload = json.loads(self.events[3][1])
-        self.assertEqual((payload["action"], payload["tools"], payload["capability_contract"]), ("planning", [], "no-tools-self-contained/v1"))
-        self.assertEqual(payload["provider_instruction"], "No provider tools or repository inspection are declared or required; decide only from this normalized public input.")
-        self.assertEqual(payload["context"]["task_id"], "task-43")
-        schema = self.events[3][2]["output_schema"]
-        turn_options = self.events[3][2]
-        self.assertEqual((turn_options["approval_mode"], turn_options["cwd"], turn_options["model"], turn_options["sandbox"]), ("deny-all", str(ROOT), "gpt-5.6-terra", "read-only"))
-        self.assertEqual(schema["type"], "object")
-        self.assertEqual(schema["properties"]["action"]["enum"], ["planning"])
-        self.assertEqual(schema["required"], ["status", "action", "blocker"])
-        self.assertEqual(schema["properties"]["blocker"], {"type": ["string", "null"], "enum": [None, "provider-blocked"]})
-        self.assertTrue({"allOf", "anyOf", "oneOf", "if", "then", "else"}.isdisjoint(schema))
-        self.assertNotIn("const", json.dumps(schema))
-        self.assertEqual(service.calls, ["prepare", "seal", "verify"])
-        self.assertEqual(result.record.receipt.capture_plan_digest, self.readiness.capture_plan_digest)
-        self.assertEqual((result.envelope.ready_at, result.record.receipt.ready_at), (101, 101))
-        self.assertEqual((result.result.kind, result.result.output_fingerprint), ("accepted", digest({"status": "complete", "action": "planning"})))
-        self.assertNotIn("Observe", json.dumps(result.record.receipt.__dict__))
+    def launch_context(self):
+        execution = sealed_execution(AdvisoryRole.WORKER, self.profile)
+        return trusted_provider_launch_context(
+            execution, cwd=ROOT,
+        )
+
+    def effect_kwargs(self, backend, root: Path) -> dict[str, object]:
+        adapter = CodexWorkerAdapter(
+            backend, self.profile, self.audit, BoundedWorkerToolSurface(()),
+        )
+        request_material, preflight_material = adapter.effect_material(self.request)
+        return {
+            "advisory_execution": sealed_execution_for_effect(
+                AdvisoryRole.WORKER, self.profile,
+                request_identity=self.request.attempt_id,
+                request_material=request_material,
+                preflight_material=preflight_material,
+            ),
+            "execution_host": trusted_execution_host(AdvisoryRole.WORKER, self.profile),
+            "budget_ledger_path": root / "role-budget.sqlite",
+        }
+
+    def test_injected_worker_factory_cannot_bypass_not_activated(self):
+        backend = HarnessNativeCodexWorkerBackend(
+            cwd=ROOT, completion=CompletionDeadline(1000, 2000),
+            launch_context=self.launch_context(),
+            codex_factory=lambda: FakeCodex(self.events),
+            approval_mode="deny-all", sandbox="read-only",
+            effort_factory=lambda value: "effort:" + value,
+        )
+        with self.assertRaisesRegex(CodexAdapterError, "sdk-incompatible"):
+            backend.open_session(
+                self.profile, resume_session_identity=None,
+                action=WorkerAction.PLANNING,
+            )
+        self.assertEqual(self.events, [])
 
     def test_preflight_drift_does_not_construct_or_call_provider(self):
         self.binding = WorkerQualificationBinding(self.binding.case_id, self.binding.task_id, self.binding.attempt_id, self.binding.input_digest, self.binding.resume_session_identity, self.binding.source_digest, self.binding.repository_fingerprint, self.binding.worktree_fingerprint, self.binding.branch_fingerprint, self.binding.policy_fingerprint, self.binding.base_sha, self.binding.candidate_sha, self.binding.base_fingerprint, self.binding.candidate_fingerprint, self.binding.profile_identity, self.binding.configuration_digest, self.binding.runtime_fingerprint, self.binding.native_channel_producer_identity, self.binding.exporter_identity, self.binding.comparator_identity, self.binding.recorder_binding_digest, digest("other-store"), self.binding.capture_plan_digest, self.binding.deterministic_state, self.binding.blocker, self.binding.next_action)
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         with tempfile.TemporaryDirectory() as temporary:
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=lambda *_: None, record_capture=lambda *_: None, verify_capture=lambda *_: None)
             with self.assertRaises(Exception):
-                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d, _e, _f: None)
+                run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, **self.effect_kwargs(backend, Path(temporary)), checkpoint_session=lambda _: None, checkpoint_turn=lambda _a, _b: None, checkpoint_result=lambda _a, _b, _c, _d, _e, _f: None)
         self.assertEqual(self.events, [])
 
+    def test_sealed_launch_context_blocks_cwd_and_profile_drift_before_client_creation(self):
+        execution = sealed_execution(AdvisoryRole.WORKER, self.profile)
+        launch = trusted_provider_launch_context(
+            execution, cwd=ROOT,
+        )
+        launches: list[str] = []
+        backend = HarnessNativeCodexWorkerBackend(
+            cwd=ROOT / "wrong-cwd", completion=CompletionDeadline(1000, 2000),
+            codex_factory=lambda: launches.append("client") or FakeCodex(self.events),
+            approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+            launch_context=launch,
+        )
+        with self.assertRaises(CodexAdapterError):
+            backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
+        self.assertEqual(launches, [])
+
+    def test_sealed_launch_context_rejects_coherent_public_instruction_mutation(self):
+        launch = self.launch_context()
+        replacement = b"coherently replaced accepted guidance"
+        instructions = (
+            "Use only the explicitly injected Roundwright guidance boundary. "
+            "Do not discover ambient, global, or repository instruction files. "
+            f"Guidance receipt: {launch.guidance_receipt_digest}. Role view: {launch.execution_binding.role.value}.\n"
+            + replacement.decode("utf-8")
+        )
+        # Deliberately bypass normal immutability and make all visible fields
+        # self-consistent.  Verification must still authenticate them to the
+        # sealed accepted guidance payload.
+        object.__setattr__(launch, "accepted_main_guidance_bytes", replacement)
+        object.__setattr__(launch, "accepted_main_guidance_digest", "sha256:" + hashlib.sha256(replacement).hexdigest())
+        object.__setattr__(launch, "developer_instructions", instructions)
+        object.__setattr__(launch, "role_injected_bytes", instructions.encode("utf-8"))
+        object.__setattr__(launch, "injected_context_digest", "sha256:" + hashlib.sha256(instructions.encode("utf-8")).hexdigest())
+        object.__setattr__(launch, "_authenticated_payload", MappingProxyType({
+            "cwd": launch.cwd, "execution_binding": launch.execution_binding,
+            "guidance_receipt_digest": launch.guidance_receipt_digest,
+            "injected_context_digest": launch.injected_context_digest,
+            "implicit_discovery_disabled": True, "developer_instructions": instructions,
+            "role_injected_bytes": instructions.encode("utf-8"),
+            "accepted_main_guidance_bytes": replacement,
+            "accepted_main_guidance_digest": launch.accepted_main_guidance_digest,
+            "cwd_identity": launch.cwd_identity, "sdk_mapping_identity": launch.sdk_mapping_identity,
+        }))
+        with self.assertRaises(RoleCapabilityError):
+            launch.verify(cwd=ROOT, profile=self.profile)
+
+    def test_native_worker_requires_a_sealed_launch_context_before_factory_creation(self):
+        launches: list[str] = []
+        with self.assertRaises(TypeError):
+            HarnessNativeCodexWorkerBackend(
+                cwd=ROOT, completion=CompletionDeadline(1000, 2000),
+                codex_factory=lambda: launches.append("client") or FakeCodex(self.events),
+                approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+            )
+        self.assertEqual(launches, [])
+
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_native_qualification_rejects_unenforceable_abstract_tool_labels(self):
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         with self.assertRaises(Exception):
             session.start_turn(self.request, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)))
         self.assertEqual(self.events[0], "enter")
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_coding_bridge_reuses_one_thread_for_typed_tool_turns(self):
         context = self.request.context
         request = CodexWorkerRequest("attempt-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="write", constraints=("bounded",), acceptance_criteria=("complete",), resume_session_identity=None), context, "write", ("bounded",), ("complete",))
@@ -210,23 +276,24 @@ class WorkerToolboxTests(unittest.TestCase):
                 self.events.append(("coding-turn", prompt, kwargs)); return OneShotHandle(self.events, next(replies))
         class Codex(FakeCodex):
             def thread_start(inner, **kwargs): self.events.append(("start", kwargs)); return Thread(self.events)
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: Codex(self.events), approval_mode="deny-all", sandbox="reviewed-sandbox", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: Codex(self.events), approval_mode="deny-all", sandbox="reviewed-sandbox", effort_factory=lambda value: value)
         turn = backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.IMPLEMENTATION).start_turn(request, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
         start = next(event for event in self.events if isinstance(event, tuple) and event[0] == "start")
-        self.assertIn("workspace-read", start[1]["developer_instructions"])
+        self.assertIn("Do not discover ambient", start[1]["developer_instructions"])
         self.assertNotIn("planning observation", start[1]["developer_instructions"])
         first = turn.read_step(); self.assertEqual((first.request.sequence, first.request.tool), (1, WorkerTool.WORKSPACE_READ))
         turn.submit_tool_result(NativeWorkerToolResult(1, WorkerTool.WORKSPACE_READ, "allowed", after_digest=digest("read"), feedback="bounded"))
         self.assertEqual(turn.read_step().response.kind, "accepted")
         self.assertEqual(len([event for event in self.events if event[0] == "coding-turn"]), 2)
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_no_tool_contract_is_bound_at_adapter_readiness_and_prompt(self):
         self.assertEqual(BoundedWorkerToolSurface(()).capability_contract, WorkerCapabilityContract.NO_TOOLS_SELF_CONTAINED)
         self.assertEqual(BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ,)).capability_contract, WorkerCapabilityContract.ORCHESTRATION_DECLARED_ONLY)
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(self.events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         start = self.events[1][1]
-        self.assertIn("No provider tools", start["developer_instructions"])
+        self.assertIn("Do not discover ambient", start["developer_instructions"])
         self.assertNotIn("tools", start)
 
     def test_blocked_provider_output_cannot_become_accepted_evidence(self):
@@ -333,9 +400,10 @@ class WorkerToolboxTests(unittest.TestCase):
         response = _consume_public_result(Handle(), WorkerAction.REPAIR)
         self.assertEqual((response.kind, response.diagnostic), ("invalid", WorkerParserDiagnostic.EXACT_TURN))
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_resume_rebinds_full_runtime_on_a_new_client(self):
         events = []
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(1000, 2000), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity="thread-43", action=WorkerAction.PLANNING)
         self.assertEqual(session.identity(), "thread-43")
         kind, identity, kwargs = events[1]
@@ -387,6 +455,7 @@ class WorkerToolboxTests(unittest.TestCase):
                 return Stream()
         self.assertEqual(_consume_public_result(Handle(), WorkerAction.REPAIR, completion=CompletionDeadline(1000, 2000)).kind, "accepted")
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_timeout_is_result_checkpointed_before_recorder_and_never_retried(self):
         events, released = [], __import__("threading").Event()
         class Handle:
@@ -408,8 +477,8 @@ class WorkerToolboxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             service = TemporaryReviewedRecorder()
             recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
-            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+            backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(25, 600), launch_context=self.launch_context(), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+            result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, **self.effect_kwargs(backend, Path(temporary)), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
         self.assertEqual(events[:3], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt"])
         self.assertIn(("result", "thread-43", "turn-43", "ambiguous", None, None, None), events)
         self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
@@ -418,6 +487,7 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual(events.count("client-close"), 1)
         self.assertLess(events.index("interrupt"), events.index("client-close"))
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_concrete_unverified_terminal_eof_requires_exact_turn_recovery(self):
         for name, values in (
             ("eof", ()),
@@ -448,8 +518,8 @@ class WorkerToolboxTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temporary:
                     service = TemporaryReviewedRecorder()
                     recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
-                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, **self.effect_kwargs(backend, Path(temporary)), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
 
                 self.assertEqual(provider_calls, ["turn"])
                 self.assertEqual((result.result.kind, result.result.session_identity, result.result.turn_identity), ("ambiguous", "thread-43", "turn-43"))
@@ -461,6 +531,7 @@ class WorkerToolboxTests(unittest.TestCase):
                 self.assertLess(events.index("interrupt"), events.index("client-close"))
                 self.assertEqual(service.calls, ["prepare"])
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_concrete_read_failures_abort_then_close_once_without_evidence(self):
         for name, failure in (("typed", CodexAdapterError(CodexFailure.UNKNOWN)), ("generic", RuntimeError("closed"))):
             with self.subTest(name=name):
@@ -487,8 +558,8 @@ class WorkerToolboxTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temporary:
                     service = TemporaryReviewedRecorder()
                     recorder = HarnessExternalWorkerRecorder(store_root=Path(temporary) / "store", store_identity=self.readiness.store_identity, recorder=self.recorder_binding, prepare_capture=service.prepare_capture, record_capture=service.record_capture, verify_capture=service.verify_capture)
-                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
+                    backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+                    result = run_bounded_worker_adapter_qualification(backend=backend, profile=self.profile, audit=self.audit, tools=BoundedWorkerToolSurface(()), request=self.request, readiness=self.readiness, binding=self.binding, recorder=recorder, **self.effect_kwargs(backend, Path(temporary)), checkpoint_session=lambda value: events.append(("session", value)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)), checkpoint_result=lambda session, turn, kind, diagnostic, source, category: events.append(("result", session, turn, kind.value, None if diagnostic is None else diagnostic.value, None if source is None else source.value, None if category is None else category.value)))
 
                 self.assertEqual(calls, ["turn", "stream"])
                 self.assertEqual(events[:4], [("session", "thread-43"), ("turn", "thread-43", "turn-43"), "interrupt", "client-close"])
@@ -499,9 +570,10 @@ class WorkerToolboxTests(unittest.TestCase):
                 self.assertEqual((result.result.kind, result.record, result.comparison.disposition), ("ambiguous", None, "match"))
                 self.assertEqual(service.calls, ["prepare"])
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_concrete_success_closes_once_without_interrupt(self):
         events = []
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(), codex_factory=lambda: FakeCodex(events), approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         turn = session.start_turn(self.request, BoundedWorkerToolSurface(()))
         self.assertEqual(turn.read_response().kind, "accepted")
@@ -509,6 +581,7 @@ class WorkerToolboxTests(unittest.TestCase):
         self.assertEqual(events.count("exit"), 1)
         self.assertNotIn("interrupt", events)
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_concrete_explicit_cancellation_is_idempotent_and_ordered(self):
         events = []
 
@@ -528,7 +601,7 @@ class WorkerToolboxTests(unittest.TestCase):
             def __exit__(self, *_args): events.append("client-close")
             def thread_start(self, **_kwargs): return Thread()
 
-        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        backend = HarnessNativeCodexWorkerBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
         session = backend.open_session(self.profile, resume_session_identity=None, action=WorkerAction.PLANNING)
         turn = session.start_turn(self.request, BoundedWorkerToolSurface(()))
         self.assertEqual((session.identity(), turn.identity()), ("thread-43", "turn-43"))

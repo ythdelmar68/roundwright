@@ -6,16 +6,20 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, NativeWorkerToolRequest, NativeWorkerTurnStep, WorkerAction, WorkerResultKind, WorkerTool, worker_request_digest
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerResponse, NativeWorkerToolRequest, NativeWorkerTurnStep, WorkerAction, WorkerResultKind, WorkerTool, worker_request_digest
 from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools, CodingSandboxResult, ReviewedSandboxReceipt, ReviewedValidationSandbox
 from roundwright.coding_worker_state import CodingToolEventStore
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.role_capability_policy import AdvisoryRole, RoleCapability, RoleScope, ScopeKind, ScopedDescriptor
+from tests.role_admission_fixture import sealed_execution_for_effect, trusted_execution_host
 from roundwright.worker_toolbox import CODING_RUNTIME_REGISTRY, CodingDispatchReceipt, CodingWorkerRuntimeDescriptor, ProductionCodingWorkerEntrypointInputs, ProductionCodingWorkerRuntime, run_production_coding_worker, run_registered_production_coding_worker
 from roundwright.worker_shadow import WorkerShadowError
 
@@ -56,34 +60,101 @@ class Sandbox(ReviewedValidationSandbox):
     def execute(self, **_kwargs): return CodingSandboxResult(0, self.output)
 
 class ProductionRuntimeTests(unittest.TestCase):
+    def coding_scope(self, root: Path, command: tuple[str, ...]):
+        root_identity = digest(json.dumps({"schema": "roundwright-bounded-coding-root/v1", "root": str(root.resolve())}, sort_keys=True, separators=(",", ":")))
+        process_identity = digest(json.dumps({"command": command}, sort_keys=True, separators=(",", ":")))[7:]
+        resource_identity = digest(json.dumps({"sandbox_identity": digest("sandbox")}, sort_keys=True, separators=(",", ":")))[7:]
+        descriptors = (
+            ScopedDescriptor(ScopeKind.PATH, root_identity, "out.txt"),
+            ScopedDescriptor(ScopeKind.PROCESS, root_identity, process_identity),
+            ScopedDescriptor(ScopeKind.NETWORK, root_identity, "network-disabled"),
+            ScopedDescriptor(ScopeKind.RESOURCE, root_identity, resource_identity),
+            ScopedDescriptor(ScopeKind.TEST_INPUT_SET, root_identity, process_identity),
+        )
+        return RoleScope(frozenset({RoleCapability.BOUNDED_CODING}), tuple(sorted(descriptors, key=lambda item: (item.kind.value, item.root_identity, item.value)))), root_identity
+
     def request(self):
         context = CodexWorkerContext("task-1", *(digest(x) for x in ("s","r","w","b","base","candidate","p","c")))
         return CodexWorkerRequest("attempt-1", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-1", action=WorkerAction.IMPLEMENTATION, context=context, objective="write", constraints=("bounded",), acceptance_criteria=("write",), resume_session_identity=None), context, "write", ("bounded",), ("write",))
     def inputs(self, root, turn, events, sandbox=None, output_limit=65_536):
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), ((sys.executable,"-c","pass"),), output_limit=output_limit, sandbox_identity=digest("sandbox")), validation_sandbox=sandbox or Sandbox())
+        command = (sys.executable, "-c", "pass")
+        scope, root_identity = self.coding_scope(root, command)
+        tools = BoundedCodingTools(BoundedCodingCapability(root, ("out.txt",), ("out.txt",), (command,), output_limit=output_limit, sandbox_identity=digest("sandbox"), role_scope=scope, scope_root_identity=root_identity), validation_sandbox=sandbox or Sandbox())
         context = self.request().context
         receipt = CodingDispatchReceipt.seal(task_id="task-1", attempt_id="attempt-1", candidate_sha="a" * 40, candidate_fingerprint=context.candidate_fingerprint, policy_fingerprint=context.policy_fingerprint, configuration_digest=context.configuration_digest, worktree_fingerprint=context.worktree_fingerprint, validation_toolchain_receipt=digest("toolchain"), sandbox_identity=digest("sandbox"), capability_digest=tools.capability_digest)
-        return ProductionCodingWorkerEntrypointInputs(backend=Backend(Session(turn, events)), profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40, toolchain_receipt_probe=lambda: digest("toolchain"))
+        backend = Backend(Session(turn, events))
+        request = self.request()
+        adapter = CodexWorkerAdapter(
+            backend, profile, audit,
+            BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)),
+        )
+        request_material, preflight_material = adapter.effect_material(request)
+        execution = sealed_execution_for_effect(
+            AdvisoryRole.WORKER, profile, request_identity=request.attempt_id,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+        return ProductionCodingWorkerEntrypointInputs(backend=backend, profile=profile, audit=audit, local_tools=tools, dispatch_receipt=receipt, event_store=CodingToolEventStore(root / "events.db"), candidate_probe=lambda: "a" * 40, toolchain_receipt_probe=lambda: digest("toolchain"), advisory_execution=execution, execution_host=trusted_execution_host(AdvisoryRole.WORKER, profile), budget_ledger_path=root / "role-budget.sqlite")
     def runtime(self, root, turn, events, **kwargs):
         values=self.inputs(root,turn,events,**kwargs)
-        return ProductionCodingWorkerRuntime(backend=values.backend, profile=values.profile, audit=values.audit, local_tools=values.local_tools, dispatch_receipt=values.dispatch_receipt, event_store=values.event_store, candidate_probe=values.candidate_probe, toolchain_receipt_probe=values.toolchain_receipt_probe)
-    def test_dispatch_writes_only_allowlisted_file_and_submits_closed_result(self):
+        return ProductionCodingWorkerRuntime(backend=values.backend, profile=values.profile, audit=values.audit, local_tools=values.local_tools, dispatch_receipt=values.dispatch_receipt, event_store=values.event_store, candidate_probe=values.candidate_probe, toolchain_receipt_probe=values.toolchain_receipt_probe, advisory_execution=values.advisory_execution, execution_host=values.execution_host, budget_ledger_path=values.budget_ledger_path)
+
+    @contextmanager
+    def hermetic_runtime(self, root, turn, events, **kwargs):
+        """Test-only activation seam; no installed package can obtain it."""
+        with patch("roundwright.worker_toolbox.require_external_production_activation", lambda: None):
+            yield self.runtime(root, turn, events, **kwargs)
+    def test_direct_production_runtime_construction_denies_before_provider_or_local_effect(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
             turn=Turn(events, (NativeWorkerTurnStep(request=request), NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
-            result=self.runtime(Path(temp),turn,events).dispatch(self.request(), checkpoint_session=lambda _: events.append("session"), checkpoint_turn=lambda *_: events.append("turn"))
-            self.assertEqual((result.kind, Path(temp,"out.txt").read_text(), events[:5]), (WorkerResultKind.ACCEPTED,"ok",["session","start","turn","step","submit"]))
-            self.assertTrue(turn.submitted[0].after_digest.startswith("sha256:"))
-            self.assertFalse(hasattr(turn.submitted[0], "path"))
+            with self.assertRaisesRegex(WorkerShadowError, "activation is unavailable"):
+                self.runtime(Path(temp),turn,events)
+            self.assertEqual(events, [])
+            self.assertFalse(Path(temp, "out.txt").exists())
+
+    def test_fabricated_direct_runtime_dispatch_denies_before_any_effect(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]
+            runtime = object.__new__(ProductionCodingWorkerRuntime)
+            with self.assertRaisesRegex(WorkerShadowError, "activation is unavailable"):
+                runtime.dispatch(self.request(), checkpoint_session=lambda _: events.append("session"), checkpoint_turn=lambda *_: events.append("turn"))
+            self.assertEqual(events, [])
+            self.assertFalse(Path(temp, "out.txt").exists())
+
+    def test_test_only_harness_preserves_allowlisted_write_and_denial_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; allowed=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
+            turn=Turn(events,(NativeWorkerTurnStep(request=allowed),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
+            with self.hermetic_runtime(Path(temp),turn,events) as runtime:
+                self.assertEqual(runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None).kind,WorkerResultKind.ACCEPTED)
+            self.assertEqual(Path(temp,"out.txt").read_text(),"ok")
+            denied=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_WRITE,path="no.txt",content="no")
+            with self.hermetic_runtime(Path(temp),Turn([], (NativeWorkerTurnStep(request=denied),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"})))),[]) as runtime:
+                with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
+            self.assertFalse(Path(temp,"no.txt").exists())
+
+    def test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            events=[]; runtime_events=[]
+            with self.hermetic_runtime(Path(temp),Turn(events,()),events) as runtime:
+                runtime._candidate_probe=lambda: "b" * 40
+                with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
+            request=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_WRITE,path="out.txt",content="once")
+            with self.hermetic_runtime(Path(temp),Turn(runtime_events,()),runtime_events) as runtime:
+                result=runtime._execute_request(self.request(),{"session_identity":"s","turn_identity":"t"},request,frozenset())
+                self.assertEqual(result.outcome,"allowed")
+                with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
 
     def test_public_production_entrypoint_constructs_the_coding_runtime(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
             turn=Turn(events, (NativeWorkerTurnStep(request=request), NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
-            result=run_production_coding_worker(inputs=self.inputs(Path(temp),turn,events), request=self.request(), checkpoint_session=lambda _:events.append("session"), checkpoint_turn=lambda *_:events.append("turn"))
-            self.assertEqual((result.kind,Path(temp,"out.txt").read_text()),(WorkerResultKind.ACCEPTED,"ok"))
+            with self.assertRaisesRegex(WorkerShadowError, "activation is unavailable"):
+                run_production_coding_worker(inputs=self.inputs(Path(temp),turn,events), request=self.request(), checkpoint_session=lambda _:events.append("session"), checkpoint_turn=lambda *_:events.append("turn"))
+            self.assertEqual(events, [])
+            self.assertFalse(Path(temp, "out.txt").exists())
 
     def test_registered_public_lifecycle_requires_an_exact_installed_resource(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -94,109 +165,8 @@ class ProductionRuntimeTests(unittest.TestCase):
             with self.assertRaises(WorkerShadowError):
                 run_registered_production_coding_worker(descriptor_value=descriptor.payload(),request=self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
             CODING_RUNTIME_REGISTRY.install("coding-resource-1",inputs)
-            result=run_registered_production_coding_worker(descriptor_value=descriptor.payload(),request=self.request(),checkpoint_session=lambda _:events.append("session"),checkpoint_turn=lambda *_:events.append("turn"))
-            self.assertEqual((result.kind,Path(temp,"out.txt").read_text()),(WorkerResultKind.ACCEPTED,"ok"))
-    def test_denied_write_has_no_effect(self):
-        with tempfile.TemporaryDirectory() as temp:
-            events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="no.txt", content="no")
-            turn=Turn(events, (NativeWorkerTurnStep(request=request), NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
-            self.runtime(Path(temp),turn,events).dispatch(self.request(), checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None)
-            self.assertEqual(turn.submitted[0].outcome,"denied"); self.assertFalse(Path(temp,"no.txt").exists())
-
-    def test_candidate_drift_blocks_before_provider_or_tool_effect(self):
-        with tempfile.TemporaryDirectory() as temp:
-            events=[]; runtime=self.runtime(Path(temp),Turn(events,()),events); runtime._candidate_probe=lambda: "b" * 40
-            with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(), checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None)
-            self.assertEqual(events,[])
-
-    def test_toolchain_receipt_drift_blocks_before_provider_or_tool_effect(self):
-        with tempfile.TemporaryDirectory() as temp:
-            events=[]; runtime=self.runtime(Path(temp),Turn(events,()),events); runtime._toolchain_receipt_probe=lambda: digest("other-toolchain")
-            with self.assertRaises(WorkerShadowError): runtime.dispatch(self.request(), checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None)
-            self.assertEqual(events,[])
-
-    def test_read_feedback_is_transient_but_event_is_durable(self):
-        with tempfile.TemporaryDirectory() as temp:
-            Path(temp,"out.txt").write_text("bounded",encoding="utf-8"); events=[]; request=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_READ,path="out.txt")
-            turn=Turn(events,(NativeWorkerTurnStep(request=request),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
-            runtime=self.runtime(Path(temp),turn,events); runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
-            self.assertEqual(turn.submitted[0].feedback,"bounded")
-            self.assertTrue((Path(temp,"events.db").exists()))
-
-    def test_submission_binds_the_fresh_sdk_turn_before_a_terminal_result(self):
-        with tempfile.TemporaryDirectory() as temp:
-            events=[]; request=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")
-            class AdvancingTurn(Turn):
-                def submit_tool_result(self, result):
-                    super().submit_tool_result(result); self.id="turn-2"
-            turn=AdvancingTurn(events, (NativeWorkerTurnStep(request=request), NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
-            runtime=self.runtime(Path(temp),turn,events)
-            result=runtime.dispatch(self.request(), checkpoint_session=lambda _:None, checkpoint_turn=lambda *_:None)
-            self.assertEqual((result.kind,result.turn_identity),(WorkerResultKind.ACCEPTED,"turn-2"))
-            connection=sqlite3.connect(Path(temp,"events.db"))
-            try:
-                self.assertEqual(connection.execute("SELECT state,next_turn_identity FROM coding_tool_submissions").fetchall(),[("submitted","turn-2")])
-            finally:
-                connection.close()
-
-    def test_raw_cap_validation_feedback_budget_failure_retains_execution_evidence(self):
-        with tempfile.TemporaryDirectory() as temp:
-            events=[]; request=NativeWorkerToolRequest(1, WorkerTool.VALIDATION_EXECUTE, command=(sys.executable,"-c","pass"))
-            turn=Turn(events,(NativeWorkerTurnStep(request=request),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
-            inputs=self.inputs(Path(temp),turn,events,Sandbox(b"\xff" * 65_536))
-            result=run_production_coding_worker(inputs=inputs,request=self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
-            self.assertEqual(result.kind,WorkerResultKind.ACCEPTED)
-            self.assertEqual(turn.submitted[0].outcome,"feedback-budget-exceeded")
-            self.assertIsNone(turn.submitted[0].feedback)
-            self.assertEqual((turn.submitted[0].exit_code,turn.submitted[0].output_digest),(0,digest(b"\xff" * 65_536)))
-            connection=sqlite3.connect(Path(temp,"events.db"))
-            try:
-                payloads=connection.execute("SELECT payload_json FROM coding_tool_events").fetchall()
-                self.assertEqual([json.loads(payload)["outcome"] for (payload,) in payloads],["feedback-budget-exceeded"])
-            finally:
-                connection.close()
-
-    def test_raw_cap_read_feedback_budget_failure_retains_read_digest(self):
-        with tempfile.TemporaryDirectory() as temp:
-            Path(temp,"out.txt").write_text("x" * 65_536,encoding="utf-8"); events=[]
-            request=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_READ,path="out.txt")
-            turn=Turn(events,(NativeWorkerTurnStep(request=request),NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}))))
-            result=self.runtime(Path(temp),turn,events).dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
-            self.assertEqual(result.kind,WorkerResultKind.ACCEPTED)
-            self.assertEqual((turn.submitted[0].outcome,turn.submitted[0].after_digest,turn.submitted[0].feedback),("feedback-budget-exceeded",digest(b"x" * 65_536),None))
-
-    def test_restart_after_effect_before_submission_blocks_before_a_second_provider_turn(self):
-        with tempfile.TemporaryDirectory() as temp:
-            events=[]; request=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_WRITE,path="out.txt",content="once")
-            runtime=self.runtime(Path(temp),Turn(events,()),events)
-            result=runtime._execute_request(self.request(),{"session_identity":"session-1","turn_identity":"turn-1"},request,frozenset())
-            self.assertEqual(result.outcome,"allowed")
-            with self.assertRaises(WorkerShadowError):
-                runtime.dispatch(self.request(),checkpoint_session=lambda _:self.fail("provider opened"),checkpoint_turn=lambda *_:self.fail("provider opened"))
-            self.assertEqual(Path(temp,"out.txt").read_text(),"once")
-
-    def test_restart_after_provider_acceptance_before_next_turn_checkpoint_blocks(self):
-        with tempfile.TemporaryDirectory() as temp:
-            events=[]; request=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_WRITE,path="out.txt",content="once")
-            turn=Turn(events,(NativeWorkerTurnStep(request=request),))
-            runtime=self.runtime(Path(temp),turn,events); calls=[]
-            result=runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_: calls.append("turn") if len(calls)==0 else (_ for _ in ()).throw(RuntimeError("checkpoint crash")))
-            self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS)
-            with self.assertRaises(WorkerShadowError):
-                runtime.dispatch(self.request(),checkpoint_session=lambda _:self.fail("provider reopened"),checkpoint_turn=lambda *_:self.fail("provider reopened"))
-
-    def test_restart_before_submitted_transition_blocks(self):
-        with tempfile.TemporaryDirectory() as temp:
-            events=[]; request=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_WRITE,path="out.txt",content="once")
-            turn=Turn(events,(NativeWorkerTurnStep(request=request),))
-            runtime=self.runtime(Path(temp),turn,events); original=runtime._event_store.record_submission
-            def interrupted(*args):
-                if args[5] == "submitted": raise RuntimeError("submission crash")
-                return original(*args)
-            runtime._event_store.record_submission=interrupted
-            result=runtime.dispatch(self.request(),checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None)
-            self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS)
-            with self.assertRaises(WorkerShadowError):
-                runtime.dispatch(self.request(),checkpoint_session=lambda _:self.fail("provider reopened"),checkpoint_turn=lambda *_:self.fail("provider reopened"))
-
+            with self.assertRaisesRegex(WorkerShadowError, "activation is unavailable"):
+                run_registered_production_coding_worker(descriptor_value=descriptor.payload(),request=self.request(),checkpoint_session=lambda _:events.append("session"),checkpoint_turn=lambda *_:events.append("turn"))
+            self.assertEqual(events, [])
+            self.assertFalse(Path(temp, "out.txt").exists())
 if __name__ == "__main__": unittest.main()

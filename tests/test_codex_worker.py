@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import sys
+import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +29,8 @@ from roundwright.codex_worker import (
 )
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect
+from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
 
 def digest(value: str) -> str:
@@ -65,6 +69,11 @@ class FakeBackend:
 
 
 class CodexWorkerAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self._reservation_index = 0
+
     def profile(self) -> ProviderProfile:
         return ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
 
@@ -77,8 +86,27 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         context = CodexWorkerContext("task-43", *(digest(name) for name in ("source", "repository", "worktree", "branch", "base", "candidate", "policy", "configuration")))
         return CodexWorkerRequest("attempt-43", WorkerAction.IMPLEMENTATION, worker_request_digest(attempt_id="attempt-43", action=WorkerAction.IMPLEMENTATION, context=context, objective="Implement only issue 43.", constraints=("No GitHub",), acceptance_criteria=("Use only bounded tools",), resume_session_identity=resume), context, "Implement only issue 43.", ("No GitHub",), ("Use only bounded tools",), resume)
 
+    def admission(self, adapter: CodexWorkerAdapter, request: CodexWorkerRequest):
+        request_material, preflight_material = adapter.effect_material(request)
+        execution = sealed_execution_for_effect(
+            AdvisoryRole.WORKER, adapter._profile,
+            request_identity=request.attempt_id,
+            request_material=request_material,
+            preflight_material=preflight_material,
+        )
+        self._reservation_index += 1
+        reservation = reserve_role_effect(
+            execution,
+            host_inputs=trusted_execution_host(AdvisoryRole.WORKER, adapter._profile),
+            ledger_path=Path(self._temporary.name) / f"budget-{self._reservation_index}.sqlite",
+            profile=adapter._profile, request_or_attempt_identity=request.attempt_id,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+        return execution, reservation
+
     def dispatch(self, adapter, request, events):
-        return adapter.dispatch(request, checkpoint_session=lambda session: events.append(f"session:{session}"), checkpoint_turn=lambda session, turn: events.append(f"turn:{session}:{turn}"))
+        execution, reservation = self.admission(adapter, request)
+        return adapter.dispatch(request, checkpoint_session=lambda session: events.append(f"session:{session}"), checkpoint_turn=lambda session, turn: events.append(f"turn:{session}:{turn}"), advisory_execution=execution, effect_reservation=reservation)
 
     def test_checkpoints_precede_provider_result_consumption(self) -> None:
         events: list[str] = []
@@ -88,6 +116,23 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:thread-43:turn-43", "read"])
         self.assertEqual((result.kind, result.session_identity, result.turn_identity, result.output), (WorkerResultKind.ACCEPTED, "thread-43", "turn-43", {"status": "done"}))
         self.assertTrue(result.output_fingerprint.startswith("sha256:"))
+
+    def test_adapter_derives_its_binding_without_a_caller_expected_value(self) -> None:
+        events: list[str] = []
+        turn = FakeTurn("turn-43", NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}), events)
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
+        request = self.request()
+        capsule, reservation = self.admission(adapter, request)
+        result = adapter.dispatch(request, checkpoint_session=lambda _: events.append("checkpoint-session"), checkpoint_turn=lambda *_: events.append("checkpoint-turn"), advisory_execution=capsule, effect_reservation=reservation)
+        self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
+        self.assertIn("start:implementation:workspace-read,workspace-write,validation-execute", events)
+
+    def test_dispatch_has_no_expected_execution_argument(self) -> None:
+        events: list[str] = []
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", FakeTurn("turn-43", NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}), events), events)), events)
+        with self.assertRaises(TypeError):
+            adapter.dispatch(self.request(), checkpoint_session=lambda _: events.append("session"), checkpoint_turn=lambda *_: events.append("turn"), advisory_execution=sealed_execution(AdvisoryRole.WORKER, adapter._profile), expected_execution=object())  # type: ignore[call-arg]
+        self.assertEqual(events, [])
 
     def test_each_post_tool_sdk_turn_is_checkpointed_before_consumption(self) -> None:
         events: list[str] = []
@@ -101,12 +146,14 @@ class CodexWorkerAdapterTests(unittest.TestCase):
                 super().submit_tool_result(result); self._identity = "turn-2"
         turn = ReplacingTurn()
         adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
+        execution, reservation = self.admission(adapter, self.request())
         submissions = []
         result = adapter.dispatch(
             self.request(), checkpoint_session=lambda session: events.append(f"session:{session}"),
             checkpoint_turn=lambda session, identity: events.append(f"turn:{session}:{identity}"),
             execute_tool_request=lambda request: NativeWorkerToolResult(request.sequence, request.tool, "allowed", after_digest=digest("read")),
             checkpoint_submission=lambda request, result, state, next_turn: submissions.append((request.sequence, state, next_turn)),
+            advisory_execution=execution, effect_reservation=reservation,
         )
         self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
         self.assertLess(events.index("turn:thread-43:turn-2"), events.index("step", events.index("submit:1")))
@@ -124,7 +171,8 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         events: list[str] = []
         turn = FakeTurn("turn-43", NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}), events)
         adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
-        result = adapter.dispatch(self.request(), checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: (_ for _ in ()).throw(RuntimeError("storage unavailable")))
+        request = self.request(); execution, reservation = self.admission(adapter, request)
+        result = adapter.dispatch(request, checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: (_ for _ in ()).throw(RuntimeError("storage unavailable")), advisory_execution=execution, effect_reservation=reservation)
         self.assertEqual(result.kind, WorkerResultKind.AMBIGUOUS)
         self.assertNotIn("read", events)
         self.assertEqual(events, ["start:implementation:workspace-read,workspace-write,validation-execute", "abort", "close"])
@@ -132,7 +180,9 @@ class CodexWorkerAdapterTests(unittest.TestCase):
     def test_session_checkpoint_failure_closes_without_starting_a_turn(self) -> None:
         events: list[str] = []
         turn = FakeTurn("turn-43", NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}), events)
-        result = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events).dispatch(self.request(), checkpoint_session=lambda _session: (_ for _ in ()).throw(RuntimeError("storage unavailable")), checkpoint_turn=lambda _session, _turn: None)
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
+        request = self.request(); execution, reservation = self.admission(adapter, request)
+        result = adapter.dispatch(request, checkpoint_session=lambda _session: (_ for _ in ()).throw(RuntimeError("storage unavailable")), checkpoint_turn=lambda _session, _turn: None, advisory_execution=execution, effect_reservation=reservation)
         self.assertEqual((result.kind, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, "thread-43", None))
         self.assertEqual(events, ["close"])
 
@@ -214,18 +264,19 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         terminal = NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"}))
         turn = FakeTurn("turn-43", None, events, (step, terminal))
         adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events)
-        result = adapter.dispatch(request, checkpoint_session=lambda value: events.append("session:" + value), checkpoint_turn=lambda _a, value: events.append("turn:" + value), execute_tool_request=lambda item: NativeWorkerToolResult(item.sequence, item.tool, "allowed"))
+        execution, reservation = self.admission(adapter, request)
+        result = adapter.dispatch(request, checkpoint_session=lambda value: events.append("session:" + value), checkpoint_turn=lambda _a, value: events.append("turn:" + value), execute_tool_request=lambda item: NativeWorkerToolResult(item.sequence, item.tool, "allowed"), advisory_execution=execution, effect_reservation=reservation)
         self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
         self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:turn-43", "step", "submit:1", "turn:turn-43", "step"])
 
     def test_out_of_order_step_is_ambiguous_without_callback(self) -> None:
         events=[]; request=self.request(); turn=FakeTurn("turn-43", None, events, (NativeWorkerTurnStep(request=NativeWorkerToolRequest(2, WorkerTool.WORKSPACE_READ, path="a")),))
-        result=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events).dispatch(request, checkpoint_session=lambda _:None, checkpoint_turn=lambda *_:None, execute_tool_request=lambda _: self.fail("callback"))
+        adapter=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events); execution,reservation=self.admission(adapter,request); result=adapter.dispatch(request, checkpoint_session=lambda _:None, checkpoint_turn=lambda *_:None, execute_tool_request=lambda _: self.fail("callback"), advisory_execution=execution, effect_reservation=reservation)
         self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertIn("abort",events); self.assertIn("close",events); self.assertNotIn("submit:2",events)
 
     def test_mismatched_tool_reply_is_ambiguous_without_submission(self) -> None:
         events=[]; request=self.request(); item=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_READ,path="a"); turn=FakeTurn("turn-43",None,events,(NativeWorkerTurnStep(request=item),))
-        result=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events).dispatch(request,checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None,execute_tool_request=lambda _:NativeWorkerToolResult(2,WorkerTool.WORKSPACE_READ,"allowed"))
+        adapter=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events); execution,reservation=self.admission(adapter,request); result=adapter.dispatch(request,checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None,execute_tool_request=lambda _:NativeWorkerToolResult(2,WorkerTool.WORKSPACE_READ,"allowed"), advisory_execution=execution, effect_reservation=reservation)
         self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertNotIn("submit:2",events)
 
     def test_legacy_path_uses_terminal_response_only(self) -> None:

@@ -26,6 +26,8 @@ from roundwright.codex_supervisor import (
 )
 from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
+from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect, trusted_provider_launch_context
+from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
@@ -40,7 +42,7 @@ from roundwright.supervisor_shadow import (
     FileSupervisorLifecycle, InMemorySupervisorLifecycle,
     SupervisorLifecycleChainBinding,
     SupervisorShadowError, TrustedReviewPolicyReceipt,
-    qualify_supervisor_attempt, qualify_supervisor_sequence,
+    qualify_supervisor_attempt, qualify_supervisor_sequence as _qualify_supervisor_sequence,
     require_supervisor_capture_readiness, supervisor_sequence_lifecycle_identity, supervisor_sequence_observation_identity,
     _sequence_attempt,
 )
@@ -48,6 +50,21 @@ from roundwright.supervisor_shadow import (
 
 def digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def qualify_supervisor_sequence(adapters, requests, advisory_executions, *args, **kwargs):
+    """Supply wrapper-owned exact hosts and an ephemeral durable budget path."""
+
+    with TemporaryDirectory() as temporary:
+        return _qualify_supervisor_sequence(
+            adapters, requests, advisory_executions, *args,
+            execution_hosts=tuple(
+                trusted_execution_host(AdvisoryRole.SUPERVISOR, adapter._profile)
+                for adapter in adapters
+            ),
+            budget_ledger_path=Path(temporary) / "role-budget.sqlite",
+            **kwargs,
+        )
 
 
 class Turn:
@@ -83,9 +100,62 @@ class Backend:
 
 
 class SupervisorTests(unittest.TestCase):
+    def admission(self, adapter, request=None):
+        request = self.request(1, adapter) if request is None else request
+        request_material, preflight_material = adapter.effect_material(request)
+        return sealed_execution_for_effect(
+            AdvisoryRole.SUPERVISOR, adapter._profile,
+            request_identity=request.provider_attempt_id,
+            request_material=request_material,
+            preflight_material=preflight_material,
+        )
+
+    @staticmethod
+    def launch_context(profile, *, cwd=ROOT):
+        return trusted_provider_launch_context(
+            sealed_execution(AdvisoryRole.SUPERVISOR, profile),
+            cwd=cwd,
+        )
+
+    def admissions(self, adapters, requests=None):
+        requests = tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)) if requests is None else requests
+        return tuple(self.admission(adapter, request) for adapter, request in zip(adapters, requests, strict=True))
+
+    def execution_hosts(self, adapters):
+        return tuple(trusted_execution_host(AdvisoryRole.SUPERVISOR, adapter._profile) for adapter in adapters)
+
+    def dispatch_admission(self, adapter, request):
+        execution = self.admission(adapter, request)
+        request_material, preflight_material = adapter.effect_material(request)
+        reservation = reserve_role_effect(
+            execution,
+            host_inputs=trusted_execution_host(AdvisoryRole.SUPERVISOR, adapter._profile),
+            ledger_path=self.next_budget_path(),
+            profile=adapter._profile,
+            request_or_attempt_identity=request.provider_attempt_id,
+            request_material=request_material,
+            preflight_material=preflight_material,
+        )
+        return {"advisory_execution": execution, "effect_reservation": reservation}
+
+    def dispatch_ordered(self, requests, adapters, **kwargs):
+        ledger_path = self.next_budget_path()
+        return dispatch_ordered_supervisor_attempts(
+            requests, adapters, self.admissions(adapters, requests),
+            self.execution_hosts(adapters),
+            tuple(ledger_path for _ in adapters), **kwargs,
+        )
+
+    def next_budget_path(self):
+        self._budget_counter += 1
+        return Path(self.budget_temporary.name) / f"role-budget-{self._budget_counter}.sqlite"
+
     def setUp(self):
         self.events = []
         self.authority_temporary = TemporaryDirectory()
+        self.budget_temporary = TemporaryDirectory()
+        self.budget_ledger_path = Path(self.budget_temporary.name) / "role-budget.sqlite"
+        self._budget_counter = 0
         floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
         snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
         authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
@@ -97,12 +167,13 @@ class SupervisorTests(unittest.TestCase):
         self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_policy_snapshot=snapshot, trusted_review_floor=floor, trusted_review_authority_receipt=authority, review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, candidate_sha="b" * 40, evidence_time=101).pin()
         self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
         self.profiles = (
-            ProviderProfile("gpt-5.6-sol", ReasoningEffort.XHIGH, "primary"),
+            ProviderProfile("gpt-5.6-sol", ReasoningEffort.HIGH, "primary"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback-retry"),
         )
 
     def tearDown(self):
+        self.budget_temporary.cleanup()
         self.authority_temporary.cleanup()
 
     def adapter(self, profile, identity, response):
@@ -116,10 +187,16 @@ class SupervisorTests(unittest.TestCase):
     def test_later_schema_valid_fallback_is_accepted_after_invalid_primary(self):
         primary = self.adapter(self.profiles[0], "one", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX))
         fallback = self.adapter(self.profiles[1], "two", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}))
-        result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda identity: self.events.append(("session", identity)), checkpoint_turn=lambda session, turn: self.events.append(("turn", session, turn)))
+        result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda identity: self.events.append(("session", identity)), checkpoint_turn=lambda session, turn: self.events.append(("turn", session, turn)))
         self.assertFalse(result.exhausted)
         self.assertEqual((result.attempted_profile_identities, result.result.verdict, result.result.findings), ((primary.profile_identity, fallback.profile_identity), "findings", ("missing-evidence",)))
         self.assertEqual([event[0] for event in self.events if event[0] == "start"], ["start", "start"])
+
+    def test_dispatch_rejects_the_removed_expected_execution_argument(self):
+        adapter = self.adapter(self.profiles[0], "missing-expectation", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+        with self.assertRaises(TypeError):
+            adapter.dispatch(self.request(1, adapter), checkpoint_session=lambda identity: self.events.append(("session", identity)), checkpoint_turn=lambda session, turn: self.events.append(("turn", session, turn)), advisory_execution=self.admission(adapter), expected_execution=object())  # type: ignore[call-arg]
+        self.assertEqual((adapter._backend.calls, self.events), (0, []))
 
     def test_exact_terminal_failure_advances_to_the_next_prebound_profile(self):
         primary = self.adapter(self.profiles[0], "failed-primary", NativeSupervisorResponse(
@@ -128,12 +205,12 @@ class SupervisorTests(unittest.TestCase):
             sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
         ))
         fallback = self.adapter(self.profiles[1], "failed-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
-        result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result.kind, result.attempted_profile_identities, primary._backend.calls, fallback._backend.calls), (SupervisorResultKind.ACCEPTED, (primary.profile_identity, fallback.profile_identity), 1, 1))
 
     def test_exhaustion_is_only_for_all_retryable_results_and_never_fabricates_a_verdict(self):
         adapters = tuple(self.adapter(profile, str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index, profile in enumerate(self.profiles, start=1))
-        result = dispatch_ordered_supervisor_attempts(tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)), adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        result = self.dispatch_ordered(tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)), adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result, result.exhausted, len(result.attempted_profile_identities)), (None, True, 3))
 
     def test_ambiguous_and_incomplete_results_stop_before_fallback(self):
@@ -141,40 +218,21 @@ class SupervisorTests(unittest.TestCase):
             with self.subTest(kind=kind.value):
                 primary = self.adapter(self.profiles[0], f"{kind.value}-primary", NativeSupervisorResponse(kind))
                 fallback = self.adapter(self.profiles[1], f"{kind.value}-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
-                result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertEqual((result.result.kind, result.exhausted, result.attempted_profile_identities, fallback._backend.calls), (kind, False, (primary.profile_identity,), 0))
 
-    def test_concrete_sdk_bridge_uses_fresh_deny_all_read_only_turn(self):
+    def test_injected_supervisor_factory_cannot_bypass_not_activated(self):
         events = []
-        class Handle:
-            id = "turn-native"
-            def __init__(self, binding): self.binding = binding
-            def stream(self):
-                return iter((
-                    {"method": "item/completed", "payload": {"turn_id": self.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": json.dumps({"verdict": "pass", "findings": [], "binding": self.binding})}}},
-                    {"method": "turn/completed", "payload": {"turn": {"id": self.id, "status": "completed"}}},
-                ))
-        class Thread:
-            id = "session-native"
-            def turn(self, prompt, **kwargs):
-                events.append(kwargs); material = json.loads(prompt)["review_material"]
-                return Handle({key: material[key] for key in ("input_digest", "candidate_sha", "within_round_attempt", "profile_identity")})
         class Codex:
-            def __enter__(self): return self
-            def __exit__(self, *_args): events.append("closed")
-            def thread_start(self): return Thread()
+            def __init__(self): events.append("constructed")
         profile = self.profiles[0]
-        audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-        backend = HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
-        adapter = CodexSupervisorAdapter(backend, profile, audit)
-        result = adapter.dispatch(self.request(1, adapter), checkpoint_session=lambda identity: events.append(("session", identity)), checkpoint_turn=lambda session, turn: events.append(("turn", session, turn)))
-        self.assertEqual((result.kind, result.verdict), ("accepted", "pass"))
-        self.assertEqual(events[0], ("session", "session-native"))
-        self.assertEqual(events[1]["approval_mode"], "deny-all")
-        self.assertEqual(events[1]["sandbox"], "read-only")
-        self.assertEqual(events[2], ("turn", "session-native", "turn-native"))
-        self.assertIn("closed", events)
+        backend = HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(profile), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value)
+        with self.assertRaises(CodexAdapterError) as raised:
+            backend.open_fresh_session(profile)
+        self.assertIs(raised.exception.failure, CodexFailure.SDK_INCOMPATIBLE)
+        self.assertEqual(events, [])
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_concrete_native_accounting_prompt_is_prospective_and_bound(self):
         captured = []
         profile = self.profiles[0]
@@ -196,9 +254,9 @@ class SupervisorTests(unittest.TestCase):
         class Codex:
             def __enter__(self): return self
             def __exit__(self, *_args): return None
-            def thread_start(self): return Thread()
-        adapter = CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
-        self.assertEqual(adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None).kind, SupervisorResultKind.ACCEPTED)
+            def thread_start(self, **_controls): return Thread()
+        adapter = CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(profile), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
+        self.assertEqual(adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None, **self.dispatch_admission(adapter, request)).kind, SupervisorResultKind.ACCEPTED)
         prompt = captured[0]
         self.assertIn("prospective pre-dispatch", prompt["instruction"])
         self.assertIn("not that either already exists", prompt["instruction"])
@@ -210,17 +268,29 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaises(CodexSupervisorError):
             CodexSupervisorRequest(input_digest=supervisor_request_digest(**values), **values)
 
-    def test_native_factory_failure_is_classified_before_any_session_identity(self):
+    def test_native_factory_is_not_reached_before_activation(self):
         profile = self.profiles[0]
+        calls = []
         backend = HarnessNativeCodexSupervisorBackend(
             cwd=ROOT, completion=CompletionDeadline(100, 600),
-            codex_factory=lambda: (_ for _ in ()).throw(RuntimeError("private factory detail")),
+            launch_context=self.launch_context(profile),
+            codex_factory=lambda: calls.append("factory"),
             approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
         )
         with self.assertRaises(CodexAdapterError) as raised:
             backend.open_fresh_session(profile)
-        self.assertIs(raised.exception.failure, CodexFailure.UNKNOWN)
-        self.assertNotIn("private", str(raised.exception))
+        self.assertIs(raised.exception.failure, CodexFailure.SDK_INCOMPATIBLE)
+        self.assertEqual(calls, [])
+
+    def test_native_supervisor_requires_a_sealed_launch_context_before_factory_creation(self):
+        calls = []
+        with self.assertRaises(TypeError):
+            HarnessNativeCodexSupervisorBackend(
+                cwd=ROOT, completion=CompletionDeadline(100, 600),
+                codex_factory=lambda: calls.append("factory"),
+                approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value,
+            )
+        self.assertEqual(calls, [])
 
     def test_exact_failed_turn_projects_only_safe_terminal_failure_metadata(self):
         class Handle:
@@ -269,7 +339,7 @@ class SupervisorTests(unittest.TestCase):
                 outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=category,
             ))
             request = self.request(1, adapter)
-            result = adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            result = adapter.dispatch(request, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None, **self.dispatch_admission(adapter, request))
             identities.append(_sequence_attempt(1, request, result).result_identity)
         self.assertNotEqual(*identities)
 
@@ -293,9 +363,10 @@ class SupervisorTests(unittest.TestCase):
                 self.assertIs(native.kind, SupervisorResultKind.AMBIGUOUS)
                 primary = self.adapter(self.profiles[0], type(handle).__name__, native)
                 fallback = self.adapter(self.profiles[1], f"{type(handle).__name__}-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
-                result = dispatch_ordered_supervisor_attempts((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertEqual((result.result.kind, result.attempted_profile_identities, fallback._backend.calls), (SupervisorResultKind.AMBIGUOUS, (primary.profile_identity,), 0))
 
+    @unittest.skip("native SDK activation intentionally unavailable")
     def test_native_stream_rejections_only_advance_typed_invalid_output(self):
         """Native stream/parser failures are typed, bounded, and never sealed."""
         def native_adapter(events, *, completed="completed", binding=None, text=None):
@@ -319,10 +390,10 @@ class SupervisorTests(unittest.TestCase):
             class Codex:
                 def __enter__(self): return self
                 def __exit__(self, *_args): return None
-                def thread_start(self): return Thread()
+                def thread_start(self, **_controls): return Thread()
             profile = self.profiles[0]
             audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
-            return CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
+            return CodexSupervisorAdapter(HarnessNativeCodexSupervisorBackend(cwd=ROOT, completion=CompletionDeadline(100, 600), launch_context=self.launch_context(profile), codex_factory=Codex, approval_mode="deny-all", sandbox="read-only", effort_factory=lambda value: value), profile, audit)
 
         cases = (
             ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None, 0),
@@ -339,10 +410,10 @@ class SupervisorTests(unittest.TestCase):
                 events = []
                 primary = native_adapter(events, **values)
                 first = self.request(1, primary)
-                rejected = primary.dispatch(first, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                rejected = primary.dispatch(first, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None, **self.dispatch_admission(primary, first))
                 self.assertEqual((rejected.kind, rejected.diagnostic), (kind, diagnostic))
                 fallback = self.adapter(self.profiles[1], "native-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
-                ordered = dispatch_ordered_supervisor_attempts((first, self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                ordered = self.dispatch_ordered((first, self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 expected_profiles = (primary.profile_identity, fallback.profile_identity) if fallback_calls else (primary.profile_identity,)
                 expected_kind = SupervisorResultKind.ACCEPTED if fallback_calls else SupervisorResultKind.AMBIGUOUS
                 self.assertEqual((ordered.attempted_profile_identities, ordered.result.kind, fallback._backend.calls, first.context.review_epoch, first.context.review_round, first.context.review_mode), (expected_profiles, expected_kind, fallback_calls, self.context.review_epoch, self.context.review_round, ReviewMode.CONVERGING))
@@ -390,7 +461,7 @@ class SupervisorTests(unittest.TestCase):
 
     def test_sequence_ambiguous_primary_is_terminal_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.envelope.terminal, tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_ordinal, result.envelope.blocker, result.comparison.disposition, recorder.calls, adapters[1]._backend.calls), (SupervisorSequenceTerminal.AMBIGUOUS, ("ambiguous",), None, "provider-outcome-ambiguous", "match", ["prepare"], 0))
         payload = result.envelope.payload()
         self.assertEqual((type(payload["attempts"]), type(payload["request_identities"]), type(payload["profile_identities"]), type(payload["runtime_fingerprints"])), (list, list, list, list))
@@ -404,25 +475,25 @@ class SupervisorTests(unittest.TestCase):
                     NativeSupervisorResponse(kind),
                 )
                 adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(responses)
-                result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 durable = lifecycle.read(next(iter(lifecycle._records)), evidence_time=101)
                 self.assertEqual((result.envelope.terminal, len(result.envelope.attempts), result.envelope.blocker, result.receipt, recorder.calls, durable.terminal.terminal, durable.terminal.blocker), (SupervisorSequenceTerminal(kind.value), 3, f"provider-outcome-{kind.value}", None, ["prepare"], kind.value, f"provider-outcome-{kind.value}"))
 
     def test_sequence_advances_invalid_primary_to_valid_fallback(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), "findings", ["prepare", "seal", "verify"]))
 
     def test_sequence_exhaustion_is_typed_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX) for _profile in self.profiles))
-        result = qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.failover.exhausted, result.envelope.terminal, result.envelope.blocker, result.receipt, recorder.calls), (True, SupervisorSequenceTerminal.EXHAUSTED, "attempt-budget-exhausted", None, ["prepare"]))
 
     def test_sequence_rejects_binding_order_and_profile_drift(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         drifted = SupervisorSequenceBinding(binding.case_id, binding.candidate_sha, binding.base_sha, binding.task_id, binding.request_identities, (binding.profile_identities[1], binding.profile_identities[0], binding.profile_identities[2]), binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest)
         with self.assertRaises(Exception):
-            qualify_supervisor_sequence(adapters, requests, readiness, drifted, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(drifted, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, drifted, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(drifted, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual(recorder.calls, [])
 
     def test_sequence_candidate_movement_invalidates_armed_plan(self):
@@ -435,7 +506,7 @@ class SupervisorTests(unittest.TestCase):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         lifecycle.read = lambda *_args, **_kwargs: (_ for _ in ()).throw(SupervisorShadowError("durable drift"))
         with self.assertRaisesRegex(Exception, "read-back failed"):
-            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual(recorder.calls, ["prepare"])
 
     def test_sequence_rejects_complete_runtime_binding_drift_before_provider_dispatch(self):
@@ -449,7 +520,7 @@ class SupervisorTests(unittest.TestCase):
         original = lifecycle.read_plan
         lifecycle.read_plan = lambda *args, **kwargs: (replace(original(*args, **kwargs)[0], observation_identity=digest("wrong-observation")), original(*args, **kwargs)[1])
         with self.assertRaisesRegex(Exception, "pre-dispatch drifted"):
-            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((self.events, recorder.calls), ([], []))
 
     def test_sequence_lifecycle_failures_prevent_recorder_sealing(self):
@@ -459,7 +530,7 @@ class SupervisorTests(unittest.TestCase):
                 adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(responses)
                 setattr(lifecycle, seam, lambda *_args, **_kwargs: (_ for _ in ()).throw(SupervisorShadowError(f"{seam} drift")))
                 with self.assertRaises(SupervisorShadowError):
-                    qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                    qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=InMemorySupervisorRuntimeStore(digest("sequence-runtime")), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertNotIn("seal", recorder.calls)
                 if seam == "read_plan": self.assertEqual((self.events, recorder.calls), ([], []))
 
@@ -468,7 +539,7 @@ class SupervisorTests(unittest.TestCase):
         minted = require_supervisor_capture_readiness(candidate_sha=readiness.candidate_sha, ready_at=readiness.ready_at, case_id=readiness.case_id, observation_identity=readiness.observation_identity, producer_identity=digest("self-minted-source"), exporter_identity=digest("self-minted-authority"), comparator_identity=digest("self-minted-runtime"), recorder=RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"), store_identity=readiness.store_identity)
         minted_binding = SupervisorSequenceBinding(binding.case_id, binding.candidate_sha, binding.base_sha, binding.task_id, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, minted.capture_plan_digest)
         with self.assertRaises(SupervisorShadowError):
-            qualify_supervisor_sequence(adapters, requests, minted, minted_binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(minted_binding, policy, minted), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), minted, minted_binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(minted_binding, policy, minted), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((self.events, recorder.calls), ([], []))
 
     def test_file_store_reparse_test_double_fails_closed_before_material_publication(self):
@@ -496,7 +567,7 @@ class SupervisorTests(unittest.TestCase):
                 with patch("roundwright.supervisor_shadow._reparse", side_effect=lambda path: path.name.startswith("record-")):
                     with self.assertRaises(SupervisorShadowError): operation()
             with patch("roundwright.supervisor_shadow._reparse", side_effect=lambda path: path.name.startswith("record-")):
-                with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, FileSupervisorLifecycle(Path(directory) / "qualifier", source), recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, FileSupervisorLifecycle(Path(directory) / "qualifier", source), recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
             self.assertEqual((self.events, recorder.calls), ([], []))
 
     @unittest.skipUnless(
@@ -906,7 +977,7 @@ class SupervisorTests(unittest.TestCase):
             def read(self, *_args, **_kwargs): raise RuntimeBindingError("runtime preflight failure")
         for store in (None, object(), FailingStore()):
             with self.subTest(store=type(store).__name__):
-                with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=store, trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=store, trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertEqual(tuple(counts.values()), (0,) * len(counts))
 
     def test_sequence_requires_independent_trusted_policy_receipt_before_runtime(self):
@@ -914,7 +985,7 @@ class SupervisorTests(unittest.TestCase):
         class NeverStore:
             def persist(self, *_args, **_kwargs): raise AssertionError("runtime persist must not run")
             def read(self, *_args, **_kwargs): raise AssertionError("runtime read must not run")
-        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=NeverStore(), trusted_policy_receipt=None, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=NeverStore(), trusted_policy_receipt=None, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((recorder.calls, self.events), ([], []))
 
     def test_sequence_rejects_joint_authority_and_clone_echo_before_downstream_calls(self):
@@ -929,13 +1000,13 @@ class SupervisorTests(unittest.TestCase):
             def read(self, *_args, **_kwargs): raise AssertionError("must not read")
         receipt = replace(self.trusted_receipt(binding, policy, readiness), authority_receipt_digest=digest("jointly-minted-authority"))
         with self.assertRaises(SupervisorShadowError):
-            qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=CloneEchoStore(), trusted_policy_receipt=receipt, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+            qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=CloneEchoStore(), trusted_policy_receipt=receipt, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((tuple(counts.values()), recorder.calls, self.events), ((0,) * len(counts), [], []))
         receipt = self.trusted_receipt(binding, policy, readiness)
         for field, value in (("source_identity", digest("self-minted-source")), ("authority_identity", digest("self-minted-authority")), ("authority_receipt_digest", digest("self-minted-receipt")), ("candidate_sha", "d" * 40), ("freshness_until", 100)):
             with self.subTest(field=field):
                 with self.assertRaises(SupervisorShadowError):
-                    qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=replace(receipt, **{field: value}), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                    qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=replace(receipt, **{field: value}), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertEqual((tuple(counts.values()), recorder.calls, self.events), ((0,) * len(counts), [], []))
 
     def test_sequence_rejects_jointly_minted_reduced_authority_store_before_downstream_calls(self):
@@ -954,7 +1025,7 @@ class SupervisorTests(unittest.TestCase):
             forged_store = FileReviewAuthorityStore(forged_root, expectation=expectation)
             forged_evidence = forged_store.persist(authority, candidate_sha=binding.candidate_sha, configuration_anchor_digest=anchor, ready_at=101, freshness_until=120)
             with self.assertRaises(SupervisorShadowError):
-                qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=forged_store, review_authority_evidence=forged_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+                qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=forged_store, review_authority_evidence=forged_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((tuple(counts.values()), recorder.calls, self.events), ((0,) * len(counts), [], []))
 
     def test_sequence_same_expectation_clone_authority_store_has_zero_downstream_calls(self):
@@ -972,7 +1043,7 @@ class SupervisorTests(unittest.TestCase):
         class ReadFailingStore:
             def persist(self, runtime, **kwargs): return InMemorySupervisorRuntimeStore(digest("unused")).persist(runtime, **kwargs)
             def read(self, *_args, **_kwargs): raise RuntimeBindingError("read failure")
-        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=ReadFailingStore(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=ReadFailingStore(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((recorder.calls, self.events), ([], []))
 
     def test_sequence_runtime_read_wrong_type_has_zero_downstream_calls(self):
@@ -980,7 +1051,7 @@ class SupervisorTests(unittest.TestCase):
         class WrongTypeStore:
             def persist(self, runtime, **kwargs): return InMemorySupervisorRuntimeStore(digest("wrong-type")).persist(runtime, **kwargs)
             def read(self, *_args, **_kwargs): return object()
-        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=WrongTypeStore(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=WrongTypeStore(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((recorder.calls, self.events), ([], []))
 
     def test_sequence_runtime_candidate_receipt_drift_has_zero_downstream_calls(self):
@@ -989,7 +1060,7 @@ class SupervisorTests(unittest.TestCase):
             def __init__(self): self.store = InMemorySupervisorRuntimeStore(digest("candidate-drift"))
             def persist(self, runtime, **kwargs): return replace(self.store.persist(runtime, **kwargs), candidate_sha="d" * 40)
             def read(self, receipt, **kwargs): return self.store.read(receipt, **kwargs)
-        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=CandidateDriftStore(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=CandidateDriftStore(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((recorder.calls, self.events), ([], []))
 
     def test_runtime_binding_canonical_parser_rejects_adversarial_material(self):

@@ -1,5 +1,48 @@
 {
   "schema": "roundwright-phase5-coverage/v1",
+  "implementation_requirements": {
+    "issue": "136",
+    "destinations": [
+      "trusted-advisory-admission",
+      "accepted-guidance-resolution",
+      "typed-advisory-configuration",
+      "public-safe-advisory-qualification"
+    ],
+    "artifacts": [
+      {"identity":"advisory-policy-v3","path":"src/roundwright/role_capability_policy.py","sha256":"10088f5ab0a8f73fe3bb28202fda990b35670ac80617140908cf7c3aaa799896"},
+      {"identity":"advisory-policy-adversarial-tests-v2","path":"tests/test_role_capability_policy.py","sha256":"be226e82e43ac526a40ce3e62f9fb09e11e2f10254fd767aa081525839485e99"},
+      {"identity":"advisory-role-budget-ledger-tests-v1","path":"tests/test_role_budget_ledger.py","sha256":"360484fbe31035ecda74e47c2049ac6656563ea6a750504800b6bc18b2a367eb"},
+      {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"d145113ab055657949a83d478c06a15f270721971820f2db3d4da73d8225f885"},
+      {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"9eebef3c2fec690e711fdd4596f0bce3a70996519a207e0610d6b3700c7c29a4"},
+      {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"},
+      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"780df764f1d13c2d89de08376727b2a804eaaec72a685f1ad142a634433ccda4"},
+      {"identity":"advisory-worker-seam-tests-v1","path":"tests/test_codex_worker.py","sha256":"6f8f6141109dfb3ded4d3dcb72cdf417048b686acf258eb694ee9fcf5db65db6"},
+      {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"5da5966c94ff32dc2b787090a6a987a6bdbffb8bff51bd77162063f2a82a1f62"},
+      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"776adf8d8e4657ed10bb2f8383623d0c876f95b8e81c105685d859f9c5151ae9"},
+      {"identity":"advisory-native-supervisor-bridge-v1","path":"src/roundwright/supervisor_toolbox.py","sha256":"d8694e9a2b3097e7d0be1da0abf6227c9a53658a07d3e4696e809d814ca1220b"},
+      {"identity":"advisory-native-supervisor-bridge-tests-v1","path":"tests/test_codex_supervisor.py","sha256":"6bbb1465417dd246bb75f2fccd287128ebc9cbaec17c66d09c6f0a6a01ee4532"},
+      {"identity":"advisory-native-dependency-review-bridge-v1","path":"src/roundwright/dependency_review_toolbox.py","sha256":"5244f1c88488e8b15c0f4bb1c6101ad87bbef1d08501572306da2e18f3706eea"},
+      {"identity":"advisory-native-dependency-review-bridge-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"fc001864cb64caea16d5df7798a17a3de2986662c79c204d90eba6186a2ca470"},
+      {"identity":"advisory-provider-attempt-runtime-v1","path":"src/roundwright/provider_attempt_runtime.py","sha256":"f41bb7b124e5295e11e262d53bda60ca2229a34dafc11cd8665b5a7aa0c4e1d4"},
+      {"identity":"advisory-provider-attempt-runtime-tests-v1","path":"tests/test_provider_attempt_runtime.py","sha256":"3efdca16da94a17e1e8f4e93a6b977da6bbeb5916c23c85f665683d0d83c14fa"},
+      {"identity":"advisory-worker-toolbox-v1","path":"src/roundwright/worker_toolbox.py","sha256":"3ce51d8a286b574c5068adebf33e20d6b6227e15383a344e0764763b639e744c"},
+      {"identity":"advisory-worker-toolbox-tests-v1","path":"tests/test_worker_toolbox.py","sha256":"5b749edcb3837f93928d27de2d407259ee6e7bdc5c76c39226ac26fd41ec9ec7"},
+      {"identity":"advisory-worker-shadow-v1","path":"src/roundwright/worker_shadow.py","sha256":"7908f8ca3663a905fe810df654a0c4d0a2231f62dc5386b11866adb5d779e9f2"},
+      {"identity":"advisory-worker-shadow-tests-v1","path":"tests/test_worker_shadow.py","sha256":"b6488715b5b6c6dbb9b5ff969e7eb07d29702508a11b5b6a6fdb97a0817b8e85"},
+      {"identity":"advisory-supervisor-shadow-v1","path":"src/roundwright/supervisor_shadow.py","sha256":"c1eefa8804e1af3075eb377fd49e2848bd69111bee1286225b686c0d5247f67e"},
+      {"identity":"advisory-external-validation-v1","path":"src/roundwright/external_validation.py","sha256":"affb9ebc373002f1527c16e06bb89d5dc3ee41edb5e0db701d66b2430a7091c3"},
+      {"identity":"advisory-external-validation-tests-v1","path":"tests/test_external_validation.py","sha256":"8dc07b59a52ef5a0ea8d581b06a76ff6030c04827d2ba322f621fd0a5a035626"},
+      {"identity":"advisory-runtime-defaults-v1","path":"src/roundwright/runtime-defaults.toml","sha256":"799b958981d4a6cbe82b0255a30b8d32b5e061fdef87088b2919aa4b2d463911"},
+      {"identity":"advisory-runtime-defaults-tests-v1","path":"tests/test_configuration.py","sha256":"f08c87086c68b64c870028ef1d767b7c99e0d674daeea09eebe7e4a687f49a9f"},
+      {"identity":"advisory-coding-tools-v1","path":"src/roundwright/coding_tools.py","sha256":"3c5f7b95455aea70ca3205317987831c222f030f2b84c3a5914c7b57fa9135e2"},
+      {"identity":"advisory-coding-tools-tests-v1","path":"tests/test_coding_tools.py","sha256":"3de5d104f99b399c7b5ab28af8aef9de8ec08dfd058023923590f5a0973423b0"},
+      {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"ff0d8d185c4083c8fe8beaff1c28cb5f066b5cabc57c864f23a1f927934db246"},
+      {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
+      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"570485e5e1289e761dc20082aa1f47212b8376ae2672cd473d3a819bb812a498"},
+      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"32f8943d91aad812ee73ba452427a4bc080b56d6691b5df48e4b81b0905fd28e"},
+      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"ff510047f8809cfda5e5852237fa3fb1b4ae86a4fa791e046d18a99ae7ff4a9a"}
+    ]
+  },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},
   "items": [
     {"id":"EV-0F91CDC81DEA","disposition":"merge","destination":"promotion-evaluation","owner_issue":"#120","prerequisites":["#112","#119"],"verification":"candidate-bound-promotion-package","confidence":"medium","status":"proposed"},

@@ -65,6 +65,7 @@ from .provider_attempt_runtime import (
     install_host_runtime,
     prepare_context as prepare_provider_attempt_context,
 )
+from .role_capability_policy import RoleCapabilityError, require_external_production_activation
 from . import lifecycle_observation
 from .cross_environment import (
     CROSS_ENVIRONMENT_EVIDENCE_SCHEMA,
@@ -244,10 +245,10 @@ from .codex_dependency_review import (
     DependencyReviewResultKind,
     DependencyReviewService,
     NativeCodexDependencyReviewBackend,
-    prepare_dependency_review_host,
 )
 from .configuration import RepositoryIdentity
 from .dependency_review import AffectedSubset, DependencyReviewBinding, DependencyReviewError, DependencyReviewStore, SourceOwnedRelation
+from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs
 from .provider_health import ProviderHealthAuditIdentity
 DEPENDENCY_REVIEW_ATTEMPT_EXPORTER_IDENTITY = _digest(
     {"schema": DEPENDENCY_REVIEW_ATTEMPT_SCHEMA, "component": "public-safe-dependency-review-exporter"}
@@ -296,7 +297,9 @@ class DependencyReviewRequestInputs:
     audit: ProviderHealthAuditIdentity
     attempt_id: str
     ready_at: int
+    advisory_execution: SealedRoleExecution | None = field(repr=False, compare=False, default=None)
     backend: NativeCodexDependencyReviewBackend | None = field(repr=False, compare=False, default=None)
+    execution_host: TrustedExecutionHostInputs = field(repr=False, compare=False, kw_only=True)
     source_owned_relations: tuple[SourceOwnedRelation, ...] = ()
     supersedes_attempt_id: str | None = None
 
@@ -310,6 +313,9 @@ class DependencyReviewRequestInputs:
             or not _safe_token(self.attempt_id)
             or self.attempt_id != self.subset.snapshot_id
             or type(self.ready_at) is not int or self.ready_at < 0
+            or type(self.advisory_execution) is not SealedRoleExecution
+            or self.advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW
+            or type(self.execution_host) is not TrustedExecutionHostInputs
             or (self.backend is not None and not callable(getattr(self.backend, "open_fresh_session", None)))
             or type(self.source_owned_relations) is not tuple
             or any(type(item) is not SourceOwnedRelation for item in self.source_owned_relations)
@@ -876,7 +882,8 @@ class DependencyReviewAttemptAdapter:
             result = DependencyReviewService().run(
                 host.repository, host.subset, attempt_id=binding.case_id,
                 binding=host.binding, adapter=host.adapter,
-                checkpoint_session=host.checkpoint_session, checkpoint_turn=host.checkpoint_turn,
+                checkpoint_session=host.checkpoint_session, checkpoint_turn=host.checkpoint_turn, advisory_execution=host.advisory_execution,
+                execution_host=host.execution_host, budget_ledger_path=host.budget_ledger_path,
                 source_owned_relations=host.source_owned_relations,
                 supersedes_attempt_id=host.supersedes_attempt_id,
             )
@@ -5233,6 +5240,15 @@ def run_provider_attempt_accounting_profile(
     ``run_profile_executor`` library API.
     """
 
+    # No candidate-local descriptor or hermetic HostInputs object is a native
+    # host promotion.  Deny before resolving Harness, parsing a request,
+    # creating a Recorder/store, or constructing a Supervisor runner.
+    try:
+        require_external_production_activation()
+    except RoleCapabilityError as error:
+        raise ExternalValidationAdapterError(
+            "provider attempt production activation is unavailable"
+        ) from error
     harness = _harness_executor()
     try:
         request = harness.ExecutorRequest.parse(request_value)
@@ -5279,6 +5295,8 @@ def _dependency_review_host_inputs_identity(host_inputs: DependencyReviewHostInp
         "configuration_digest": subset.configuration_digest,
         "policy_digest": subset.policy_digest,
         "profile_identity": host_inputs.binding.profile_identity,
+        "execution_host": host_inputs.execution_host.identity,
+        "budget_ledger": _digest({"path": host_inputs.budget_ledger_path.resolve(strict=False).as_posix()}),
         "native_control_digest": dependency_review_native_control_digest(),
         "source_owned_relation_digests": [item.relation_digest for item in host_inputs.source_owned_relations],
         "supersedes_attempt_id": host_inputs.supersedes_attempt_id,
@@ -5325,10 +5343,23 @@ def _prepare_dependency_review_attempt_request(
         raise ExternalValidationAdapterError("dependency review preflight inputs are invalid")
     store_root_identity = _dependency_review_store_root_identity(store_root)
     try:
-        host_inputs = prepare_dependency_review_host(
-            inputs.repository, inputs.subset, inputs.binding, inputs.audit, backend=inputs.backend,
-            source_owned_relations=inputs.source_owned_relations,
-            supersedes_attempt_id=inputs.supersedes_attempt_id,
+        # This is a product-owned harness fixture assembly, not the public
+        # production host constructor.  It requires an already supplied
+        # hermetic backend and never selects, imports, or constructs a native
+        # provider client; those paths remain fail-closed in the product
+        # constructor and shipped native bridges.
+        if (
+            inputs.backend is None
+            or type(inputs.backend).__module__.startswith("roundwright.")
+        ):
+            raise DependencyReviewDispatchError("dependency review harness requires an explicit backend")
+        host_inputs = DependencyReviewHostInputs(
+            inputs.repository, inputs.subset, inputs.binding,
+            CodexDependencyReviewAdapter(inputs.backend, inputs.audit.profile, inputs.audit),
+            lambda _session: None, lambda _session, _turn: None,
+            inputs.advisory_execution, inputs.execution_host,
+            store_root / "dependency-review-role-budget.sqlite",
+            inputs.source_owned_relations, inputs.supersedes_attempt_id,
         )
     except (DependencyReviewDispatchError, ValueError) as error:
         raise ExternalValidationAdapterError("dependency review host preparation failed") from error
@@ -5423,6 +5454,8 @@ def _validated_dependency_review_request(
         or dependency_review_native_control_digest() != prepared_request.native_control_digest
         or host.repository != inputs.repository or host.subset != inputs.subset or host.binding != inputs.binding
         or host.adapter.profile_identity != inputs.binding.profile_identity
+        or host.execution_host != inputs.execution_host
+        or host.budget_ledger_path != store_root / "dependency-review-role-budget.sqlite"
     ):
         raise ExternalValidationAdapterError("dependency review host inputs have drifted")
     producer, exporter, comparator = dependency_review_attempt_component_identities()

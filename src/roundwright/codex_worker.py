@@ -23,6 +23,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import ProviderRole
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedRoleEffectReservation, require_worker_tool_capability
 
 
 class CodexWorkerError(ValueError):
@@ -413,6 +414,25 @@ class CodexWorkerAdapter:
     def capability_contract(self) -> WorkerCapabilityContract:
         return self._tools.capability_contract
 
+    def effect_material(self, request: CodexWorkerRequest) -> tuple[dict[str, object], dict[str, object]]:
+        """Return the exact request and adapter facts bound by the host ledger."""
+
+        if type(request) is not CodexWorkerRequest:
+            raise CodexWorkerError("Worker dispatch is invalid")
+        return (
+            {
+                "input_digest": request.input_digest,
+                "action": request.action.value,
+                "context": request.context.__dict__,
+                "resume_session_identity": request.resume_session_identity,
+            },
+            {
+                "adapter_profile": self.profile_identity,
+                "runtime": self.runtime_fingerprint,
+                "tools": tuple(item.value for item in self._tools.tools),
+            },
+        )
+
     def dispatch(
         self,
         request: CodexWorkerRequest,
@@ -421,6 +441,8 @@ class CodexWorkerAdapter:
         checkpoint_turn: Callable[[str, str], None],
         execute_tool_request: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult] | None = None,
         checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None,
+        advisory_execution: SealedRoleExecution,
+        effect_reservation: TrustedRoleEffectReservation,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -431,16 +453,39 @@ class CodexWorkerAdapter:
 
         if type(request) is not CodexWorkerRequest or not callable(checkpoint_session) or not callable(checkpoint_turn):
             raise CodexWorkerError("Worker dispatch is invalid")
+        if (type(advisory_execution) is not SealedRoleExecution
+                or advisory_execution.seam is not RoleExecutionSeam.WORKER
+                or type(effect_reservation) is not TrustedRoleEffectReservation):
+            raise CodexWorkerError("Worker advisory admission is unavailable")
+        try:
+            request_material, preflight_material = self.effect_material(request)
+
+            def admit() -> dict[str, object]:
+                # The record is deliberately re-read at each effect boundary.
+                # The durable reservation is evidence for this exact binding,
+                # not a cached permit or a second consumption.
+                return effect_reservation.require_before_effect(
+                    advisory_execution, profile=self._profile,
+                    request_or_attempt_identity=request.attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                )
+
+            admission_receipt = admit()
+        except RoleCapabilityError as error:
+            raise CodexWorkerError("Worker advisory admission is denied") from error
         session_identity: str | None = None
         turn_identity: str | None = None
         session: NativeWorkerSession | None = None
         turn: NativeWorkerTurn | None = None
         try:
+            admit()
             session = self._backend.open_session(self._profile, resume_session_identity=request.resume_session_identity, action=request.action)
             session_identity = _identity(session, "session")
             if request.resume_session_identity is not None and session_identity != request.resume_session_identity:
                 _close_session(session)
                 return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
+            admit()
             checkpoint_session(session_identity)
         except CodexAdapterError:
             _close_session(session)
@@ -452,8 +497,10 @@ class CodexWorkerAdapter:
             _close_session(session)
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
         try:
+            admit()
             turn = session.start_turn(request, self._tools)
             turn_identity = _identity(turn, "turn")
+            admit()
             checkpoint_turn(session_identity, turn_identity)
         except CodexAdapterError:
             _abort_turn(turn); _close_session(session)
@@ -468,14 +515,26 @@ class CodexWorkerAdapter:
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         try:
             if execute_tool_request is None:
+                admit()
                 response = turn.read_response()
             else:
+                def authorized_tool_request(item: NativeWorkerToolRequest) -> NativeWorkerToolResult:
+                    try:
+                        require_worker_tool_capability(admit(), tool=item.tool)
+                    except RoleCapabilityError:
+                        # Do not hand an ungranted request to the product
+                        # callback.  This is deliberately a terminal native
+                        # result rather than an ambient permission exception.
+                        return NativeWorkerToolResult(item.sequence, item.tool, "denied")
+                    return execute_tool_request(item)
+
                 response = _consume_steps(
-                    turn, execute_tool_request,
+                    turn, authorized_tool_request,
                     checkpoint_next_turn=lambda: _checkpoint_next_turn(
                         turn, session_identity, checkpoint_turn
                     ),
                     checkpoint_submission=checkpoint_submission,
+                    authorize_effect=admit,
                 )
                 # A coding tool result may advance the native handle.  Bind
                 # the returned terminal outcome to that actual final turn.
@@ -512,10 +571,11 @@ def _checkpoint_next_turn(
     return next_turn_identity
 
 
-def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], str], checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None) -> NativeWorkerResponse:
+def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRequest], NativeWorkerToolResult], *, checkpoint_next_turn: Callable[[], str], checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None, authorize_effect: Callable[[], object]) -> NativeWorkerResponse:
     """Consume one exact turn; malformed/uncertain tool exchange is ambiguous."""
     expected = 1
     while expected <= _MAX_TOOL_STEPS:
+        authorize_effect()
         step = turn.read_step()
         if step.response is not None:
             return step.response
@@ -529,17 +589,22 @@ def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRe
             # This durable intent is bound to the already checkpointed source
             # turn.  A crash from here through the provider handoff can never
             # be reconstructed as a clear delivery.
+            authorize_effect()
             checkpoint_submission(request, result, "intent", None)
         try:
+            authorize_effect()
             turn.submit_tool_result(result)
             # A coding result creates a fresh exact SDK turn.  Its identity
             # must become durable before this loop asks it for a stream.
+            authorize_effect()
             next_turn_identity = checkpoint_next_turn()
         except Exception:
             if checkpoint_submission is not None:
+                authorize_effect()
                 checkpoint_submission(request, result, "uncertain", None)
             raise
         if checkpoint_submission is not None:
+            authorize_effect()
             checkpoint_submission(request, result, "submitted", next_turn_identity)
         expected += 1
     raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)

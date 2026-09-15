@@ -1,5 +1,50 @@
 # Authority Model
 
+## Bounded advisory-role admission
+
+Recovery Advisor and Owner Intent Interpreter are opt-in advisory instances,
+not dispatchers. Admission requires independent authority evidence bound to the
+repository, task, deployment, epoch, expiry, revocation identity, host/state/
+fence-bound instance, accepted guidance at an exact trusted Git tree, and a
+root-normalized typed action/path/process/test-input/network/resource scope. The
+profile intersects that scope with a reviewed, immutable per-capability SDK
+mapping and finite budgets. Drive-qualified, UNC, traversal, repeated-separator,
+and non-canonical scope paths fail closed.
+
+Configuration resolves profiles only; it cannot create an admission or
+authority. A readiness receipt always leaves effective repository authority
+disabled. Missing, stale, revoked, copied, reassigned, expanded, or unknown
+evidence denies the request. The admission-record reader requires the existing
+candidate/Git-entrypoint control that validates authoritative `origin/main`;
+it cannot be constructed from a role-local path alone. The shared pre-effect gate
+rereads that Git blob using its sealed runtime clock before every use. Guidance derives only the root-to-task
+`AGENTS.md` chain at the pinned tree; candidate, global, unrelated, and ambient
+instructions are prohibited. A typed pre-effect gate is defined for Worker,
+Supervisor, dependency-review, and both advisory seams. No advisory dispatch
+is enabled in those existing runtime seams today. When an advisory capsule is
+provided, the persistent Worker, fresh Supervisor, and dependency-review
+adapters call its matching sealed pre-effect gate before opening a provider
+session; a mismatched or denied capsule opens no session. Recovery Advisor and
+Owner Intent Interpreter retain their explicit non-dispatching gates until a
+dedicated provider route is introduced.
+
+Each capsule also carries immutable provider-guidance evidence: the matching
+role view, provider working-root identity, exact injected context digest,
+accepted-main identity, task candidate, and selected guidance receipt. A
+mismatched view or receipt fails before any hermetic fixture effect. Launch
+facts are sealed transitively: every verification re-authenticates the complete
+injected instruction payload to the accepted-guidance bytes, so coordinated
+public-field mutation is not a valid launch context. The native
+SDK has no qualified discovery-off control, so injected prompt prose is never
+treated as disabling discovery; every real bridge remains disabled pending a
+separately reviewed external host promotion.
+
+Owner-facing grant drafts are complete canonical requests: they name bounded
+actions and descriptors together with every instance, repository, state,
+deployment, host, epoch, fence, candidate, profile, guidance, store, record,
+authority, validity, and revocation binding. An owner selects the named existing
+grant; they never calculate a replacement identifier.
+
 ## Roles
 
 - **Owner:** approves the exact reviewed candidate and is the only authority that may authorize merge, release, publication, or destructive cleanup.

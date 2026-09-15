@@ -48,6 +48,8 @@ from .coding_worker_state import (
 )
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
+from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
+from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect
 from .shadow import RecorderBinding
 from .worker_shadow import (
     ExternalCapturePlanReceipt,
@@ -58,6 +60,7 @@ from .worker_shadow import (
     WorkerShadowCaptureReadiness,
     WorkerShadowError,
     qualify_worker_adapter,
+    require_worker_qualification_preflight,
     require_worker_shadow_capture_readiness,
 )
 from .codex_worker import CodexWorkerAdapter
@@ -282,9 +285,13 @@ class HarnessExternalWorkerRecorder(ExternalWorkerRecorder):
 class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
     """Executable deny-all/read-only bridge over the reviewed native SDK API."""
 
-    def __init__(self, *, cwd: Path, completion: CompletionDeadline, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, *, cwd: Path, completion: CompletionDeadline, launch_context: TrustedProviderLaunchContext, codex_factory: Callable[[], object] | None = None, approval_mode: object | None = None, sandbox: object | None = None, effort_factory: Callable[[str], object] | None = None, clock: Callable[[], float] = time.monotonic) -> None:
         if not isinstance(cwd, Path):
             raise WorkerShadowError("native Worker working directory is invalid")
+        # A factory is an implementation detail, never evidence that the
+        # caller has authority to open a provider.  In particular, accepting
+        # an injected constructor here used to turn a test seam into a
+        # production activation bypass.
         if codex_factory is None:
             try:
                 sdk = importlib.import_module("openai_codex")
@@ -292,14 +299,23 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 codex_factory, approval_mode, sandbox, effort_factory = sdk.Codex, sdk.ApprovalMode.deny_all, sdk.Sandbox.read_only, generated.ReasoningEffort
             except Exception as error:
                 raise WorkerShadowError("reviewed native Worker SDK is unavailable") from error
-        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock):
+        if type(completion) is not CompletionDeadline or not callable(codex_factory) or approval_mode is None or sandbox is None or not callable(effort_factory) or not callable(clock) or type(launch_context) is not TrustedProviderLaunchContext:
             raise WorkerShadowError("reviewed native Worker SDK binding is invalid")
-        self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock
+        self._cwd, self._completion, self._codex_factory, self._approval_mode, self._sandbox, self._effort_factory, self._clock, self._launch = cwd, completion, codex_factory, approval_mode, sandbox, effort_factory, clock, launch_context
 
     def open_session(self, profile: ProviderProfile, *, resume_session_identity: str | None, action: WorkerAction) -> NativeWorkerSession:
         if type(profile) is not ProviderProfile or type(action) is not WorkerAction:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-        instructions = _NO_TOOL_INSTRUCTIONS if action is WorkerAction.PLANNING else _CODING_TOOL_INSTRUCTIONS
+        try:
+            self._launch.verify(cwd=self._cwd, profile=profile, required_capability=RoleCapability.BOUNDED_CODING)
+            # The candidate has no independently reviewed production host or
+            # qualified provider-native discovery-off control.  This must run
+            # before *any* supplied constructor, including a real SDK factory
+            # passed through a formerly-hermetic seam.
+            require_external_production_activation()
+        except RoleCapabilityError as error:
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
+        instructions = self._launch.developer_instructions
         codex = self._codex_factory()
         try:
             client = codex.__enter__() if hasattr(codex, "__enter__") else codex
@@ -310,7 +326,7 @@ class HarnessNativeCodexWorkerBackend(NativeCodexWorkerBackend):
                 if not callable(resume):
                     raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
                 thread = resume(resume_session_identity, approval_mode=self._approval_mode, cwd=str(self._cwd), developer_instructions=instructions, model=profile.model, sandbox=self._sandbox)
-            return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile.model, self._sandbox, self._effort_factory, profile.reasoning_effort.value, self._completion, self._clock)
+            return _HarnessWorkerSession(thread, codex, self._approval_mode, self._cwd, profile, self._sandbox, self._effort_factory, self._completion, self._clock, self._launch)
         except CodexAdapterError:
             _close(codex)
             raise
@@ -353,8 +369,8 @@ class _HarnessCleanupOwner:
 
 
 class _HarnessWorkerSession(NativeWorkerSession):
-    def __init__(self, thread: object, codex: object, approval_mode: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
-        self._thread, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock, self._started = thread, approval_mode, cwd, model, sandbox, effort_factory, effort, completion, clock, False
+    def __init__(self, thread: object, codex: object, approval_mode: object, cwd: Path, profile: ProviderProfile, sandbox: object, effort_factory: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float], launch_context: TrustedProviderLaunchContext) -> None:
+        self._thread, self._approval_mode, self._cwd, self._profile, self._sandbox, self._effort_factory, self._completion, self._clock, self._started, self._launch = thread, approval_mode, cwd, profile, sandbox, effort_factory, completion, clock, False, launch_context
         self._cleanup = _HarnessCleanupOwner(codex)
 
     def identity(self) -> str:
@@ -370,18 +386,22 @@ class _HarnessWorkerSession(NativeWorkerSession):
         if self._started or type(request) is not CodexWorkerRequest or type(tools) is not BoundedWorkerToolSurface:
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         self._started = True
+        try:
+            self._launch.verify(cwd=self._cwd, profile=self._profile, required_capability=RoleCapability.BOUNDED_CODING)
+        except RoleCapabilityError as error:
+            raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         if request.action is not WorkerAction.PLANNING:
             required = {WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE}
             if set(tools.tools) != required:
                 raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
-            return _HarnessCodingWorkerTurn(self._thread, self._cleanup, request, tools, self._approval_mode, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock)
+            return _HarnessCodingWorkerTurn(self._thread, self._cleanup, request, tools, self._approval_mode, self._cwd, self._profile, self._sandbox, self._effort_factory, self._completion, self._clock, self._launch)
         if tools.capability_contract.value != "no-tools-self-contained/v1":
             raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE)
         # The full canonical request is transient. Only the validated structured
         # lifecycle projection below can cross the SDK boundary.
         prompt = json.dumps(_native_payload(request, tools), sort_keys=True, separators=(",", ":"))
         try:
-            handle = self._thread.turn(prompt, approval_mode=self._approval_mode, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
+            handle = self._thread.turn(prompt, approval_mode=self._approval_mode, cwd=str(self._cwd), model=self._profile.model, effort=self._effort_factory(self._profile.reasoning_effort.value), output_schema=_result_schema(request.action.value), sandbox=self._sandbox)
             return _HarnessWorkerTurn(handle, self._cleanup, request.action, self._completion, self._clock)
         except Exception as error:
             self._cleanup.close()
@@ -420,9 +440,9 @@ class _HarnessWorkerTurn(NativeWorkerTurn):
 class _HarnessCodingWorkerTurn(NativeWorkerTurn):
     """Repeated constrained SDK turns over one persistent native thread."""
 
-    def __init__(self, thread: object, cleanup: _HarnessCleanupOwner, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface, approval: object, cwd: Path, model: str, sandbox: object, effort_factory: Callable[[str], object], effort: str, completion: CompletionDeadline, clock: Callable[[], float]) -> None:
+    def __init__(self, thread: object, cleanup: _HarnessCleanupOwner, request: CodexWorkerRequest, tools: BoundedWorkerToolSurface, approval: object, cwd: Path, profile: ProviderProfile, sandbox: object, effort_factory: Callable[[str], object], completion: CompletionDeadline, clock: Callable[[], float], launch_context: TrustedProviderLaunchContext) -> None:
         self._thread, self._cleanup, self._request, self._tools = thread, cleanup, request, tools
-        self._approval, self._cwd, self._model, self._sandbox, self._effort_factory, self._effort, self._completion, self._clock = approval, cwd, model, sandbox, effort_factory, effort, completion, clock
+        self._approval, self._cwd, self._profile, self._sandbox, self._effort_factory, self._completion, self._clock, self._launch = approval, cwd, profile, sandbox, effort_factory, completion, clock, launch_context
         self._handle: object | None = None
         self._start({"schema": "roundwright-coding-turn/v1", "request": _native_coding_payload(request, tools), "previous_result": None})
 
@@ -454,7 +474,10 @@ class _HarnessCodingWorkerTurn(NativeWorkerTurn):
 
     def _start(self, payload: Mapping[str, object]) -> None:
         try:
-            self._handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._model, effort=self._effort_factory(self._effort), output_schema=_coding_schema(self._request.action), sandbox=self._sandbox)
+            self._launch.verify(cwd=self._cwd, profile=self._profile, required_capability=RoleCapability.BOUNDED_CODING)
+            self._handle = self._thread.turn(json.dumps(payload, sort_keys=True, separators=(",", ":")), approval_mode=self._approval, cwd=str(self._cwd), model=self._profile.model, effort=self._effort_factory(self._profile.reasoning_effort.value), output_schema=_coding_schema(self._request.action), sandbox=self._sandbox)
+        except RoleCapabilityError as error:
+            self._cleanup.close(); raise CodexAdapterError(CodexFailure.SDK_INCOMPATIBLE) from error
         except Exception as error:
             self._cleanup.close(); raise CodexAdapterError(CodexFailure.UNKNOWN) from error
 
@@ -735,17 +758,45 @@ def _native_payload(request: CodexWorkerRequest, tools: BoundedWorkerToolSurface
     return {"schema": "roundwright-worker-native/v1", "capability_contract": "no-tools-self-contained/v1", "provider_instruction": "No provider tools or repository inspection are declared or required; decide only from this normalized public input.", "action": request.action.value, "attempt_id": request.attempt_id, "request_digest": request.input_digest, "context": {"task_id": request.context.task_id, "source_digest": request.context.source_digest, "repository_fingerprint": request.context.repository_fingerprint, "worktree_fingerprint": request.context.worktree_fingerprint, "branch_fingerprint": request.context.branch_fingerprint, "base_fingerprint": request.context.base_fingerprint, "candidate_fingerprint": request.context.candidate_fingerprint, "policy_fingerprint": request.context.policy_fingerprint, "configuration_digest": request.context.configuration_digest}, "objective": request.objective, "constraints": list(request.constraints), "acceptance_criteria": list(request.acceptance_criteria), "resume_session_identity": request.resume_session_identity, "tools": []}
 
 
-def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
+def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, tools: BoundedWorkerToolSurface, request: CodexWorkerRequest, readiness: WorkerShadowCaptureReadiness, binding: WorkerQualificationBinding, recorder: ExternalWorkerRecorder, advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[str, str, WorkerResultKind, WorkerParserDiagnostic | None, WorkerOutcomeSource | None, WorkerSdkTurnErrorCategory | None], None]) -> WorkerQualificationResult:
     """Operational composition point; all readiness checks occur before SDK dispatch."""
-    return qualify_worker_adapter(CodexWorkerAdapter(backend, profile, audit, tools), request, readiness, binding, recorder, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
+    adapter = CodexWorkerAdapter(backend, profile, audit, tools)
+    require_worker_qualification_preflight(
+        adapter, request, readiness, binding, recorder, advisory_execution,
+        checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
+        checkpoint_result=checkpoint_result,
+    )
+    request_material, preflight_material = adapter.effect_material(request)
+    try:
+        reservation = reserve_role_effect(
+            advisory_execution, host_inputs=execution_host,
+            ledger_path=budget_ledger_path, profile=profile,
+            request_or_attempt_identity=request.attempt_id,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+    except RoleCapabilityError as error:
+        raise WorkerShadowError("Worker qualification budget admission is denied") from error
+    return qualify_worker_adapter(adapter, request, readiness, binding, recorder, advisory_execution, reservation, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
 
 
 class ProductionCodingWorkerRuntime:
-    """Candidate-bound production coding seam; CLI activation remains blocked."""
-    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str]) -> None:
+    """Unavailable installed production coding seam.
+
+    This class intentionally remains import-compatible for callers that need a
+    deterministic denial, but it is not a test harness.  Construction and
+    dispatch both independently require the externally issued activation
+    capability that this candidate deliberately does not contain.
+    """
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str], advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path) -> None:
+        try:
+            require_external_production_activation()
+        except RoleCapabilityError as error:
+            raise WorkerShadowError("production coding activation is unavailable") from error
         if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore
                 or not callable(candidate_probe) or not callable(toolchain_receipt_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
-                or local_tools.capability_digest != dispatch_receipt.capability_digest):
+                or local_tools.capability_digest != dispatch_receipt.capability_digest
+                or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER
+                or type(execution_host) is not TrustedExecutionHostInputs or not isinstance(budget_ledger_path, Path)):
             raise WorkerShadowError("production coding runtime requires a sealed dispatch receipt")
         self._adapter = CodexWorkerAdapter(backend, profile, audit, BoundedWorkerToolSurface((WorkerTool.WORKSPACE_READ, WorkerTool.WORKSPACE_WRITE, WorkerTool.VALIDATION_EXECUTE)))
         self._local_tools = local_tools
@@ -753,6 +804,9 @@ class ProductionCodingWorkerRuntime:
         self._event_store = event_store
         self._candidate_probe = candidate_probe
         self._toolchain_receipt_probe = toolchain_receipt_probe
+        self._advisory_execution = advisory_execution
+        self._execution_host = execution_host
+        self._budget_ledger_path = budget_ledger_path
 
     @property
     def capability_contract(self):
@@ -761,9 +815,25 @@ class ProductionCodingWorkerRuntime:
         return WorkerCapabilityContract.EXECUTABLE_BOUNDED_CODING
 
     def dispatch(self, request: CodexWorkerRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None]):
+        try:
+            require_external_production_activation()
+        except RoleCapabilityError as error:
+            raise WorkerShadowError("production coding activation is unavailable") from error
         if request.action is WorkerAction.PLANNING:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
+        request_material, preflight_material = self._adapter.effect_material(request)
+        try:
+            reservation = reserve_role_effect(
+                self._advisory_execution, host_inputs=self._execution_host,
+                ledger_path=self._budget_ledger_path,
+                profile=self._adapter._profile,
+                request_or_attempt_identity=request.attempt_id,
+                request_material=request_material,
+                preflight_material=preflight_material,
+            )
+        except RoleCapabilityError as error:
+            raise WorkerShadowError("production coding budget admission is denied") from error
         try:
             if self._event_store.requires_reconciliation(request.context.task_id, request.attempt_id, frozenset()):
                 raise WorkerShadowError("coding effect requires durable reconciliation")
@@ -796,7 +866,7 @@ class ProductionCodingWorkerRuntime:
             if state == "submitted": acknowledged_sequences.add(item.sequence)
 
         callback = execute if request.action is not WorkerAction.PLANNING else None
-        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None)
+        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, effect_reservation=reservation)
 
     def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest, acknowledged_sequences: frozenset[int]) -> NativeWorkerToolResult:
         self._dispatch_receipt.validate_for(worker_request, self._candidate_probe(), self._toolchain_receipt_probe())
@@ -885,11 +955,16 @@ class ProductionCodingWorkerEntrypointInputs:
     event_store: CodingToolEventStore
     candidate_probe: Callable[[], str]
     toolchain_receipt_probe: Callable[[], str]
+    advisory_execution: SealedRoleExecution
+    execution_host: TrustedExecutionHostInputs
+    budget_ledger_path: Path
 
     def __post_init__(self) -> None:
         if (type(self.profile) is not ProviderProfile or type(self.audit) is not ProviderHealthAuditIdentity
                 or type(self.local_tools) is not BoundedCodingTools or type(self.dispatch_receipt) is not CodingDispatchReceipt
                 or type(self.event_store) is not CodingToolEventStore or not callable(self.candidate_probe) or not callable(self.toolchain_receipt_probe)
+                or type(self.advisory_execution) is not SealedRoleExecution or self.advisory_execution.seam is not RoleExecutionSeam.WORKER
+                or type(self.execution_host) is not TrustedExecutionHostInputs or not isinstance(self.budget_ledger_path, Path)
                 or not callable(getattr(self.backend, "open_session", None))):
             raise WorkerShadowError("production coding entrypoint inputs are invalid")
 
@@ -901,12 +976,19 @@ def run_production_coding_worker(*, inputs: ProductionCodingWorkerEntrypointInpu
     :func:`run_bounded_worker_adapter_qualification` with its no-tools
     capability; this entrypoint accepts only implementation or repair work.
     """
+    # No in-repository value, including a synthetically coherent sealed
+    # execution, activates this public effectful entrypoint.  Qualification
+    # exercises the explicit hermetic adapter seam instead.
+    try:
+        require_external_production_activation()
+    except RoleCapabilityError as error:
+        raise WorkerShadowError("production coding activation is unavailable") from error
     if type(inputs) is not ProductionCodingWorkerEntrypointInputs or type(request) is not CodexWorkerRequest or request.action is WorkerAction.PLANNING:
         raise WorkerShadowError("production coding entrypoint is invalid")
     return ProductionCodingWorkerRuntime(
         backend=inputs.backend, profile=inputs.profile, audit=inputs.audit,
         local_tools=inputs.local_tools, dispatch_receipt=inputs.dispatch_receipt,
-        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe,
+        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe, advisory_execution=inputs.advisory_execution, execution_host=inputs.execution_host, budget_ledger_path=inputs.budget_ledger_path,
     ).dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
 
 

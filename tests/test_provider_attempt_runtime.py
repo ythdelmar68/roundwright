@@ -9,6 +9,7 @@ import os
 import sqlite3
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import replace
 from tempfile import TemporaryDirectory
@@ -31,9 +32,10 @@ from roundwright.provider_attempt_runtime import (
     DiffReviewSelection, DiffReviewSequenceEntry, DurableDiffReviewRunner, MaterializedProviderAttemptContext,
     ProviderAttemptCheckpointFailure, ProviderAttemptHostInputs, ProviderAttemptRuntimeDescriptor, ProviderAttemptRuntimeError,
     ProviderAttemptRuntimeResources, ProviderAttemptCompletionPolicy, PRODUCTION_COMPLETION_POLICY,
-    install_host_runtime,
+    install_host_runtime, provider_attempt_effect_material,
 )
 from roundwright.provider_health import CodexFailure
+from roundwright.role_capability_policy import AdvisoryRole, DurableRoleBudgetLedger, RoleBudget, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.provider_recovery import (
     AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, SupervisorAccountingSnapshot,
     SupervisorTerminalFailure, claim_supervisor_dispatch, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
@@ -48,6 +50,7 @@ from tests.provider_health_fixture import provider_context
 import tests.test_candidate_review as _candidate_test_module
 from tests.test_codex_supervisor import Backend
 from tests.test_external_validation import fake_harness
+from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
 
 def digest(character: str) -> str:
@@ -66,6 +69,46 @@ class _Runner:
 
 
 class ProviderAttemptRuntimeTests(unittest.TestCase):
+    def effect_trust(self, *, identity, recovery, seal, source_digest, review_epoch, review_round, selection, audit):
+        _context, request_material, preflight_material = provider_attempt_effect_material(
+            identity=identity, recovery=recovery, seal=seal, source_digest=source_digest,
+            review_epoch=review_epoch, review_round=review_round,
+            selection=selection, audit=audit,
+        )
+        return (
+            sealed_execution_for_effect(
+                AdvisoryRole.SUPERVISOR, audit.profile,
+                request_identity=selection.provider_attempt_id,
+                request_material=request_material,
+                preflight_material=preflight_material,
+            ),
+            trusted_execution_host(AdvisoryRole.SUPERVISOR, audit.profile),
+        )
+
+    def sequence_entry(self, runner, *, selection=None, recovery=None, audit=None, backend=None):
+        selection = runner.selection if selection is None else selection
+        recovery = runner.recovery if recovery is None else recovery
+        audit = runner.audit if audit is None else audit
+        backend = runner.backend if backend is None else backend
+        execution, host = self.effect_trust(
+            identity=runner.identity, recovery=recovery, seal=runner.seal,
+            source_digest=runner.source_digest, review_epoch=runner.review_epoch,
+            review_round=runner.review_round, selection=selection, audit=audit,
+        )
+        return DiffReviewSequenceEntry(selection, execution, recovery, audit, backend, host)
+
+    def budget_ledger(
+        self, repository: RepositoryIdentity, execution: object, *, budget: RoleBudget | None = None,
+        filename: str = "provider-attempt-budget.sqlite",
+    ) -> DurableRoleBudgetLedger:
+        assert execution is not None
+        return DurableRoleBudgetLedger(
+            repository.root / filename,
+            grant_receipt_digest=execution.contract.admission.grant.receipt_digest,
+            execution_binding=execution.execution_binding,
+            budget=execution.contract.profile.budget if budget is None else budget,
+        )
+
     def descriptor_payload(self) -> dict[str, object]:
         policy = {
             "complete_rounds": 1,
@@ -95,6 +138,14 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             "review_round": 1,
             "completion_policy": PRODUCTION_COMPLETION_POLICY.receipt(),
         }
+
+    def test_public_hosted_provider_entrypoint_is_not_activated_before_harness_or_store_access(self) -> None:
+        with patch("roundwright.external_validation._harness_executor") as harness:
+            with self.assertRaisesRegex(external_validation.ExternalValidationAdapterError, "production activation"):
+                external_validation.run_provider_attempt_accounting_profile(
+                    "execute", {}, Path("unreachable-recorder"), object(),
+                )
+            harness.assert_not_called()
 
     def resources(self, descriptor: ProviderAttemptRuntimeDescriptor) -> ProviderAttemptRuntimeResources:
         repository = object.__new__(RepositoryIdentity)
@@ -128,17 +179,57 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
         dependency_binding, control = _candidate_test_module._dispatch_control(identity, recovery, now, seal.candidate_sha)
         audit = recovery.health_receipt.audit_identity
         backend = Backend(f"runtime-{suffix}", response, [])
+        selection = DiffReviewSelection(
+            f"runtime-review-{suffix}", implementation.implementation_attempt_id,
+            f"runtime-provider-{suffix}", f"runtime-message-{suffix}", f"runtime-lease-{suffix}",
+            now + 60, "Review the immutable candidate.", ("Return a strict verdict.",),
+        )
+        execution, execution_host = self.effect_trust(
+            identity=identity, recovery=recovery, seal=seal, source_digest=digest("7"),
+            review_epoch=1, review_round=1, selection=selection, audit=audit,
+        )
         runner = DurableDiffReviewRunner(
             repository, identity, recovery, binding, seal, lease, dependency_binding, control, audit, backend,
             digest("7"), 1, 1,
-            DiffReviewSelection(
-                f"runtime-review-{suffix}", implementation.implementation_attempt_id,
-                f"runtime-provider-{suffix}", f"runtime-message-{suffix}", f"runtime-lease-{suffix}",
-                now + 60, "Review the immutable candidate.", ("Return a strict verdict.",),
-            ),
+            selection,
+            advisory_execution=execution,
+            execution_host=execution_host,
+            budget_ledger_path=repository.root / "provider-attempt-budget.sqlite",
             case_id=f"runtime-case-{suffix}", ready_at=now,
         )
         return runner, backend, repository, identity, recovery, seal
+
+    def test_sequence_entry_rejects_missing_or_wrong_role_capsule_before_effects(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, _repository, _identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                DiffReviewSequenceEntry(runner.selection, None, recovery, runner.audit, backend, trusted_execution_host(AdvisoryRole.SUPERVISOR, runner.audit.profile))  # type: ignore[arg-type]
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                DiffReviewSequenceEntry(
+                    runner.selection, sealed_execution(AdvisoryRole.WORKER, runner.audit.profile),
+                    recovery, runner.audit, backend, trusted_execution_host(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                )
+            self.assertEqual(backend.calls, 0)
+
+    def test_sequence_entry_refuses_primary_capsule_for_a_fallback_profile(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, _repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            fallback = provider_context(
+                recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+            )
+            with self.assertRaises(ProviderAttemptRuntimeError):
+                DiffReviewSequenceEntry(
+                    runner.selection, sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                    fallback, fallback.health_receipt.audit_identity, backend, trusted_execution_host(AdvisoryRole.SUPERVISOR, fallback.health_receipt.audit_identity.profile),
+                )
+            self.assertEqual(backend.calls, 0)
 
     def test_descriptor_accepts_only_the_closed_json_shape_and_real_anchors(self) -> None:
         descriptor = ProviderAttemptRuntimeDescriptor.parse(self.descriptor_payload())
@@ -227,27 +318,29 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             }
             short_native = HarnessNativeCodexSupervisorBackend(
                 cwd=repository.root, completion=CompletionDeadline(100, 600),
+                launch_context=trusted_provider_launch_context(
+                    sealed_execution(AdvisoryRole.SUPERVISOR, runner.audit.profile),
+                    cwd=repository.root,
+                ),
             )
             host = ProviderAttemptHostInputs(
                 repository, identity, recovery, runner.lease, seal, runner.binding,
                 runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection,
                 short_native,
+                advisory_execution=runner.advisory_execution,
+                execution_host=runner.execution_host,
+                budget_ledger_path=runner.budget_ledger_path,
             )
             with self.assertRaisesRegex(ProviderAttemptRuntimeError, "completion policy"):
                 install_host_runtime(descriptor, host)
             self.assertEqual(backend.calls, 0)
-            # The production host chooses its closed native backend with the
-            # descriptor-bound production deadline; it cannot retain the old
-            # test-scale fallback when no test seam is supplied.
-            materialized = install_host_runtime(
-                dict(descriptor, resource_id="runtime-production-deadline-45"),
-                replace(host, backend=None),
-            )
-            self.assertIsInstance(materialized.resources.runner.backend, HarnessNativeCodexSupervisorBackend)
-            self.assertEqual(
-                materialized.resources.runner.backend.completion,
-                CompletionDeadline(100_000, 600_000),
-            )
+            # Native SDK discovery remains fail-closed until a separately
+            # reviewed discovery-off production control is activated.
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "not activated"):
+                install_host_runtime(
+                    dict(descriptor, resource_id="runtime-production-deadline-45"),
+                    replace(host, backend=None),
+                )
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(
@@ -306,6 +399,33 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(runner.execute(), ("runtime-provider-one",))
             self.assertEqual(backend.calls, 1)
 
+    def test_host_supervisor_execution_drift_blocks_before_attempt_or_backend(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, _recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            drifted = replace(runner, execution_host=replace(
+                runner.execution_host, candidate_sha="c" * 40,
+            ))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                before = connection.execute(
+                    "SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,),
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "context has drifted"):
+                drifted.execute()
+            self.assertEqual(backend.calls, 0)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM provider_attempts WHERE task_id = ?", (identity.task_id,),
+                ).fetchone()[0], before)
+            finally:
+                connection.close()
+
     def test_invalid_then_later_accepted_result_uses_durable_recovery_without_formal_consumption(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary) / "repository"
@@ -328,11 +448,80 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
             )
             accepted = replace(runner, sequence=(
-                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, runner.backend),
-                DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                self.sequence_entry(runner),
+                self.sequence_entry(
+                    runner, selection=second_selection, recovery=second_recovery,
+                    audit=second_recovery.health_receipt.audit_identity,
+                    backend=second_backend,
+                ),
             ))
             self.assertEqual(accepted.execute(), ("runtime-provider-one", "runtime-provider-two"))
             self.assertEqual(read_attempt(repository, identity, "runtime-provider-two", context=recovery).state, AttemptState.ACCEPTED)
+
+    def test_fallback_reserves_its_own_exact_binding_and_reconstructs_without_redispatch(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, primary, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            second_recovery = provider_context(
+                recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+            )
+            fallback = Backend("runtime-budget-fallback", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), [])
+            second = DiffReviewSelection(
+                "runtime-budget-review-two", runner.selection.implementation_attempt_id,
+                "runtime-budget-provider-two", "runtime-budget-message-two", "runtime-budget-lease-two",
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.",
+                ("Return a strict verdict.",), 2,
+            )
+            shared_path = repository.root / "shared-provider-attempt-budget.sqlite"
+            shared = replace(runner, budget_ledger_path=shared_path, sequence=(
+                self.sequence_entry(runner, backend=primary),
+                self.sequence_entry(
+                    runner, selection=second, recovery=second_recovery,
+                    audit=second_recovery.health_receipt.audit_identity,
+                    backend=fallback,
+                ),
+            ))
+            self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
+            self.assertEqual((primary.calls, fallback.calls), (1, 1))
+            connection = sqlite3.connect(shared_path)
+            try:
+                rows = connection.execute(
+                    "SELECT binding_digest, calls, duration_seconds, tokens FROM role_budget_usage"
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(len({row[0] for row in rows}), 2)
+            self.assertEqual({row[1:] for row in rows}, {(1, 60, 4_000)})
+            self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
+            self.assertEqual((primary.calls, fallback.calls), (1, 1))
+
+    def test_shared_budget_final_slot_reservations_serialize(self) -> None:
+        with TemporaryDirectory() as temporary:
+            execution = sealed_execution(AdvisoryRole.SUPERVISOR, self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )[0].audit.profile)
+            path = Path(temporary) / "concurrent-budget.sqlite"
+            ledgers = (
+                DurableRoleBudgetLedger(path, grant_receipt_digest=execution.contract.admission.grant.receipt_digest,
+                    execution_binding=execution.execution_binding, budget=RoleBudget(1, 1, 1)),
+                DurableRoleBudgetLedger(path, grant_receipt_digest=execution.contract.admission.grant.receipt_digest,
+                    execution_binding=execution.execution_binding, budget=RoleBudget(1, 1, 1)),
+            )
+            def reserve(ledger: DurableRoleBudgetLedger) -> bool:
+                try:
+                    ledger.reserve_effect()
+                    return True
+                except RoleCapabilityError:
+                    return False
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                self.assertEqual(sum(pool.map(reserve, ledgers)), 1)
 
     def test_terminal_supervisor_failure_is_durable_and_fails_over_without_invalid_output(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -359,8 +548,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 ("Return a strict verdict.",), 2,
             )
             runner = replace(runner, sequence=(
-                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first_backend),
-                DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                self.sequence_entry(runner, backend=first_backend),
+                self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
             ))
             first_only = replace(runner, sequence=(runner.sequence[0],))
             self.assertEqual(first_only.execute(), (runner.selection.provider_attempt_id,))
@@ -453,8 +642,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
             )
             runner = replace(runner, backend=blocked, sequence=(
-                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, blocked),
-                DiffReviewSequenceEntry(second, second_recovery, second_recovery.health_receipt.audit_identity, fallback),
+                self.sequence_entry(runner, backend=blocked),
+                self.sequence_entry(runner, selection=second, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=fallback),
             ))
             with self.assertRaisesRegex(ProviderAttemptRuntimeError, "accounting decision is terminal"):
                 runner.execute()
@@ -519,8 +708,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
             )
             runner = replace(runner, sequence=(
-                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first),
-                DiffReviewSequenceEntry(second, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                self.sequence_entry(runner, backend=first),
+                self.sequence_entry(runner, selection=second, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
             ))
             self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
             request = second_backend.request
@@ -706,8 +895,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 message_identity="runtime-local-session-message-two",
                 process_lease_id="runtime-local-session-lease-two", within_round_attempt=2)
             runner = replace(runner, backend=first, sequence=(
-                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first),
-                DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second),
+                self.sequence_entry(runner, backend=first),
+                self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second),
             ))
             with patch("roundwright.provider_attempt_runtime.checkpoint_diff_review_session", side_effect=RuntimeError("private callback detail")):
                 with self.assertRaises(ProviderAttemptCheckpointFailure) as raised:
@@ -749,8 +938,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 message_identity="runtime-local-turn-message-two",
                 process_lease_id="runtime-local-turn-lease-two", within_round_attempt=2)
             runner = replace(runner, backend=first, sequence=(
-                DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first),
-                DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second),
+                self.sequence_entry(runner, backend=first),
+                self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second),
             ))
             with patch("roundwright.provider_attempt_runtime.dispatch_diff_review", side_effect=RuntimeError("private callback detail")):
                 with self.assertRaises(ProviderAttemptCheckpointFailure) as raised:
@@ -776,7 +965,15 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 Path(temporary) / "repository",
                 NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
             )
-            runner = replace(runner, review_epoch=2, review_round=4)
+            execution, execution_host = self.effect_trust(
+                identity=identity, recovery=recovery, seal=seal,
+                source_digest=runner.source_digest, review_epoch=2, review_round=4,
+                selection=runner.selection, audit=runner.audit,
+            )
+            runner = replace(
+                runner, review_epoch=2, review_round=4,
+                advisory_execution=execution, execution_host=execution_host,
+            )
             self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
             descriptor = ProviderAttemptRuntimeDescriptor.parse({
                 "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-round-45",
@@ -821,6 +1018,9 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             context = install_host_runtime(descriptor, ProviderAttemptHostInputs(
                 repository, identity, recovery, runner.lease, seal, runner.binding,
                 runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection, backend,
+                advisory_execution=runner.advisory_execution,
+                execution_host=runner.execution_host,
+                budget_ledger_path=runner.budget_ledger_path,
             ))
             connection = sqlite3.connect(database_path(repository))
             try:
@@ -891,6 +1091,9 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             context = install_host_runtime(descriptor, ProviderAttemptHostInputs(
                 repository, identity, recovery, runner.lease, seal, runner.binding,
                 runner.dependency_binding, runner.dispatch_control, (runner.audit,), runner.selection, backend,
+                advisory_execution=runner.advisory_execution,
+                execution_host=runner.execution_host,
+                budget_ledger_path=runner.budget_ledger_path,
             ))
             drifted_runner = replace(context.resources.runner, selection=replace(
                 runner.selection, implementation_attempt_id="runtime-preflight-missing-implementation",
@@ -952,6 +1155,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    @unittest.skip("provider-attempt production activation intentionally unavailable")
     def test_hosted_entrypoint_runs_reviewed_harness_validate_then_execute(self) -> None:
         """Exercise the documented V2 host shape against the reviewed library.
 
@@ -1026,13 +1230,17 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     "execution_context": descriptor,
                 }
                 sequence = (
-                    DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first_backend),
-                    DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                    self.sequence_entry(runner, backend=first_backend),
+                    self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
                 )
                 host = ProviderAttemptHostInputs(
                     repository, identity, recovery, runner.lease, seal, runner.binding,
                     runner.dependency_binding, runner.dispatch_control,
-                    (runner.audit, second_recovery.health_receipt.audit_identity), runner.selection, first_backend, sequence,
+                    (runner.audit, second_recovery.health_receipt.audit_identity), runner.selection, first_backend,
+                    execution_host=runner.execution_host,
+                    budget_ledger_path=runner.budget_ledger_path,
+                    sequence=sequence,
+                    advisory_execution=runner.advisory_execution,
                 )
                 store = Path(temporary) / "recorder"
                 parsed = harness.ExecutorRequest.parse(request)
@@ -1084,6 +1292,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     sys.modules.pop(name, None)
             sys.modules.update(prior_modules)
 
+    @unittest.skip("provider-attempt production activation intentionally unavailable")
     def test_hosted_ambiguous_attempt_blocks_before_failover_dispatch(self) -> None:
         harness_source = os.environ.get("ROUNDWRIGHT_HARNESS_SOURCE")
         if harness_source is None:
@@ -1154,17 +1363,20 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     repository, identity, recovery, runner.lease, seal, runner.binding,
                     runner.dependency_binding, runner.dispatch_control,
                     (runner.audit, second_recovery.health_receipt.audit_identity), runner.selection, first_backend,
-                    (
-                        DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first_backend),
-                        DiffReviewSequenceEntry(second_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                    execution_host=runner.execution_host,
+                    budget_ledger_path=runner.budget_ledger_path,
+                    sequence=(
+                        self.sequence_entry(runner, backend=first_backend),
+                        self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
                     ),
+                    advisory_execution=runner.advisory_execution,
                 )
                 preflight_descriptor = dict(descriptor, resource_id="runtime-hosted-ambiguous-preflight-45")
                 preflight_request = dict(request, execution_context=preflight_descriptor)
                 duplicate_selection = replace(second_selection, provider_attempt_id=runner.selection.provider_attempt_id)
                 preflight_host = replace(host, sequence=(
-                    DiffReviewSequenceEntry(runner.selection, recovery, runner.audit, first_backend),
-                    DiffReviewSequenceEntry(duplicate_selection, second_recovery, second_recovery.health_receipt.audit_identity, second_backend),
+                    self.sequence_entry(runner, backend=first_backend),
+                    self.sequence_entry(runner, selection=duplicate_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
                 ))
                 with self.assertRaises(external_validation.ExternalValidationAdapterError):
                     external_validation.run_provider_attempt_accounting_profile(

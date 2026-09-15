@@ -85,6 +85,7 @@ _PATH_ENVIRONMENT_KEYS = {
     "repository_root": "ROUNDWRIGHT_REPOSITORY_ROOT",
     "cache_directory": "ROUNDWRIGHT_CACHE_DIRECTORY",
 }
+_ADVISORY_PROFILES_ENVIRONMENT_KEY = "ROUNDWRIGHT_ADVISORY_PROFILES"
 
 
 @dataclass(frozen=True)
@@ -436,27 +437,35 @@ class ResolvedConfigurationBinding:
     trusted_review_floor: ReviewPolicy
     canonical_material: str = ""
     trusted_floor_evidence_required: bool = False
+    recovery_advisor_profile_identity: str | None = None
+    owner_intent_interpreter_profile_identity: str | None = None
 
     def __post_init__(self) -> None:
         try:
             material = json.loads(self.canonical_material)
             if type(material) is not dict or json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True) != self.canonical_material or self.digest != _digest(material):
                 raise ValueError
-            base_keys = {"schema_version", "worker", "dependency_review", "supervisor_attempt_profiles", "paths", "review", "trusted_review_floor", "sources"}
+            legacy_base_keys = {"schema_version", "worker", "dependency_review", "supervisor_attempt_profiles", "paths", "review", "trusted_review_floor", "sources"}
+            base_keys = legacy_base_keys | {"recovery_advisor", "owner_intent_interpreter"}
             configured_source_keys = base_keys | {"configured_sources"}
+            legacy_configured_source_keys = legacy_base_keys | {"configured_sources"}
             if set(material) not in (base_keys, base_keys | {"trusted_floor_evidence"}) or set(material["paths"]) != {"repository_root", "cache_directory"}:
                 # Earlier bindings did not contain the closed source allowlist.
                 # They remain readable for unrelated historical review receipts,
                 # but cannot be used to resolve configured-source authority.
-                if set(material) not in (configured_source_keys, configured_source_keys | {"trusted_floor_evidence"}) or set(material["paths"]) != {"repository_root", "cache_directory"}:
+                if set(material) not in (configured_source_keys, configured_source_keys | {"trusted_floor_evidence"}, legacy_base_keys, legacy_base_keys | {"trusted_floor_evidence"}, legacy_configured_source_keys, legacy_configured_source_keys | {"trusted_floor_evidence"}) or set(material["paths"]) != {"repository_root", "cache_directory"}:
                     raise ValueError
             policy = material["review"]
             profiles = tuple(_digest(item) for item in material["supervisor_attempt_profiles"])
+            recovery_identity = None if "recovery_advisor" not in material else _digest(material["recovery_advisor"])
+            intent_identity = None if "owner_intent_interpreter" not in material else _digest(material["owner_intent_interpreter"])
             sources = {name: value.value for name, value in self.sources.items()}
-            expected_source_keys = {"repository_root", "cache_directory", "roles.worker", "roles.dependency_review", "roles.supervisor.attempt_profiles", "review.complete_rounds", "review.max_rounds", "review.max_supervisor_attempts_per_round", "review.on_final_findings"}
+            expected_source_keys = {"repository_root", "cache_directory", "roles.worker", "roles.dependency_review", "roles.recovery_advisor", "roles.owner_intent_interpreter", "roles.supervisor.attempt_profiles", "review.complete_rounds", "review.max_rounds", "review.max_supervisor_attempts_per_round", "review.on_final_findings"}
             if "configured_sources" in material:
                 expected_source_keys = expected_source_keys | {"configured_sources"}
-            if set(material["sources"]) != expected_source_keys or set(sources) != expected_source_keys or material["schema_version"] != self.schema_version or _digest(material["worker"]) != self.worker_profile_identity or _digest(material["dependency_review"]) != self.dependency_review_profile_identity or profiles != self.supervisor_profile_identities or len(set(profiles)) != len(profiles) or material["sources"] != sources or material["review"] != _review_policy_payload(self.review_policy) or material["trusted_review_floor"] != _review_policy_payload(self.trusted_review_floor) or material["paths"]["repository_root"] != self.repository_root_identity or material["paths"]["cache_directory"] != self.cache_directory_identity:
+            if "recovery_advisor" not in material:
+                expected_source_keys -= {"roles.recovery_advisor", "roles.owner_intent_interpreter"}
+            if set(material["sources"]) != expected_source_keys or set(sources) != expected_source_keys or material["schema_version"] != self.schema_version or _digest(material["worker"]) != self.worker_profile_identity or _digest(material["dependency_review"]) != self.dependency_review_profile_identity or self.recovery_advisor_profile_identity not in (None, recovery_identity) or self.owner_intent_interpreter_profile_identity not in (None, intent_identity) or profiles != self.supervisor_profile_identities or len(set(profiles)) != len(profiles) or material["sources"] != sources or material["review"] != _review_policy_payload(self.review_policy) or material["trusted_review_floor"] != _review_policy_payload(self.trusted_review_floor) or material["paths"]["repository_root"] != self.repository_root_identity or material["paths"]["cache_directory"] != self.cache_directory_identity:
                 raise ValueError
             self.review_policy.enforce_floor(self.trusted_review_floor)
             if self.review_policy.max_supervisor_attempts_per_round != len(self.supervisor_profile_identities): raise ValueError
@@ -465,6 +474,8 @@ class ResolvedConfigurationBinding:
             if self.trusted_floor_evidence_required != has_trusted_evidence or (has_trusted_evidence and (type(material["trusted_floor_evidence"]) is not dict or set(material["trusted_floor_evidence"]) != trusted_keys or not all(_is_digest(material["trusted_floor_evidence"][name]) for name in trusted_keys))): raise ValueError
             object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
             object.__setattr__(self, "supervisor_profile_identities", tuple(self.supervisor_profile_identities))
+            object.__setattr__(self, "recovery_advisor_profile_identity", recovery_identity)
+            object.__setattr__(self, "owner_intent_interpreter_profile_identity", intent_identity)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ConfigurationError("resolved configuration binding is not self-authenticating") from error
 
@@ -576,6 +587,8 @@ class Configuration:
     cache_directory: EffectiveValue[Path]
     worker: EffectiveValue[ProviderProfile]
     dependency_review: EffectiveValue[ProviderProfile]
+    recovery_advisor: EffectiveValue[ProviderProfile]
+    owner_intent_interpreter: EffectiveValue[ProviderProfile]
     supervisor_attempt_profiles: EffectiveValue[tuple[ProviderProfile, ...]]
     review: Mapping[str, EffectiveValue[object]]
     configured_sources: EffectiveValue[tuple[dict[str, object], ...]]
@@ -606,6 +619,8 @@ class Configuration:
             "cache_directory": self.cache_directory.source,
             "roles.worker": self.worker.source,
             "roles.dependency_review": self.dependency_review.source,
+            "roles.recovery_advisor": self.recovery_advisor.source,
+            "roles.owner_intent_interpreter": self.owner_intent_interpreter.source,
             "roles.supervisor.attempt_profiles": self.supervisor_attempt_profiles.source,
         }
         values.update({f"review.{name}": value.source for name, value in self.review.items()})
@@ -619,6 +634,8 @@ class Configuration:
             "schema_version": self.schema_version,
             "worker": _profile_payload(self.worker.value),
             "dependency_review": _profile_payload(self.dependency_review.value),
+            "recovery_advisor": _profile_payload(self.recovery_advisor.value),
+            "owner_intent_interpreter": _profile_payload(self.owner_intent_interpreter.value),
             "supervisor_attempt_profiles": [_profile_payload(item) for item in self.supervisor_attempt_profiles.value],
             "paths": {
                 "repository_root": None if self.repository_root.value is None else _digest({"path": os.fspath(self.repository_root.value)}),
@@ -639,6 +656,8 @@ class Configuration:
             "schema_version": self.schema_version,
             "worker": _profile_payload(self.worker.value),
             "dependency_review": _profile_payload(self.dependency_review.value),
+            "recovery_advisor": _profile_payload(self.recovery_advisor.value),
+            "owner_intent_interpreter": _profile_payload(self.owner_intent_interpreter.value),
             "supervisor_attempt_profiles": [_profile_payload(profile) for profile in self.supervisor_attempt_profiles.value],
             "paths": {"repository_root": None if self.repository_root.value is None else _digest({"path": os.fspath(self.repository_root.value)}), "cache_directory": _digest({"path": os.fspath(self.cache_directory.value)})},
             "review": _review_policy_payload(self.review_policy),
@@ -675,6 +694,8 @@ class Configuration:
             trusted_floor,
             canonical_material,
             self.review_authority_evidence is not None,
+            _digest(_profile_payload(self.recovery_advisor.value)),
+            _digest(_profile_payload(self.owner_intent_interpreter.value)),
         )
 
 
@@ -763,6 +784,8 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
     _merge_runtime(raw, sources, cli_updates, ConfigurationSource.COMMAND_LINE)
     worker = _parse_profile(raw["roles"]["worker"], name_required=False)
     dependency_review = _parse_profile(raw["roles"]["dependency_review"], name_required=False)
+    recovery_advisor = _parse_profile(raw["roles"]["recovery_advisor"], name_required=False)
+    owner_intent_interpreter = _parse_profile(raw["roles"]["owner_intent_interpreter"], name_required=False)
     supervisors = tuple(_parse_profile(value, name_required=True) for value in raw["roles"]["supervisor"]["attempt_profiles"])
     review = _parse_review(raw["review"])
     configured_sources = _parse_configured_sources(raw["runtime"]["configured_sources"])
@@ -777,6 +800,8 @@ def load_configuration(*, cwd: Path | None = None, environment: Mapping[str, str
         cache_directory=paths["cache_directory"],  # type: ignore[arg-type]
         worker=EffectiveValue(worker, sources["roles.worker"]),
         dependency_review=EffectiveValue(dependency_review, sources["roles.dependency_review"]),
+        recovery_advisor=EffectiveValue(recovery_advisor, sources["roles.recovery_advisor"]),
+        owner_intent_interpreter=EffectiveValue(owner_intent_interpreter, sources["roles.owner_intent_interpreter"]),
         supervisor_attempt_profiles=EffectiveValue(supervisors, sources["roles.supervisor.attempt_profiles"]),
         review={name: EffectiveValue(value, sources[f"review.{name}"]) for name, value in review.__dict__.items()},
         configured_sources=EffectiveValue(configured_sources, sources["configured_sources"]),
@@ -995,7 +1020,7 @@ def _validate_document(document: object, *, complete: bool) -> None:
             raise ConfigurationError("configuration path settings are unsupported")
     roles = document.get("roles")
     if roles is not None:
-        if type(roles) is not dict or set(roles) - {"worker", "dependency_review", "supervisor"}:
+        if type(roles) is not dict or set(roles) - {"worker", "dependency_review", "recovery_advisor", "owner_intent_interpreter", "supervisor"}:
             raise ConfigurationError("configuration contains an unknown role")
         if "worker" in roles:
             _validate_profile_document(roles["worker"], name_required=False)
@@ -1007,7 +1032,11 @@ def _validate_document(document: object, *, complete: bool) -> None:
                 raise ConfigurationError("supervisor profiles must be replaced as one non-empty list")
             for item in supervisor["attempt_profiles"]:
                 _validate_profile_document(item, name_required=True)
-        if complete and set(roles) != {"worker", "dependency_review", "supervisor"}:
+        if "recovery_advisor" in roles:
+            _validate_profile_document(roles["recovery_advisor"], name_required=False)
+        if "owner_intent_interpreter" in roles:
+            _validate_profile_document(roles["owner_intent_interpreter"], name_required=False)
+        if complete and set(roles) != {"worker", "dependency_review", "recovery_advisor", "owner_intent_interpreter", "supervisor"}:
             raise ConfigurationError("packaged runtime roles are incomplete")
     elif complete:
         raise ConfigurationError("packaged runtime roles are missing")
@@ -1064,6 +1093,12 @@ def _merge_runtime(current: dict[str, Any], sources: dict[str, ConfigurationSour
         if "dependency_review" in roles:
             current["roles"]["dependency_review"] = roles["dependency_review"]
             sources["roles.dependency_review"] = source
+        if "recovery_advisor" in roles:
+            current["roles"]["recovery_advisor"] = roles["recovery_advisor"]
+            sources["roles.recovery_advisor"] = source
+        if "owner_intent_interpreter" in roles:
+            current["roles"]["owner_intent_interpreter"] = roles["owner_intent_interpreter"]
+            sources["roles.owner_intent_interpreter"] = source
         if "supervisor" in roles:
             current["roles"]["supervisor"] = roles["supervisor"]
             sources["roles.supervisor.attempt_profiles"] = source
@@ -1079,6 +1114,8 @@ def _merge_runtime(current: dict[str, Any], sources: dict[str, ConfigurationSour
 def _mark_all(sources: dict[str, ConfigurationSource], runtime: dict[str, Any], source: ConfigurationSource) -> None:
     sources["roles.worker"] = source
     sources["roles.dependency_review"] = source
+    sources["roles.recovery_advisor"] = source
+    sources["roles.owner_intent_interpreter"] = source
     sources["roles.supervisor.attempt_profiles"] = source
     sources["configured_sources"] = source
     for name in runtime["review"]:
@@ -1087,7 +1124,17 @@ def _mark_all(sources: dict[str, ConfigurationSource], runtime: dict[str, Any], 
 
 def _environment_updates(environment: Mapping[str, str]) -> dict[str, Any]:
     review = {name: environment[variable] for name, variable in _REVIEW_ENVIRONMENT_KEYS.items() if variable in environment}
-    return {} if not review else {"review": review}
+    update: dict[str, Any] = {} if not review else {"review": review}
+    raw_profiles = environment.get(_ADVISORY_PROFILES_ENVIRONMENT_KEY)
+    if raw_profiles is not None:
+        try:
+            profiles = json.loads(raw_profiles)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ConfigurationError("advisory profile environment override is invalid") from error
+        if type(profiles) is not dict or set(profiles) != {"recovery_advisor", "owner_intent_interpreter"}:
+            raise ConfigurationError("advisory profile environment override is partial")
+        update["roles"] = profiles
+    return update
 
 
 def _environment_path_updates(environment: Mapping[str, str]) -> dict[str, object]:
@@ -1106,6 +1153,10 @@ def _cli_updates(values: Mapping[str, object]) -> dict[str, Any]:
             update.setdefault("roles", {})["worker"] = value
         elif key == "roles.dependency_review":
             update.setdefault("roles", {})["dependency_review"] = value
+        elif key == "roles.recovery_advisor":
+            update.setdefault("roles", {})["recovery_advisor"] = value
+        elif key == "roles.owner_intent_interpreter":
+            update.setdefault("roles", {})["owner_intent_interpreter"] = value
         elif key == "roles.supervisor.attempt_profiles":
             update.setdefault("roles", {})["supervisor"] = {"attempt_profiles": value}
         elif key in {"repository_root", "cache_directory"}:
@@ -1146,7 +1197,7 @@ def parse_cli_overrides(values: list[str]) -> dict[str, object]:
                 parsed[key] = json.loads(raw)
             except json.JSONDecodeError as error:
                 raise ConfigurationError("supervisor profiles CLI override must be JSON") from error
-        elif key in {"roles.worker", "roles.dependency_review"}:
+        elif key in {"roles.worker", "roles.dependency_review", "roles.recovery_advisor", "roles.owner_intent_interpreter"}:
             try:
                 parsed[key] = json.loads(raw)
             except json.JSONDecodeError as error:

@@ -26,9 +26,12 @@ class Phase5CoverageTests(unittest.TestCase):
         self.source = self.directory / "map.json"
         self.ledger = self.directory / "ledger.md"
         self.tests = self.directory / "tests.md"
+        self.semantic = self.directory / "semantic.json"
         shutil.copy2(ROOT / "docs" / "migration" / "phase5-coverage-map.json", self.source)
         shutil.copy2(ROOT / "docs" / "migration" / "legacy-decision-ledger.md", self.ledger)
         shutil.copy2(ROOT / "docs" / "migration" / "test-disposition.md", self.tests)
+        candidate = coverage.current_candidate(); payload={"schema":"roundwright-phase5-semantic-execution/v1","candidate_sha":candidate,"tests":coverage._SEMANTIC_TESTS,"status":"passed"}
+        self.semantic.write_text(json.dumps({**payload,"receipt_digest":"sha256:" + coverage._digest(coverage._canonical(payload))}),encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -44,8 +47,8 @@ class Phase5CoverageTests(unittest.TestCase):
         self.assertEqual(len(document["items"]), len(coverage.EXPECTED_OWNERS))
         manifest = self.directory / "readback.json"
         candidate = coverage.current_candidate()
-        coverage.render(self.source, self.ledger, self.tests, candidate, manifest)
-        coverage.verify(self.source, self.ledger, self.tests, candidate, manifest)
+        coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
+        coverage.verify(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
 
     def test_rejects_duplicate_unknown_and_owner_drift(self) -> None:
         document = self.document()
@@ -65,6 +68,26 @@ class Phase5CoverageTests(unittest.TestCase):
         document["items"][0]["destination"] = "another-public-safe-target"
         self.write_document(document)
         with self.assertRaisesRegex(coverage.CoverageError, "destination has drifted"):
+            coverage.validate(self.source, self.ledger, self.tests)
+
+    def test_rejects_issue_136_requirement_omission_or_drift(self) -> None:
+        document = self.document()
+        document["implementation_requirements"]["destinations"].pop()
+        self.write_document(document)
+        with self.assertRaisesRegex(coverage.CoverageError, "issue 136"):
+            coverage.validate(self.source, self.ledger, self.tests)
+
+    def test_rejects_issue_136_concrete_artifact_digest_drift(self) -> None:
+        document = self.document()
+        document["implementation_requirements"]["artifacts"][0]["sha256"] = "0" * 64
+        self.write_document(document)
+        with self.assertRaisesRegex(coverage.CoverageError, "artifact digest"):
+            coverage.validate(self.source, self.ledger, self.tests)
+
+    def test_rejects_semantic_boundary_contract_drift(self) -> None:
+        contracts = dict(coverage.SEMANTIC_CONTRACTS)
+        contracts["src/roundwright/worker_toolbox.py"] = ("missing-required-production-boundary",)
+        with patch.object(coverage, "SEMANTIC_CONTRACTS", contracts), self.assertRaisesRegex(coverage.CoverageError, "semantic contract"):
             coverage.validate(self.source, self.ledger, self.tests)
 
     def test_rejects_verification_drift_and_unsafe_verification_values(self) -> None:
@@ -126,7 +149,22 @@ class Phase5CoverageTests(unittest.TestCase):
         shutil.copy2(ROOT / "docs" / "migration" / "phase5-coverage-map.json", self.source)
         manifest = self.directory / "readback.json"
         candidate = coverage.current_candidate()
-        coverage.render(self.source, self.ledger, self.tests, candidate, manifest)
+        coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
         other_candidate = "0" * 40 if candidate != "0" * 40 else "1" * 40
         with self.assertRaisesRegex(coverage.CoverageError, "does not match checked-out HEAD"):
-            coverage.verify(self.source, self.ledger, self.tests, other_candidate, manifest)
+            coverage.verify(self.source, self.ledger, self.tests, other_candidate, manifest, self.semantic)
+
+    def test_rejects_missing_stale_and_inconsistent_semantic_execution_receipts(self) -> None:
+        candidate = coverage.current_candidate()
+        manifest = self.directory / "readback.json"
+        self.semantic.unlink()
+        with self.assertRaisesRegex(coverage.CoverageError, "semantic execution receipt is unavailable"):
+            coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
+        for payload in (
+            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": "0" * 40, "tests": coverage._SEMANTIC_TESTS, "status": "passed"},
+            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": coverage._SEMANTIC_TESTS[:-1], "status": "passed"},
+            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": coverage._SEMANTIC_TESTS, "status": "failed"},
+        ):
+            self.semantic.write_text(json.dumps({**payload, "receipt_digest": "sha256:" + coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
+            with self.subTest(payload=payload), self.assertRaisesRegex(coverage.CoverageError, "stale or forged"):
+                coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)

@@ -6,15 +6,40 @@ import tempfile
 import unittest
 import os
 import subprocess
+import hashlib
+import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools, CodingToolError
+from roundwright.role_capability_policy import RoleCapability, RoleCapabilityError, RoleScope, ScopeKind, ScopedDescriptor
+
+
+def digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 class BoundedCodingToolsTests(unittest.TestCase):
+    def capability(self, root: Path, readable: tuple[str, ...], writable: tuple[str, ...], commands: tuple[tuple[str, ...], ...], **kwargs) -> BoundedCodingCapability:
+        """Create an effectful fixture with its full exact role scope."""
+        root_identity = kwargs.pop("scope_root_identity", digest(json.dumps({"schema": "roundwright-bounded-coding-root/v1", "root": str(root.resolve())}, sort_keys=True, separators=(",", ":"))))
+        supplied_scope = kwargs.pop("role_scope", None)
+        sandbox_identity = kwargs.get("sandbox_identity")
+        descriptors = [
+            *(ScopedDescriptor(ScopeKind.PATH, root_identity, value) for value in sorted(set(readable + writable))),
+            *(ScopedDescriptor(ScopeKind.PROCESS, root_identity, digest(json.dumps({"command": command}, sort_keys=True, separators=(",", ":")))[7:]) for command in commands),
+            ScopedDescriptor(ScopeKind.NETWORK, root_identity, "network-disabled"),
+            ScopedDescriptor(ScopeKind.RESOURCE, root_identity, digest(json.dumps({"sandbox_identity": sandbox_identity}, sort_keys=True, separators=(",", ":")))[7:]),
+            *(ScopedDescriptor(ScopeKind.TEST_INPUT_SET, root_identity, digest(json.dumps({"command": command}, sort_keys=True, separators=(",", ":")))[7:]) for command in commands),
+        ]
+        return BoundedCodingCapability(
+            root, readable, writable, commands, role_scope=supplied_scope or RoleScope(
+                frozenset({RoleCapability.BOUNDED_CODING}), tuple(sorted(descriptors, key=lambda item: (item.kind.value, item.root_identity, item.value))),
+            ), scope_root_identity=root_identity, **kwargs,
+        )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.fixture = Path(self.temporary.name)
@@ -23,7 +48,7 @@ class BoundedCodingToolsTests(unittest.TestCase):
         self.foreign.mkdir()
         (self.root / "src").mkdir(parents=True)
         (self.root / "src" / "allowed.txt").write_text("before", encoding="utf-8")
-        self.tools = BoundedCodingTools(BoundedCodingCapability(
+        self.tools = BoundedCodingTools(self.capability(
             self.root, ("src/allowed.txt",), ("src/allowed.txt",),
             ((sys.executable, "-c", "import sys; sys.exit(0)"),),
         ))
@@ -46,6 +71,17 @@ class BoundedCodingToolsTests(unittest.TestCase):
                 self.tools.read(path)
         with self.assertRaises(CodingToolError):
             self.tools.validate(("cmd.exe", "/c", "whoami"))
+
+    def test_win32_aliases_are_rejected_before_any_path_effect(self) -> None:
+        command = (sys.executable, "-c", "import sys; sys.exit(0)")
+        for alias in (
+            "src/aux.txt", "src/COM1", "src/allowed.txt:stream",
+            "src/allowed.txt.", "src/allowed.txt ", "src/ａｕｘ.txt",
+        ):
+            with self.subTest(alias=alias), self.assertRaises((CodingToolError, RoleCapabilityError)):
+                self.capability(
+                    self.root, (alias,), ("src/allowed.txt",), (command,),
+                )
 
     def test_symlink_escape_is_denied_when_supported(self) -> None:
         target = self.foreign / "coding-tools-secret.txt"
@@ -71,7 +107,7 @@ class BoundedCodingToolsTests(unittest.TestCase):
         )
         if completed.returncode != 0:
             self.skipTest("junction creation is unavailable to this test identity")
-        tools = BoundedCodingTools(BoundedCodingCapability(
+        tools = BoundedCodingTools(self.capability(
             self.root, ("src/foreign/secret.txt",), ("src/allowed.txt",),
             ((sys.executable, "-c", "import sys; sys.exit(0)"),),
         ))
@@ -83,9 +119,45 @@ class BoundedCodingToolsTests(unittest.TestCase):
         with self.assertRaises(CodingToolError):
             self.tools.read("../foreign-worktree/secret.txt")
 
+    def test_admitted_role_scope_enforces_exact_paths_before_local_effects(self) -> None:
+        (self.root / "src" / "other.txt").write_text("other", encoding="utf-8")
+        root_identity = digest(json.dumps({"schema": "roundwright-bounded-coding-root/v1", "root": str(self.root.resolve())}, sort_keys=True, separators=(",", ":")))
+        process = (sys.executable, "-c", "import sys; sys.exit(0)")
+        process_identity = digest(json.dumps({"command": process}, sort_keys=True, separators=(",", ":")))[7:]
+        resource_identity = digest(json.dumps({"sandbox_identity": None}, sort_keys=True, separators=(",", ":")))[7:]
+        descriptors = (
+            ScopedDescriptor(ScopeKind.PATH, root_identity, "src/allowed.txt"),
+            ScopedDescriptor(ScopeKind.PROCESS, root_identity, process_identity),
+            ScopedDescriptor(ScopeKind.NETWORK, root_identity, "network-disabled"),
+            ScopedDescriptor(ScopeKind.RESOURCE, root_identity, resource_identity),
+            ScopedDescriptor(ScopeKind.TEST_INPUT_SET, root_identity, process_identity),
+        )
+        scope = RoleScope(frozenset({RoleCapability.BOUNDED_CODING}), tuple(sorted(descriptors, key=lambda item: (item.kind.value, item.root_identity, item.value))))
+        tools = BoundedCodingTools(self.capability(
+            self.root, ("src/allowed.txt", "src/other.txt"), ("src/allowed.txt",),
+            ((sys.executable, "-c", "import sys; sys.exit(0)"),),
+            role_scope=scope, scope_root_identity=root_identity,
+        ))
+        self.assertEqual(tools.read("src/allowed.txt")[0], "before")
+        with self.assertRaisesRegex(CodingToolError, "admitted role scope"):
+            tools.read("src/other.txt")
+
+    def test_effectful_capability_requires_a_role_scope(self) -> None:
+        with self.assertRaisesRegex(CodingToolError, "capability is invalid"):
+            BoundedCodingCapability(
+                self.root, ("src/allowed.txt",), ("src/allowed.txt",),
+                ((sys.executable, "-c", "pass"),),
+            )
+
+    def test_scope_root_label_cannot_authorize_a_different_resolved_workspace(self) -> None:
+        command = (sys.executable, "-c", "pass")
+        root_a = digest(json.dumps({"schema": "roundwright-bounded-coding-root/v1", "root": str(self.foreign.resolve())}, sort_keys=True, separators=(",", ":")))
+        with self.assertRaisesRegex(CodingToolError, "scope root"):
+            self.capability(self.root, ("src/allowed.txt",), ("src/allowed.txt",), (command,), scope_root_identity=root_a)
+
     def test_validation_output_budget_is_enforced_while_the_process_runs(self) -> None:
         command = (sys.executable, "-c", "import sys; sys.stdout.write('x' * 4097)")
-        tools = BoundedCodingTools(BoundedCodingCapability(
+        tools = BoundedCodingTools(self.capability(
             self.root, ("src/allowed.txt",), ("src/allowed.txt",), (command,), output_limit=4096,
         ))
         with self.assertRaisesRegex(CodingToolError, "output budget"):
@@ -93,7 +165,7 @@ class BoundedCodingToolsTests(unittest.TestCase):
 
     def test_validation_timeout_terminates_the_owned_process(self) -> None:
         command = (sys.executable, "-c", "import time; time.sleep(5)")
-        tools = BoundedCodingTools(BoundedCodingCapability(
+        tools = BoundedCodingTools(self.capability(
             self.root, ("src/allowed.txt",), ("src/allowed.txt",), (command,), timeout_seconds=1,
         ))
         with self.assertRaisesRegex(CodingToolError, "timed out"):
@@ -101,7 +173,7 @@ class BoundedCodingToolsTests(unittest.TestCase):
 
     def test_verified_timeout_cleanup_is_not_recorded_as_uncertain(self) -> None:
         command = (sys.executable, "-c", "import time; time.sleep(5)")
-        tools = BoundedCodingTools(BoundedCodingCapability(
+        tools = BoundedCodingTools(self.capability(
             self.root, ("src/allowed.txt",), ("src/allowed.txt",), (command,), timeout_seconds=1,
         ))
         with self.assertRaises(CodingToolError) as captured:

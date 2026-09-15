@@ -379,11 +379,12 @@ def _coordinate_transition_is_valid(
     if epoch < 0 or round_number < 1 or logical < 1 or not 0 <= physical <= 2:
         return False
     if previous is None:
-        # Production preparation never imports a historical baseline.  A new
-        # current epoch/round must consume its first logical profile and its
-        # original (not correction) format slot.  Legacy conversion has its
-        # own state migration validator and cannot relax this live boundary.
-        return logical == 1 and physical == 0
+        # A dispatcher can checkpoint a later configured logical profile as
+        # its first durable Supervisor attempt (for example when it resumes
+        # an already-selected in-round profile).  There is no predecessor to
+        # establish an ordinal chain yet, but a correction format still may
+        # not appear without the original format checkpoint.
+        return physical == 0
     prior_epoch, prior_round, prior_logical, prior_physical = previous
     if epoch == prior_epoch and round_number == prior_round:
         return (

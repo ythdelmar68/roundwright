@@ -10,8 +10,9 @@ from roundwright.failure_recovery import (
     Clearance, EvidenceConfidence, EvidenceSource, FailureBinding, FailureClass, FailureEvidence, FailureRecoveryError,
     FailureRecord, FailureRole, RecoveryAction, admit_recovery, classify,
     RecoveryRouteAdmission, issue_recovery_route_admission,
-    failure_compatibility_matrix, parse_failure_record,
+    failure_compatibility_matrix, native_failure_class, parse_failure_record,
 )
+from roundwright.provider_health import CodexFailure
 from roundwright.codex_worker import classify_worker_failure
 from roundwright.codex_supervisor import classify_supervisor_failure
 from roundwright.codex_dependency_review import classify_dependency_review_failure
@@ -95,6 +96,14 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertEqual((incompatible.failure, incompatible.action), (FailureClass.UNKNOWN, RecoveryAction.RECONCILE))
         with self.assertRaisesRegex(FailureRecoveryError, "taxonomy is incompatible"):
             FailureRecord(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_SERVICE, False, RecoveryAction.STOP_SCOPE, True)
+
+    def test_native_failure_class_rejects_strings_and_duck_typed_values(self):
+        class LookAlike:
+            value = CodexFailure.SANDBOX_OR_APPROVAL_DENIED.value
+        self.assertEqual(native_failure_class(CodexFailure.SANDBOX_OR_APPROVAL_DENIED), (FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+        for value in (CodexFailure.SANDBOX_OR_APPROVAL_DENIED.value, LookAlike(), object()):
+            with self.subTest(value=type(value).__name__):
+                self.assertEqual(native_failure_class(value), (FailureClass.UNKNOWN, EvidenceSource.UNAVAILABLE))
 
     def test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route(self):
         binding, route = self.live_route()

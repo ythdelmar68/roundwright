@@ -139,14 +139,18 @@ def _require_failure_compatibility(record: "FailureRecord") -> None:
 def native_failure_class(value: object) -> tuple[FailureClass, EvidenceSource]:
     """Project one closed native error category onto recovery evidence.
 
-    Adapters retain their native enum independently; this boundary accepts
-    only its public ``value`` so it does not import a provider implementation
-    or create a recovery/provider import cycle.
+    Only the reviewed native enum may establish authenticated provider
+    evidence.  Strings and look-alike ``.value`` objects are untrusted input
+    and must remain unavailable rather than acquiring recovery authority.
     """
 
-    native = getattr(value, "value", value)
-    if type(native) is not str:
+    # Provider health owns the native enum but imports recovery through its
+    # runtime dependencies, so bind it only at this terminal classification
+    # boundary rather than during module initialization.
+    from .provider_health import CodexFailure
+    if type(value) is not CodexFailure:
         return FailureClass.UNKNOWN, EvidenceSource.UNAVAILABLE
+    native = value.value
     if native == "sandbox-or-approval-denied":
         return FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST
     if native in {"provider-outage", "transport-or-provider-outage"}:

@@ -31,6 +31,7 @@ from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
 from .failure_recovery import EvidenceSource, FailureClass, native_failure_class
+from .provider_health import CodexFailure
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect, trusted_provider_launch_context
 from .provider_recovery import (
     AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
@@ -529,7 +530,7 @@ class DurableDiffReviewRunner:
                 self.repository, self.identity, attempt_id,
             )
             if terminal is not None:
-                failure, evidence = native_failure_class(terminal.failure_class)
+                failure, evidence = native_failure_class(CodexFailure(terminal.failure_class.value))
                 if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
                     raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
                 if position + 1 >= len(entries):
@@ -670,7 +671,7 @@ class DurableDiffReviewRunner:
                     self.repository, self.identity, existing.attempt_id,
                 )
                 if terminal is not None:
-                    failure, evidence = native_failure_class(terminal.failure_class)
+                    failure, evidence = native_failure_class(CodexFailure(terminal.failure_class.value))
                     if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
                         raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
                     return (existing.attempt_id, False)

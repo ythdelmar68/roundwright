@@ -24,7 +24,7 @@ from .candidate_review import (
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
-    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
+    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorDiagnostic, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
@@ -687,7 +687,10 @@ class DurableDiffReviewRunner:
             self.repository, self.identity, recovery, attempt_id=selection.provider_attempt_id,
             role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
             process_lease_expires_at=selection.process_lease_expires_at, input_fingerprint=input_fingerprint,
-            selected_profile_identity=selected, lease=self.lease, now=self.dispatch_control.now,
+            selected_profile_identity=selected,
+            logical_profile_position=selection.resolved_logical_profile_position,
+            physical_format_output_ordinal=selection.physical_format_output_ordinal,
+            lease=self.lease, now=self.dispatch_control.now,
         )
         if prepared.state is not AttemptState.PREPARED:
             raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
@@ -709,8 +712,8 @@ class DurableDiffReviewRunner:
                 current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.resolved_logical_profile_position,
                 current_profile_identity=selected, prior_attempts=prior, current_physical_format_output_ordinal=selection.physical_format_output_ordinal, seal_state_identity=self.lease.state_identity,
             )
-        except ProviderRecoveryError:
-            raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from None
+        except ProviderRecoveryError as error:
+            raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from error
         if decision_material.dispatch_claim is not SupervisorDispatchClaimState.CLAIMED:
             raise ProviderAttemptRuntimeError("provider accounting dispatch claim has drifted")
         request = CodexSupervisorRequest(

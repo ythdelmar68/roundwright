@@ -523,7 +523,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 self.assertEqual(sum(pool.map(reserve, ledgers)), 1)
 
-    def test_terminal_supervisor_failure_is_durable_and_fails_over_without_invalid_output(self) -> None:
+    def test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary) / "repository"
             runner, first_backend, repository, identity, recovery, seal = self.durable_runner(
@@ -552,16 +552,17 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
             ))
             first_only = replace(runner, sequence=(runner.sequence[0],))
-            self.assertEqual(first_only.execute(), (runner.selection.provider_attempt_id,))
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "not format-correctable"):
+                first_only.execute()
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             checkpoint_failure = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
             self.assertIsNotNone(checkpoint_failure)
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
-            # Restart from the durable terminal-failure checkpoint may dispatch
-            # only the still-unseen configured secondary; it must not replay
-            # the first turn, failure record, or failover transition.
-            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
+            # A restart preserves the terminal denial and cannot use a later
+            # logical profile as a disguised format correction.
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "not format-correctable"):
+                runner.execute()
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             terminal = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
@@ -571,7 +572,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 (terminal.failure_class, terminal.outcome_source, terminal.sdk_error_category),
                 (SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorTerminalFailureSource.SDK_TURN_FAILED, SupervisorTerminalFailureSdkCategory.OVERLOAD),
             )
-            self.assertEqual(read_attempt(repository, identity, second_selection.provider_attempt_id, context=recovery).state, AttemptState.ACCEPTED)
+            with self.assertRaises(ProviderRecoveryError):
+                read_attempt(repository, identity, second_selection.provider_attempt_id, context=recovery)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute(
@@ -579,8 +581,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 ).fetchone()[0], 0)
             finally:
                 connection.close()
-            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
-            self.assertEqual((first_backend.calls, second_backend.calls), (1, 1))
+            self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
             descriptor = ProviderAttemptRuntimeDescriptor.parse({
                 "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-terminal-45",
                 "repository_id": identity.repository_id, "task_id": identity.task_id,
@@ -732,7 +733,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertNotIn("C:/", json.dumps(material, sort_keys=True))
             self.assertNotIn("findings", json.dumps(material, sort_keys=True))
             native = canonical_supervisor_review_material(request)
-            self.assertEqual(native["schema"], "roundwright-provider-attempt-accounting-material/v2")
+            self.assertEqual(native["schema"], "roundwright-provider-attempt-accounting-material/v3")
             self.assertEqual(native["decision_semantic"], "pre-dispatch-transition-eligibility/v2")
             self.assertIn("pre-dispatch eligibility", native["decision_rule"])
             self.assertIn("does not assert", native["decision_rule"])

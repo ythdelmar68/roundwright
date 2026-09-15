@@ -29,7 +29,7 @@
       {"identity":"advisory-worker-toolbox-tests-v1","path":"tests/test_worker_toolbox.py","sha256":"5b749edcb3837f93928d27de2d407259ee6e7bdc5c76c39226ac26fd41ec9ec7"},
       {"identity":"advisory-worker-shadow-v1","path":"src/roundwright/worker_shadow.py","sha256":"7908f8ca3663a905fe810df654a0c4d0a2231f62dc5386b11866adb5d779e9f2"},
       {"identity":"advisory-worker-shadow-tests-v1","path":"tests/test_worker_shadow.py","sha256":"b6488715b5b6c6dbb9b5ff969e7eb07d29702508a11b5b6a6fdb97a0817b8e85"},
-      {"identity":"advisory-supervisor-shadow-v1","path":"src/roundwright/supervisor_shadow.py","sha256":"184d50cfb4f7ebe1c0e372c5c219c7d03470ce2605ff5d48c31b168a6c1917ed"},
+      {"identity":"advisory-supervisor-shadow-v1","path":"src/roundwright/supervisor_shadow.py","sha256":"a7531e1e12624a19ebfa4740381cd478964ca5ef46dabf8abab310a967452658"},
       {"identity":"advisory-external-validation-v1","path":"src/roundwright/external_validation.py","sha256":"7006269ad7684ade0b2c9d56378aacfa5d9c1eaad6d3b168b603089639d60b75"},
       {"identity":"advisory-external-validation-tests-v1","path":"tests/test_external_validation.py","sha256":"8dc07b59a52ef5a0ea8d581b06a76ff6030c04827d2ba322f621fd0a5a035626"},
       {"identity":"advisory-runtime-defaults-v1","path":"src/roundwright/runtime-defaults.toml","sha256":"799b958981d4a6cbe82b0255a30b8d32b5e061fdef87088b2919aa4b2d463911"},

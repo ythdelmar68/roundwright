@@ -12,7 +12,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
-from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorFailoverResult, SupervisorFallbackAuthorization, SupervisorResultKind, dispatch_ordered_supervisor_attempts
+from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorDiagnostic, SupervisorFailoverResult, SupervisorFallbackAuthorization, SupervisorResultKind, dispatch_ordered_supervisor_attempts
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 from .configuration import FileReviewAuthorityStore, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityEvidenceReceipt, ReviewAuthorityExpectation, ReviewPolicy
 from .runtime_binding import ExternalSupervisorRuntimeStore, FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBinding, SupervisorRuntimeBindingReceipt

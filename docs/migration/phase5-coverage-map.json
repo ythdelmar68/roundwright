@@ -40,7 +40,7 @@
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
       {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"570485e5e1289e761dc20082aa1f47212b8376ae2672cd473d3a819bb812a498"},
       {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"c540c4a66a5507189e09f8529eba3e2828f2b0b0fe2fdc935946a572d6f62261"},
-      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"4c8af9d4bd7ec9718cfad7e0e73c3b9809faf564ced52b1602868650eed6b325"}
+      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"25131e0ce479beb1f3ee25f5aef5f2639ecf218885ad1bc43bae1a513bc747b0"}
     ]
   },
   "issue_132_requirements": {

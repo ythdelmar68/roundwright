@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,7 @@ SEMANTIC_CONTRACTS = {
     "tests/test_production_coding_runtime.py": (
         "test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
         "test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
+        "test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage",
     ),
     "tests/test_coding_tools.py": (
         "test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
@@ -174,9 +176,12 @@ SEMANTIC_CONTRACTS = {
     ),
     "tests/test_codex_dependency_review.py": (
         "test_restart_scope_denial_blocks_before_dependency_provider_session",
+        "test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
+        "test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
     ),
     "tests/test_codex_supervisor.py": (
         "test_ambiguous_and_incomplete_results_stop_before_fallback",
+        "test_sequence_advances_invalid_primary_to_valid_fallback",
     ),
     "tests/test_provider_attempt_runtime.py": (
         "test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output",
@@ -484,8 +489,12 @@ SEMANTIC_TESTS = (
     "tests.test_coding_tools.BoundedCodingToolsTests.test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
     "tests.test_role_capability_policy.RoleCapabilityPolicyTests.test_scope_traversal_unknown_descriptors_and_capability_expansion_fail_closed",
     "tests.test_codex_worker.CodexWorkerAdapterTests.test_typed_denial_and_transport_failure_remain_typed",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage",
     "tests.test_codex_supervisor.SupervisorTests.test_security_denial_stops_before_a_prebound_profile_fallback",
+    "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_scope_denial_blocks_before_dependency_provider_session",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
     "tests.test_failure_recovery.FailureRecoveryTests.test_denial_blocks_same_scope_across_restart_until_exact_clearance",
     "tests.test_failure_recovery.FailureRecoveryTests.test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route",
     "tests.test_failure_recovery.FailureRecoveryTests.test_closed_matrix_allows_only_canonical_evidence_and_recovery_categories",
@@ -512,20 +521,28 @@ ISSUE_132_FINDING_REQUIREMENTS = {
     "E1R2-07": ("src/roundwright/failure_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified"),
     "E1R2-08": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic"),
 }
-ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + (
+ISSUE_132_E1R3_TESTS = (
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage",
+    "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
+)
+ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + ISSUE_132_E1R3_TESTS + (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
 )
 def _validate_issue_132_semantic_tests() -> None:
-    """Keep the independently maintained E1R2 inventory closed and ordered."""
+    """Keep the independently maintained E1R2/E1R3 inventory closed and ordered."""
     if len(ISSUE_132_FINDING_REQUIREMENTS) != 8 or len(set(ISSUE_132_FINDING_REQUIREMENTS)) != 8:
         raise CoverageError("Issue 132 E1R2 finding inventory is incomplete")
     if tuple(test for test in SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
         raise CoverageError("Issue 132 semantic test inventory is omitted, reordered, or drifted")
     if any(not (ROOT / path).is_file() or test not in SEMANTIC_TESTS for path, test in ISSUE_132_FINDING_REQUIREMENTS.values()):
         raise CoverageError("Issue 132 E1R2 finding mapping has drifted")
+    if len(ISSUE_132_E1R3_TESTS) != 4 or any(test not in SEMANTIC_TESTS for test in ISSUE_132_E1R3_TESTS):
+        raise CoverageError("Issue 132 E1R3 finding inventory is incomplete")
 
 def _semantic_execution(path: Path, candidate: str) -> str:
     _validate_issue_132_semantic_tests()
@@ -533,7 +550,7 @@ def _semantic_execution(path: Path, candidate: str) -> str:
         actual = _read_json(path)
     except CoverageError as error:
         raise CoverageError("Phase 5 semantic execution receipt is unavailable") from error
-    payload = {"schema": "roundwright-phase5-semantic-execution/v2", "candidate_sha": candidate, "tests": list(SEMANTIC_TESTS), "windows_declared_skips": list(WINDOWS_DECLARED_SKIPS), "status": "passed"}
+    payload = {"schema": "roundwright-phase5-semantic-execution/v3", "candidate_sha": candidate, "tests": list(SEMANTIC_TESTS), "executed_tests": list(SEMANTIC_TESTS), "skipped_tests": list(WINDOWS_DECLARED_SKIPS if sys.platform == "win32" else ()), "windows_declared_skips": list(WINDOWS_DECLARED_SKIPS), "status": "passed"}
     if actual != {**payload, "receipt_digest": "sha256:" + _digest(_canonical(payload))}:
         raise CoverageError("Phase 5 semantic execution receipt is stale or forged")
     return actual["receipt_digest"]

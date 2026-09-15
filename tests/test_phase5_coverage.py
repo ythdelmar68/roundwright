@@ -19,6 +19,19 @@ coverage = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(coverage)
 
 
+def semantic_payload(candidate, *, tests=None, executed=None, skipped=None, status="passed"):
+    tests = coverage.SEMANTIC_TESTS if tests is None else tests
+    return {
+        "schema": "roundwright-phase5-semantic-execution/v3",
+        "candidate_sha": candidate,
+        "tests": tests,
+        "executed_tests": tests if executed is None else executed,
+        "skipped_tests": () if skipped is None else skipped,
+        "windows_declared_skips": coverage.WINDOWS_DECLARED_SKIPS,
+        "status": status,
+    }
+
+
 class Phase5CoverageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -30,7 +43,7 @@ class Phase5CoverageTests(unittest.TestCase):
         shutil.copy2(ROOT / "docs" / "migration" / "phase5-coverage-map.json", self.source)
         shutil.copy2(ROOT / "docs" / "migration" / "legacy-decision-ledger.md", self.ledger)
         shutil.copy2(ROOT / "docs" / "migration" / "test-disposition.md", self.tests)
-        candidate = coverage.current_candidate(); payload={"schema":"roundwright-phase5-semantic-execution/v2","candidate_sha":candidate,"tests":coverage.SEMANTIC_TESTS,"windows_declared_skips":coverage.WINDOWS_DECLARED_SKIPS,"status":"passed"}
+        candidate = coverage.current_candidate(); payload=semantic_payload(candidate)
         self.semantic.write_text(json.dumps({**payload,"receipt_digest":"sha256:" + coverage._digest(coverage._canonical(payload))}),encoding="utf-8")
 
     def tearDown(self) -> None:
@@ -174,9 +187,12 @@ class Phase5CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(coverage.CoverageError, "semantic execution receipt is unavailable"):
             coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
         for payload in (
-            {"schema": "roundwright-phase5-semantic-execution/v2", "candidate_sha": "0" * 40, "tests": coverage.SEMANTIC_TESTS, "windows_declared_skips": coverage.WINDOWS_DECLARED_SKIPS, "status": "passed"},
-            {"schema": "roundwright-phase5-semantic-execution/v2", "candidate_sha": candidate, "tests": coverage.SEMANTIC_TESTS[:-1], "windows_declared_skips": coverage.WINDOWS_DECLARED_SKIPS, "status": "passed"},
-            {"schema": "roundwright-phase5-semantic-execution/v2", "candidate_sha": candidate, "tests": coverage.SEMANTIC_TESTS, "windows_declared_skips": coverage.WINDOWS_DECLARED_SKIPS, "status": "failed"},
+            semantic_payload("0" * 40),
+            semantic_payload(candidate, tests=coverage.SEMANTIC_TESTS[:-1]),
+            semantic_payload(candidate, executed=coverage.SEMANTIC_TESTS[:-1]),
+            semantic_payload(candidate, executed=(*coverage.SEMANTIC_TESTS, coverage.SEMANTIC_TESTS[0])),
+            semantic_payload(candidate, skipped=(coverage.SEMANTIC_TESTS[0],)),
+            semantic_payload(candidate, status="failed"),
         ):
             self.semantic.write_text(json.dumps({**payload, "receipt_digest": "sha256:" + coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
             with self.subTest(payload=payload), self.assertRaisesRegex(coverage.CoverageError, "stale or forged"):
@@ -192,6 +208,10 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority",
             "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
             "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic",
+            "tests.test_production_coding_runtime.ProductionRuntimeTests.test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage",
+            "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
             "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
@@ -208,7 +228,7 @@ class Phase5CoverageTests(unittest.TestCase):
             (*coverage.SEMANTIC_TESTS[:5], required[4], required[3], *coverage.SEMANTIC_TESTS[6:]),
         )
         candidate = coverage.current_candidate()
-        payload = {"schema": "roundwright-phase5-semantic-execution/v2", "candidate_sha": candidate, "tests": coverage.SEMANTIC_TESTS, "windows_declared_skips": coverage.WINDOWS_DECLARED_SKIPS, "status": "passed"}
+        payload = semantic_payload(candidate)
         self.semantic.write_text(json.dumps({**payload, "receipt_digest": "sha256:" + coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
         for semantic_tests in variants:
             with self.subTest(semantic_tests=semantic_tests), patch.object(coverage, "SEMANTIC_TESTS", semantic_tests), self.assertRaisesRegex(coverage.CoverageError, "Issue 132 semantic test inventory"):

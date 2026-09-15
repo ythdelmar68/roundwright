@@ -64,6 +64,7 @@ ISSUE_136_ARTIFACTS = {
     "advisory-coding-tools-tests-v1": "tests/test_coding_tools.py",
     "advisory-production-coding-runtime-tests-v1": "tests/test_production_coding_runtime.py",
     "advisory-admission-fixture-v1": "tests/role_admission_fixture.py",
+    "advisory-semantic-receipt-runner-v1": "ci/phase5_semantic_receipt.py",
     "advisory-qualification-validator-v1": "ci/validate_phase5_coverage.py",
     "advisory-qualification-validator-tests-v1": "tests/test_phase5_coverage.py",
 }
@@ -381,7 +382,10 @@ _SEMANTIC_TESTS = (
 )
 
 def _semantic_execution(path: Path, candidate: str) -> str:
-    actual = _read_json(path)
+    try:
+        actual = _read_json(path)
+    except CoverageError as error:
+        raise CoverageError("Phase 5 semantic execution receipt is unavailable") from error
     payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": list(_SEMANTIC_TESTS), "status": "passed"}
     if actual != {**payload, "receipt_digest": _digest(_canonical(payload))}:
         raise CoverageError("Phase 5 semantic execution receipt is stale or forged")

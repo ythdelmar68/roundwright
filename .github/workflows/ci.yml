@@ -96,8 +96,9 @@ jobs:
           checked_out_sha="$(git rev-parse HEAD)"
           test "$checked_out_sha" = "$CANDIDATE_SHA"
           python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py validate
-          python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py render --candidate "$CANDIDATE_SHA" --output dist/phase5-coverage-manifest.json
-          python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py verify --candidate "$CANDIDATE_SHA" --manifest dist/phase5-coverage-manifest.json
+          python ci/resolve_validation_toolchain.py exec-python -- ci/phase5_semantic_receipt.py --candidate "$CANDIDATE_SHA" --output dist/phase5-semantic-execution.json
+          python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py render --candidate "$CANDIDATE_SHA" --output dist/phase5-coverage-manifest.json --semantic-receipt dist/phase5-semantic-execution.json
+          python ci/resolve_validation_toolchain.py exec-python -- ci/validate_phase5_coverage.py verify --candidate "$CANDIDATE_SHA" --manifest dist/phase5-coverage-manifest.json --semantic-receipt dist/phase5-semantic-execution.json
           sha256sum dist/phase5-coverage-manifest.json > dist/phase5-coverage-manifest.sha256
       - name: Run deterministic offline tests
         run: python ci/resolve_validation_toolchain.py exec-python -- -m unittest discover -s tests -v
@@ -130,6 +131,7 @@ jobs:
         with:
           name: roundwright-phase5-coverage-${{ matrix.os }}-${{ env.CANDIDATE_SHA }}
           path: |
+            dist/phase5-semantic-execution.json
             dist/phase5-coverage-manifest.json
             dist/phase5-coverage-manifest.sha256
       - uses: actions/upload-artifact@v4

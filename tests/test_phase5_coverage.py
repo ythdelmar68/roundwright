@@ -153,3 +153,18 @@ class Phase5CoverageTests(unittest.TestCase):
         other_candidate = "0" * 40 if candidate != "0" * 40 else "1" * 40
         with self.assertRaisesRegex(coverage.CoverageError, "does not match checked-out HEAD"):
             coverage.verify(self.source, self.ledger, self.tests, other_candidate, manifest, self.semantic)
+
+    def test_rejects_missing_stale_and_inconsistent_semantic_execution_receipts(self) -> None:
+        candidate = coverage.current_candidate()
+        manifest = self.directory / "readback.json"
+        self.semantic.unlink()
+        with self.assertRaisesRegex(coverage.CoverageError, "semantic execution receipt is unavailable"):
+            coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
+        for payload in (
+            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": "0" * 40, "tests": coverage._SEMANTIC_TESTS, "status": "passed"},
+            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": coverage._SEMANTIC_TESTS[:-1], "status": "passed"},
+            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": coverage._SEMANTIC_TESTS, "status": "failed"},
+        ):
+            self.semantic.write_text(json.dumps({**payload, "receipt_digest": coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
+            with self.subTest(payload=payload), self.assertRaisesRegex(coverage.CoverageError, "stale or forged"):
+                coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)

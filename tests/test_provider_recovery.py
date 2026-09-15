@@ -812,6 +812,47 @@ class ProviderRecoveryTests(unittest.TestCase):
                 with self.assertRaises(Exception):
                     read_durable_failure(repository, other, record.digest)
 
+    def test_supervisor_coordinates_are_unique_and_strictly_monotonic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("coordinate")
+            self.admit(repository, identity, lease)
+            context = self.context(identity, role=ProviderRole.SUPERVISOR)
+            profile = context.runtime_binding.supervisor_profile_identities[0]
+
+            def reserve(attempt: str, *, epoch: int, review_round: int, physical: int):
+                return prepare_attempt(
+                    repository, identity, context, attempt_id=attempt,
+                    role=ProviderRole.SUPERVISOR, process_lease_id=f"lease-{attempt}",
+                    process_lease_expires_at=int(time.time()) + 10,
+                    input_fingerprint="a" * 64, selected_profile_identity=profile,
+                    logical_profile_position=1, physical_format_output_ordinal=physical,
+                    review_epoch=epoch, review_round=review_round, lease=lease,
+                )
+
+            first = reserve("coordinate-zero", epoch=1, review_round=1, physical=0)
+            self.assertEqual(first, reserve("coordinate-zero", epoch=1, review_round=1, physical=0))
+            reserve("coordinate-one", epoch=1, review_round=1, physical=1)
+            reserve("coordinate-two", epoch=1, review_round=1, physical=2)
+            reserve("coordinate-round-two", epoch=1, review_round=2, physical=0)
+            with self.assertRaisesRegex(ProviderRecoveryError, "conflicts"):
+                reserve("coordinate-duplicate", epoch=1, review_round=2, physical=0)
+            with self.assertRaisesRegex(ProviderRecoveryError, "stale, regressive, or gapped"):
+                reserve("coordinate-gap", epoch=1, review_round=4, physical=0)
+            with self.assertRaisesRegex(ProviderRecoveryError, "stale, regressive, or gapped"):
+                reserve("coordinate-regression", epoch=0, review_round=1, physical=0)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO supervisor_attempt_coordinates("
+                        "attempt_id, task_id, review_epoch, review_round, logical_profile_position, "
+                        "physical_format_output_ordinal, profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        ("database-coordinate-duplicate", identity.task_id, 1, 2, 1, 0, profile),
+                    )
+            finally:
+                connection.close()
+
     def test_durable_clearance_and_revocation_are_append_only_and_restart_verified(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary)); initialize(repository)

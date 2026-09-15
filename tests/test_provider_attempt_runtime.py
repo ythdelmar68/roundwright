@@ -485,6 +485,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE task_id = ? AND (attempt_id = ? OR attempt_id LIKE 'runtime-format-provider-%') ORDER BY attempt_number", (identity.task_id, runner.selection.provider_attempt_id)).fetchall(), [(1, 0), (1, 1), (1, 2)])
+                self.assertEqual(connection.execute("SELECT review_epoch, review_round, logical_profile_position, physical_format_output_ordinal FROM supervisor_attempt_coordinates WHERE task_id = ? ORDER BY logical_profile_position, physical_format_output_ordinal", (identity.task_id,)).fetchall(), [(1, 1, 1, 0), (1, 1, 1, 1), (1, 1, 1, 2)])
             finally:
                 connection.close()
 
@@ -503,6 +504,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT attempt_id, logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE attempt_id IN (?, ?) ORDER BY attempt_number", (runner.selection.provider_attempt_id, next_selection.provider_attempt_id)).fetchall(), [(runner.selection.provider_attempt_id, 1, 0), (next_selection.provider_attempt_id, 1, 1)])
+                self.assertEqual(connection.execute("SELECT attempt_id, review_epoch, review_round, logical_profile_position, physical_format_output_ordinal FROM supervisor_attempt_coordinates WHERE attempt_id IN (?, ?) ORDER BY logical_profile_position, physical_format_output_ordinal", (runner.selection.provider_attempt_id, next_selection.provider_attempt_id)).fetchall(), [(runner.selection.provider_attempt_id, 1, 1, 1, 0), (next_selection.provider_attempt_id, 1, 1, 1, 1)])
             finally:
                 connection.close()
 

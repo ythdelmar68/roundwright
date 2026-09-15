@@ -718,7 +718,8 @@ def checkpoint_diff_review_session(
         process_lease_expires_at=process_lease_expires_at,
         input_fingerprint=input_digest,
         selected_profile_identity=selected_profile_identity, logical_profile_position=within_round_attempt,
-        physical_format_output_ordinal=physical_format_output_ordinal, lease=lease, now=now,
+        physical_format_output_ordinal=physical_format_output_ordinal,
+        review_epoch=review_epoch, review_round=review_round, lease=lease, now=now,
     )
     if provider.state is AttemptState.PREPARED:
         record_session_identity(
@@ -798,7 +799,11 @@ def dispatch_diff_review(
     _require_unconsumed_formal_round(repository, identity, policy_projection.review_epoch, policy_projection.review_round)
     provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.SUPERVISOR,
                                process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
-                               input_fingerprint=input_digest, selected_profile_identity=selected_profile_identity, logical_profile_position=within_round_attempt, physical_format_output_ordinal=physical_format_output_ordinal, lease=lease, now=now)
+                               input_fingerprint=input_digest, selected_profile_identity=selected_profile_identity,
+                               logical_profile_position=within_round_attempt,
+                               physical_format_output_ordinal=physical_format_output_ordinal,
+                               review_epoch=review_epoch, review_round=review_round,
+                               lease=lease, now=now)
     if provider.state is AttemptState.PREPARED:
         record_session_identity(repository, identity, context, attempt_id=provider_attempt_id, session_identity=supervisor_session_identity, lease=lease, now=now)
         record_external_turn(repository, identity, context, attempt_id=provider_attempt_id, session_identity=supervisor_session_identity, external_turn_identity=external_turn_identity, lease=lease, now=now)

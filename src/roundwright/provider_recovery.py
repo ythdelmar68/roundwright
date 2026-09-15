@@ -286,6 +286,7 @@ def read_supervisor_accounting_snapshot(
         raise ProviderRecoveryError("accounting snapshot state is unavailable") from error
     try:
         _require_matching_task(connection, identity)
+        _require_monotonic_supervisor_coordinates(connection, identity.task_id)
         seal = connection.execute("SELECT base_sha,candidate_sha,state_identity FROM candidate_seals WHERE task_id=?", (identity.task_id,)).fetchone()
         if seal != (base_sha, candidate_sha, seal_state_identity): raise ProviderRecoveryError("accounting snapshot seal has drifted")
         evidence = tuple(row[0] for row in connection.execute("SELECT evidence_fingerprint FROM candidate_evidence WHERE task_id=? AND candidate_sha=? ORDER BY evidence_fingerprint", (identity.task_id,candidate_sha)))
@@ -296,7 +297,17 @@ def read_supervisor_accounting_snapshot(
             physical, profile = (0, rest[0]) if len(rest) == 1 else rest
             row = connection.execute("SELECT state,session_identity,external_turn_identity,output_pointer,completion_evidence_fingerprint,accepted_review_identity,selected_profile_identity,logical_profile_position,physical_format_output_ordinal FROM provider_attempts WHERE task_id=? AND attempt_id=?", (identity.task_id,attempt_id)).fetchone()
             outcome = connection.execute("SELECT recovery_action,blocker FROM provider_recovery_outcomes WHERE attempt_id=?", (attempt_id,)).fetchone()
-            if row is None or row[6] != profile or row[7] != ordinal or row[8] != physical: raise ProviderRecoveryError("accounting snapshot attempt is unavailable")
+            coordinate = connection.execute(
+                "SELECT task_id, review_epoch, review_round, logical_profile_position, "
+                "physical_format_output_ordinal, profile_identity "
+                "FROM supervisor_attempt_coordinates WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if (
+                row is None or row[6] != profile or row[7] != ordinal or row[8] != physical
+                or coordinate != (identity.task_id, review_epoch, review_round, ordinal, physical, profile)
+            ):
+                raise ProviderRecoveryError("accounting snapshot attempt is unavailable")
             persisted = None if outcome is None else _PersistedRecoveryOutcome(RecoveryAction(outcome[0]), outcome[1])
             return SupervisorAccountingAttemptSnapshot(attempt_id,ordinal,profile,AttemptState(row[0]),row[1] is not None,row[2] is not None,row[4] is not None,(row[3] or "").startswith("supervisor-invalid-"),None if outcome is None else RecoveryAction(outcome[0]),_terminal_failure_from_outcome(AttemptState(row[0]), persisted),row[5] is not None,physical)
         current = attempt((current_attempt_id,current_within_round_attempt,current_physical_format_output_ordinal,current_profile_identity))
@@ -320,6 +331,8 @@ def preflight_attempt_preparation(
     selected_profile_identity: str | None = None,
     logical_profile_position: int = 0,
     physical_format_output_ordinal: int = 0,
+    review_epoch: int | None = None,
+    review_round: int | None = None,
     now: int | None = None,
 ) -> None:
     """Validate a future attempt's identity and health without durable writes."""
@@ -338,7 +351,115 @@ def preflight_attempt_preparation(
         raise ProviderRecoveryError("Supervisor accounting position is invalid")
     if role is not ProviderRole.SUPERVISOR and (logical_profile_position != 0 or physical_format_output_ordinal != 0):
         raise ProviderRecoveryError("non-Supervisor accounting position is invalid")
+    _validate_supervisor_coordinate_request(role, review_epoch, review_round)
     _require_health_authorization(context, role, selected, _clock(now))
+
+
+def _validate_supervisor_coordinate_request(
+    role: ProviderRole, review_epoch: int | None, review_round: int | None,
+) -> tuple[int, int] | None:
+    """Require epoch/round ownership whenever a Supervisor reserves accounting."""
+    if role is not ProviderRole.SUPERVISOR:
+        if review_epoch is not None or review_round is not None:
+            raise ProviderRecoveryError("non-Supervisor attempt coordinate is invalid")
+        return None
+    if review_epoch is None and review_round is None:
+        return None
+    if type(review_epoch) is not int or review_epoch < 0 or type(review_round) is not int or review_round < 1:
+        raise ProviderRecoveryError("Supervisor attempt coordinate is invalid")
+    return review_epoch, review_round
+
+
+def _coordinate_transition_is_valid(
+    previous: tuple[int, int, int, int] | None,
+    current: tuple[int, int, int, int],
+) -> bool:
+    """Accept only one next profile/format/round/epoch coordinate."""
+    epoch, round_number, logical, physical = current
+    if epoch < 0 or round_number < 1 or logical < 1 or not 0 <= physical <= 2:
+        return False
+    if previous is None:
+        # A migrated history may begin at a later formal round.  Every new
+        # coordinate is subsequently checked against that durable baseline.
+        return True
+    prior_epoch, prior_round, prior_logical, prior_physical = previous
+    if epoch == prior_epoch and round_number == prior_round:
+        return (
+            (logical == prior_logical and physical == prior_physical + 1)
+            or (logical == prior_logical + 1 and physical == 0)
+        )
+    if epoch == prior_epoch:
+        return round_number == prior_round + 1 and logical == 1 and physical == 0
+    # A new durable epoch either continues the same formal round for a
+    # revalidated candidate, or resets the round sequence for a new candidate.
+    return epoch == prior_epoch + 1 and round_number in {prior_round, 1} and logical == 1 and physical == 0
+
+
+def _reserve_supervisor_coordinate(
+    connection, task_id: str, attempt_id: str, profile_identity: str,
+    logical_profile_position: int, physical_format_output_ordinal: int,
+    coordinate: tuple[int, int] | None,
+) -> None:
+    """Persist one exact coordinate or reject duplicate, stale, and gapped state."""
+    if coordinate is None:
+        return
+    epoch, round_number = coordinate
+    expected = (task_id, epoch, round_number, logical_profile_position, physical_format_output_ordinal, profile_identity)
+    existing = connection.execute(
+        "SELECT task_id, review_epoch, review_round, logical_profile_position, physical_format_output_ordinal, profile_identity FROM supervisor_attempt_coordinates WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    if existing is not None:
+        if existing != expected:
+            raise ProviderRecoveryError("Supervisor attempt coordinate replay conflicts with committed state")
+        _require_monotonic_supervisor_coordinates(connection, task_id)
+        return
+    collision = connection.execute(
+        "SELECT attempt_id FROM supervisor_attempt_coordinates WHERE task_id = ? AND review_epoch = ? AND review_round = ? AND logical_profile_position = ? AND physical_format_output_ordinal = ?",
+        expected[:-1],
+    ).fetchone()
+    if collision is not None:
+        raise ProviderRecoveryError("Supervisor attempt coordinate conflicts with committed state")
+    _require_monotonic_supervisor_coordinates(
+        connection, task_id,
+        prospective=(epoch, round_number, logical_profile_position, physical_format_output_ordinal),
+    )
+    connection.execute(
+        "INSERT INTO supervisor_attempt_coordinates(attempt_id, task_id, review_epoch, review_round, logical_profile_position, physical_format_output_ordinal, profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (attempt_id, *expected),
+    )
+
+
+def _require_monotonic_supervisor_coordinates(
+    connection, task_id: str, *, prospective: tuple[int, int, int, int] | None = None,
+) -> None:
+    """Validate the ordered durable ledger and one possible next coordinate."""
+    invalid = connection.execute(
+        "SELECT 1 FROM supervisor_attempt_coordinates AS coordinates "
+        "LEFT JOIN provider_attempts AS attempts "
+        "ON attempts.attempt_id = coordinates.attempt_id AND attempts.task_id = coordinates.task_id "
+        "WHERE coordinates.task_id = ? "
+        "AND (attempts.attempt_id IS NULL OR attempts.provider_role != 'supervisor') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if invalid is not None:
+        raise ProviderRecoveryError("Supervisor attempt coordinate history has drifted")
+    rows = connection.execute(
+        "SELECT coordinates.review_epoch, coordinates.review_round, coordinates.logical_profile_position, coordinates.physical_format_output_ordinal, attempts.selected_profile_identity, coordinates.profile_identity "
+        "FROM supervisor_attempt_coordinates AS coordinates "
+        "JOIN provider_attempts AS attempts "
+        "ON attempts.attempt_id = coordinates.attempt_id AND attempts.task_id = coordinates.task_id "
+        "WHERE coordinates.task_id = ? AND attempts.provider_role = 'supervisor' "
+        "ORDER BY attempts.attempt_number, attempts.attempt_id",
+        (task_id,),
+    ).fetchall()
+    previous: tuple[int, int, int, int] | None = None
+    for epoch, round_number, logical, physical, selected, recorded_profile in rows:
+        if selected != recorded_profile or not _coordinate_transition_is_valid(previous, (epoch, round_number, logical, physical)):
+            raise ProviderRecoveryError("Supervisor attempt coordinate history has drifted")
+        previous = (epoch, round_number, logical, physical)
+    if prospective is not None and not _coordinate_transition_is_valid(previous, prospective):
+        raise ProviderRecoveryError("Supervisor attempt coordinate is stale, regressive, or gapped")
 
 
 def prepare_attempt(
@@ -354,6 +475,8 @@ def prepare_attempt(
     selected_profile_identity: str | None = None,
     logical_profile_position: int = 0,
     physical_format_output_ordinal: int = 0,
+    review_epoch: int | None = None,
+    review_round: int | None = None,
     lease: TransitionLease | None = None,
     now: int | None = None,
 ) -> ProviderAttempt:
@@ -374,6 +497,7 @@ def prepare_attempt(
         raise ProviderRecoveryError("Supervisor accounting position is invalid")
     if role is not ProviderRole.SUPERVISOR and (logical_profile_position != 0 or physical_format_output_ordinal != 0):
         raise ProviderRecoveryError("non-Supervisor accounting position is invalid")
+    coordinate = _validate_supervisor_coordinate_request(role, review_epoch, review_round)
     receipt = _require_health_authorization(context, role, selected_profile, observed)
     connection = _open_writable_connection(repository)
     try:
@@ -410,6 +534,10 @@ def prepare_attempt(
                 or row.state not in {AttemptState.PREPARED, AttemptState.DISPATCHED}
             ):
                 raise ProviderRecoveryError("provider attempt replay conflicts with committed state")
+            _reserve_supervisor_coordinate(
+                connection, identity.task_id, attempt_id, selected_profile,
+                logical_profile_position, physical_format_output_ordinal, coordinate,
+            )
             connection.commit()
             return row
         number = connection.execute(
@@ -419,6 +547,10 @@ def prepare_attempt(
         connection.execute(
             "INSERT INTO provider_attempts(attempt_id, task_id, provider_role, attempt_number, process_lease_id, process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, output_pointer, completion_evidence_fingerprint, accepted_review_identity, state, selected_profile_identity, logical_profile_position, physical_format_output_ordinal) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?)",
             (attempt_id, identity.task_id, role.value, number, process_lease_id, process_lease_expires_at, input_fingerprint, AttemptState.PREPARED.value, selected_profile, logical_profile_position, physical_format_output_ordinal),
+        )
+        _reserve_supervisor_coordinate(
+            connection, identity.task_id, attempt_id, selected_profile,
+            logical_profile_position, physical_format_output_ordinal, coordinate,
         )
         _persist_context(connection, attempt_id, context)
         authorization_fingerprint = _persist_health_authorization(connection, attempt_id, receipt, role, selected_profile)

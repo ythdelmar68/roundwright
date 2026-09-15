@@ -476,6 +476,7 @@ class DurableDiffReviewRunner:
                     selected_profile_identity=entry.audit.profile_identity,
                     logical_profile_position=selection.resolved_logical_profile_position,
                     physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                    review_epoch=self.review_epoch, review_round=self.review_round,
                     now=self.dispatch_control.now,
                 )
             # Every provider-free eligibility dependency is normalized here.
@@ -587,6 +588,7 @@ class DurableDiffReviewRunner:
                 input_fingerprint=input_fingerprint, selected_profile_identity=entry.audit.profile_identity,
                 logical_profile_position=selection.resolved_logical_profile_position,
                 physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                review_epoch=self.review_epoch, review_round=self.review_round,
                 lease=self.lease, now=self.dispatch_control.now,
             )
             if prepared.state is not AttemptState.PREPARED:
@@ -719,6 +721,7 @@ class DurableDiffReviewRunner:
             selected_profile_identity=selected,
             logical_profile_position=selection.resolved_logical_profile_position,
             physical_format_output_ordinal=selection.physical_format_output_ordinal,
+            review_epoch=self.review_epoch, review_round=self.review_round,
             lease=self.lease, now=self.dispatch_control.now,
         )
         if prepared.state is not AttemptState.PREPARED:

@@ -11,7 +11,6 @@ import argparse
 import hashlib
 import json
 import re
-import runpy
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -85,9 +84,16 @@ ISSUE_132_ARTIFACTS = {
     "failure-recovery-roadmap-v1": "docs/operations/dogfood-promotion-roadmap.md",
     "failure-recovery-supervisor-runtime-v1": "src/roundwright/provider_attempt_runtime.py",
     "failure-recovery-supervisor-boundary-v1": "src/roundwright/codex_supervisor.py",
+    "failure-recovery-worker-boundary-v1": "src/roundwright/codex_worker.py",
+    "failure-recovery-dependency-boundary-v1": "src/roundwright/codex_dependency_review.py",
+    "failure-recovery-candidate-review-v1": "src/roundwright/candidate_review.py",
     "failure-recovery-supervisor-runtime-tests-v1": "tests/test_provider_attempt_runtime.py",
     "failure-recovery-runtime-tests-v1": "tests/test_provider_recovery.py",
     "failure-recovery-supervisor-tests-v1": "tests/test_codex_supervisor.py",
+    "failure-recovery-worker-tests-v1": "tests/test_codex_worker.py",
+    "failure-recovery-dependency-tests-v1": "tests/test_codex_dependency_review.py",
+    "failure-recovery-candidate-review-tests-v1": "tests/test_candidate_review.py",
+    "failure-recovery-state-tests-v1": "tests/test_state.py",
     "failure-recovery-semantic-receipt-v1": "ci/phase5_semantic_receipt.py",
     "failure-recovery-qualification-validator-v1": "ci/validate_phase5_coverage.py",
     "failure-recovery-qualification-tests-v1": "tests/test_phase5_coverage.py",
@@ -140,17 +146,34 @@ SEMANTIC_CONTRACTS = {
     "src/roundwright/provider_attempt_runtime.py": (
         "class ProviderAttemptFormatCorrectionExhausted",
         "physical_format_output_ordinal",
-        "provider terminal failure is not format-correctable",
+        "provider terminal failure cannot use a format correction route",
     ),
     "src/roundwright/codex_supervisor.py": (
         "roundwright-provider-attempt-accounting-material/v3",
         "physical_format_output_ordinal",
+        "_eligible_prebound_failover",
+    ),
+    "src/roundwright/codex_worker.py": (
+        "class CodexWorkerAdapter",
+        "SANDBOX_OR_APPROVAL_DENIED",
+    ),
+    "src/roundwright/codex_dependency_review.py": (
+        "def classify_dependency_review_failure",
+        "DependencyReviewResultKind.BLOCKED",
     ),
     "tests/test_failure_recovery.py": (
         "test_denial_blocks_same_scope_across_restart_until_exact_clearance",
     ),
     "tests/test_provider_recovery.py": (
         "test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
+        "test_durable_failure_readback_revalidates_current_admission_authority",
+        "test_supervisor_coordinates_are_unique_and_strictly_monotonic",
+    ),
+    "tests/test_codex_worker.py": (
+        "test_typed_denial_and_transport_failure_remain_typed",
+    ),
+    "tests/test_codex_dependency_review.py": (
+        "test_restart_scope_denial_blocks_before_dependency_provider_session",
     ),
     "tests/test_codex_supervisor.py": (
         "test_ambiguous_and_incomplete_results_stop_before_fallback",
@@ -454,12 +477,23 @@ def _semantic_contract_digest() -> str:
     return _digest(_canonical(payload))
 
 
-# The executor owns the closed inventory.  Loading its inert module value keeps
-# the receipt and verifier byte-for-byte aligned without a second editable list.
-_SEMANTIC_TESTS = tuple(runpy.run_path(str(ROOT / "ci" / "phase5_semantic_receipt.py"))["TESTS"])
-ISSUE_132_SEMANTIC_TESTS = (
+SEMANTIC_TESTS = (
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
+    "tests.test_worker_toolbox.WorkerToolboxTests.test_sealed_launch_context_rejects_coherent_public_instruction_mutation",
+    "tests.test_coding_tools.BoundedCodingToolsTests.test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
+    "tests.test_role_capability_policy.RoleCapabilityPolicyTests.test_scope_traversal_unknown_descriptors_and_capability_expansion_fail_closed",
+    "tests.test_codex_worker.CodexWorkerAdapterTests.test_typed_denial_and_transport_failure_remain_typed",
+    "tests.test_codex_supervisor.SupervisorTests.test_security_denial_stops_before_a_prebound_profile_fallback",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_scope_denial_blocks_before_dependency_provider_session",
     "tests.test_failure_recovery.FailureRecoveryTests.test_denial_blocks_same_scope_across_restart_until_exact_clearance",
+    "tests.test_failure_recovery.FailureRecoveryTests.test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route",
+    "tests.test_failure_recovery.FailureRecoveryTests.test_closed_matrix_allows_only_canonical_evidence_and_recovery_categories",
+    "tests.test_failure_recovery.FailureRecoveryTests.test_closed_record_parser_rejects_tampered_or_unknown_payload",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
     "tests.test_codex_supervisor.SupervisorTests.test_ambiguous_and_incomplete_results_stop_before_fallback",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
@@ -467,10 +501,31 @@ ISSUE_132_SEMANTIC_TESTS = (
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_later_accounting_request_reads_prior_invalid_recovery_without_disclosure",
 )
+WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
+ISSUE_132_FINDING_REQUIREMENTS = {
+    "E1R2-01": ("src/roundwright/codex_worker.py", "tests.test_codex_worker.CodexWorkerAdapterTests.test_typed_denial_and_transport_failure_remain_typed"),
+    "E1R2-02": ("src/roundwright/codex_supervisor.py", "tests.test_codex_supervisor.SupervisorTests.test_security_denial_stops_before_a_prebound_profile_fallback"),
+    "E1R2-03": ("src/roundwright/codex_dependency_review.py", "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_scope_denial_blocks_before_dependency_provider_session"),
+    "E1R2-04": ("src/roundwright/failure_recovery.py", "tests.test_failure_recovery.FailureRecoveryTests.test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route"),
+    "E1R2-05": ("src/roundwright/failure_recovery.py", "tests.test_failure_recovery.FailureRecoveryTests.test_closed_matrix_allows_only_canonical_evidence_and_recovery_categories"),
+    "E1R2-06": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority"),
+    "E1R2-07": ("src/roundwright/failure_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified"),
+    "E1R2-08": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic"),
+}
+ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + (
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
+)
 def _validate_issue_132_semantic_tests() -> None:
-    """Keep the selected Issue 132 receipt slice closed and ordered."""
-    if tuple(test for test in _SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
+    """Keep the independently maintained E1R2 inventory closed and ordered."""
+    if len(ISSUE_132_FINDING_REQUIREMENTS) != 8 or len(set(ISSUE_132_FINDING_REQUIREMENTS)) != 8:
+        raise CoverageError("Issue 132 E1R2 finding inventory is incomplete")
+    if tuple(test for test in SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
         raise CoverageError("Issue 132 semantic test inventory is omitted, reordered, or drifted")
+    if any(not (ROOT / path).is_file() or test not in SEMANTIC_TESTS for path, test in ISSUE_132_FINDING_REQUIREMENTS.values()):
+        raise CoverageError("Issue 132 E1R2 finding mapping has drifted")
 
 def _semantic_execution(path: Path, candidate: str) -> str:
     _validate_issue_132_semantic_tests()
@@ -478,7 +533,7 @@ def _semantic_execution(path: Path, candidate: str) -> str:
         actual = _read_json(path)
     except CoverageError as error:
         raise CoverageError("Phase 5 semantic execution receipt is unavailable") from error
-    payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": list(_SEMANTIC_TESTS), "status": "passed"}
+    payload = {"schema": "roundwright-phase5-semantic-execution/v2", "candidate_sha": candidate, "tests": list(SEMANTIC_TESTS), "windows_declared_skips": list(WINDOWS_DECLARED_SKIPS), "status": "passed"}
     if actual != {**payload, "receipt_digest": "sha256:" + _digest(_canonical(payload))}:
         raise CoverageError("Phase 5 semantic execution receipt is stale or forged")
     return actual["receipt_digest"]

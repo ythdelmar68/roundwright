@@ -18,6 +18,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_for_role
 from pathlib import Path
 
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, reserve_role_effect
@@ -25,6 +26,11 @@ from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, Seal
 
 class CodexSupervisorError(ValueError):
     """Raised when a Supervisor boundary would lose identity or authority."""
+
+
+def classify_supervisor_failure(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource) -> FailureRecord:
+    """Ordered dispatch consumes a role-bound decision, never display text."""
+    return classify_for_role(FailureRole.SUPERVISOR, binding, failure, evidence)
 
 
 class SupervisorCheckpointStage(StrEnum):

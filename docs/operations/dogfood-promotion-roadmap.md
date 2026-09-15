@@ -138,6 +138,13 @@ session by default. None proves session death. #132 distinguishes these states
 from no-progress, confirmed terminal context/session loss, ambiguous output,
 topology violations and verified security/authority denial.
 
+The #132 typed record is provider-neutral and binds every recovery decision to
+the candidate, policy, configuration, authority scope, role, profile, session,
+and attempt.  Display prose and missing telemetry are unknown and reconcile;
+they never authorize a replacement.  A verified denial stops the exact scope
+across restart.  Only a later verified, binding-identical clearance can be
+considered, and it is a new durable decision rather than an erased denial.
+
 #133 owns same-session continuation and evidence-gated successor admission.
 Before replacement, preserve and reconcile work/effects and fence the previous
 writer. Only the deterministic lifecycle owner admits a successor; a

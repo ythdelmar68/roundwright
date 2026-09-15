@@ -847,6 +847,15 @@ MIGRATIONS = (
             ("configured_source_inventories", "CREATE TABLE configured_source_inventories (inventory_digest TEXT PRIMARY KEY, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_set_digest TEXT NOT NULL, content_json TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        68,
+        (
+            "CREATE TABLE failure_recovery_records (record_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_json TEXT NOT NULL, recorded_at INTEGER NOT NULL CHECK(recorded_at > 0))",
+        ),
+        (
+            ("failure_recovery_records", "CREATE TABLE failure_recovery_records (record_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_json TEXT NOT NULL, recorded_at INTEGER NOT NULL CHECK(recorded_at > 0))"),
+        ),
+    ),
 )
 
 

@@ -215,7 +215,10 @@ class SupervisorTests(unittest.TestCase):
         )
 
     def admissions(self, adapters, requests=None):
-        requests = tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)) if requests is None else requests
+        requests = tuple(
+            self.request(index, adapter, logical=1, physical=index - 1)
+            for index, adapter in enumerate(adapters, start=1)
+        ) if requests is None else requests
         return tuple(self.admission(adapter, request) for adapter, request in zip(adapters, requests, strict=True))
 
     def execution_hosts(self, adapters):
@@ -326,8 +329,9 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((result.result.kind, result.attempted_profile_identities, fallback._backend.calls), (SupervisorResultKind.BLOCKED, (primary.profile_identity,), 0))
 
     def test_exhaustion_is_only_for_all_retryable_results_and_never_fabricates_a_verdict(self):
-        adapters = tuple(self.adapter(profile, str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index, profile in enumerate(self.profiles, start=1))
-        result = self.dispatch_ordered(tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)), adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        adapters = tuple(self.adapter(self.profiles[0], str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index in range(1, 4))
+        requests = tuple(self.request(index, adapter, logical=1, physical=index - 1) for index, adapter in enumerate(adapters, start=1))
+        result = self.dispatch_ordered(requests, adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result, result.exhausted, len(result.attempted_profile_identities)), (None, True, 3))
 
     def test_ambiguous_and_incomplete_results_stop_before_fallback(self):
@@ -554,7 +558,7 @@ class SupervisorTests(unittest.TestCase):
 
     def sequence_fixture(self, responses, *, coordinates=None):
         if coordinates is None:
-            coordinates = tuple((profile, index, 0) for index, profile in enumerate(self.profiles, start=1))
+            coordinates = tuple((self.profiles[0], 1, index) for index in range(len(responses)))
         adapters = tuple(
             self.adapter(profile, str(index), response)
             for index, ((profile, _logical, _physical), response) in enumerate(zip(coordinates, responses, strict=True), start=1)
@@ -596,7 +600,7 @@ class SupervisorTests(unittest.TestCase):
             with self.subTest(kind=kind.value):
                 responses = (
                     NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
-                    NativeSupervisorResponse(SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD),
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
                     NativeSupervisorResponse(kind),
                 )
                 adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(responses)

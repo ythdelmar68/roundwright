@@ -610,7 +610,7 @@ class ProductionActivationTests(unittest.TestCase):
     def test_missing_external_root_denies_before_input_construction(self) -> None:
         with self.assertRaisesRegex(DependencyReviewDispatchError, "activation is unavailable"):
             prepare_dependency_review_host(
-                None, None, None, None, advisory_execution=None,
+                None, None, None, None, None, advisory_execution=None,
                 execution_host=None, budget_ledger_path=None,
             )  # type: ignore[arg-type]
 

@@ -619,8 +619,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             checkpoint_failure = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
             self.assertIsNotNone(checkpoint_failure)
             self.assertEqual(
-                (first.attempt_id, checkpoint_failure.attempt_id, first_backend.calls, second_backend.calls),
-                (runner.selection.provider_attempt_id, runner.selection.provider_attempt_id, 1, 0),
+                (first.attempt_id, checkpoint_failure.failure_class, first_backend.calls, second_backend.calls),
+                (runner.selection.provider_attempt_id, SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE, 1, 0),
             )
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
             # A restart resumes only the already-selected successor profile.

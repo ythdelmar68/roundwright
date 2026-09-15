@@ -325,6 +325,125 @@ class RecoveryRouteAdmission:
             raise FailureRecoveryError("recovery route admission is invalid")
 
 
+@dataclass(frozen=True)
+class DurableRecoveryRouteAuthorization:
+    """Restart-safe, one-use authorization for a separately reserved effect."""
+
+    route_digest: str
+    record_digest: str
+    binding: FailureBinding
+    target_role: FailureRole
+    target_profile_digest: str
+    target_route_digest: str
+    coordinate_digest: str
+    remaining_budget_digest: str
+
+    def __post_init__(self) -> None:
+        if (not all(_DIGEST.fullmatch(value) for value in (self.route_digest, self.record_digest, self.target_profile_digest, self.target_route_digest, self.coordinate_digest, self.remaining_budget_digest))
+                or type(self.binding) is not FailureBinding or type(self.target_role) is not FailureRole):
+            raise FailureRecoveryError("durable recovery route authorization is invalid")
+        if self.target_role is not self.binding.role:
+            raise FailureRecoveryError("durable recovery route target role is invalid")
+
+
+def _route_payload(record_digest: str, binding: FailureBinding, target_role: FailureRole, target_profile_digest: str, target_route_digest: str, coordinate_digest: str, remaining_budget_digest: str) -> dict[str, object]:
+    return {"schema": "roundwright-durable-recovery-route/v1", "record_digest": record_digest, "binding": _binding_payload(binding), "target_role": target_role.value, "target_profile_digest": target_profile_digest, "target_route_digest": target_route_digest, "coordinate_digest": coordinate_digest, "remaining_budget_digest": remaining_budget_digest}
+
+
+def issue_durable_recovery_route_authorization(repository, identity, *, record_digest: str, binding: FailureBinding, target_role: FailureRole, target_profile_digest: str, target_route_digest: str, coordinate_digest: str, remaining_budget_digest: str, now: int | None = None) -> DurableRecoveryRouteAuthorization:
+    """Issue only from a current persisted fallback decision, before reservation."""
+    from .state import _open_writable_connection, _require_matching_task
+    if type(binding) is not FailureBinding or type(target_role) is not FailureRole or not all(_DIGEST.fullmatch(value) for value in (record_digest, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest)):
+        raise FailureRecoveryError("durable recovery route inputs are invalid")
+    observed = int(time.time()) if now is None else now
+    if type(observed) is not int or observed <= 0:
+        raise FailureRecoveryError("durable recovery route time is invalid")
+    payload = _route_payload(record_digest, binding, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest)
+    route_digest = "sha256:" + _digest_json(payload)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        record = _read_route_source(connection, identity, record_digest, binding)
+        if record.action is not RecoveryAction.PREBOUND_FALLBACK or not record.retryable or target_role is not binding.role:
+            raise FailureRecoveryError("durable recovery route source is not eligible")
+        repository_id = connection.execute("SELECT repository_id FROM tasks WHERE task_id=?", (identity.task_id,)).fetchone()
+        if repository_id != (identity.repository_id,):
+            raise FailureRecoveryError("durable recovery route authority has drifted")
+        encoded = json.dumps(_binding_payload(binding), sort_keys=True, separators=(",", ":"))
+        row = connection.execute("SELECT task_id, repository_id, record_digest, binding_json, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest FROM recovery_route_authorizations WHERE route_digest=?", (route_digest,)).fetchone()
+        expected = (identity.task_id, identity.repository_id, record_digest, encoded, target_role.value, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest)
+        if row is None:
+            connection.execute("INSERT INTO recovery_route_authorizations(route_digest, task_id, repository_id, record_digest, binding_json, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest, state, reservation_digest, issued_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', NULL, ?, NULL)", (route_digest, *expected, observed))
+        elif row != expected:
+            raise FailureRecoveryError("durable recovery route conflicts")
+        connection.commit()
+        return DurableRecoveryRouteAuthorization(route_digest, record_digest, binding, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest)
+    except Exception:
+        connection.rollback(); raise
+    finally:
+        connection.close()
+
+
+def _read_route_source(connection, identity, record_digest: str, binding: FailureBinding) -> FailureRecord:
+    row = connection.execute("SELECT record_json FROM failure_recovery_records WHERE task_id=? AND record_digest=?", (identity.task_id, record_digest)).fetchone()
+    if row is None:
+        raise FailureRecoveryError("durable recovery route source is unavailable")
+    try:
+        record = parse_failure_record(json.loads(row[0]))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise FailureRecoveryError("durable recovery route source is malformed") from error
+    if record.digest != record_digest or record.binding != binding:
+        raise FailureRecoveryError("durable recovery route source has drifted")
+    _require_attempt_admission(connection, identity, binding)
+    return record
+
+
+def read_durable_recovery_route_authorization(repository, identity, route_digest: str) -> DurableRecoveryRouteAuthorization:
+    from .state import _open_writable_connection, _require_matching_task
+    if not _DIGEST.fullmatch(route_digest):
+        raise FailureRecoveryError("durable recovery route digest is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN")
+        _require_matching_task(connection, identity)
+        row = connection.execute("SELECT record_digest, binding_json, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest FROM recovery_route_authorizations WHERE task_id=? AND repository_id=? AND route_digest=?", (identity.task_id, identity.repository_id, route_digest)).fetchone()
+        if row is None: raise FailureRecoveryError("durable recovery route is unavailable")
+        record_digest, encoded, role, profile, target, coordinate, budget = row
+        try: binding = FailureBinding(**{**json.loads(encoded), "role": FailureRole(json.loads(encoded)["role"])})
+        except Exception as error: raise FailureRecoveryError("durable recovery route is malformed") from error
+        authorization = DurableRecoveryRouteAuthorization(route_digest, record_digest, binding, FailureRole(role), profile, target, coordinate, budget)
+        if route_digest != "sha256:" + _digest_json(_route_payload(record_digest, binding, authorization.target_role, profile, target, coordinate, budget)):
+            raise FailureRecoveryError("durable recovery route has drifted")
+        _read_route_source(connection, identity, record_digest, binding)
+        connection.commit(); return authorization
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+
+
+def consume_durable_recovery_route_authorization(repository, identity, authorization: DurableRecoveryRouteAuthorization, *, reservation_digest: str, target_role: FailureRole, target_profile_digest: str, target_route_digest: str, coordinate_digest: str, remaining_budget_digest: str, now: int | None = None) -> None:
+    from .state import _open_writable_connection, _require_matching_task
+    if type(authorization) is not DurableRecoveryRouteAuthorization or type(target_role) is not FailureRole or not all(_DIGEST.fullmatch(value) for value in (reservation_digest, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest)):
+        raise FailureRecoveryError("durable recovery route consumption is invalid")
+    observed = int(time.time()) if now is None else now
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE"); _require_matching_task(connection, identity)
+        row = connection.execute("SELECT repository_id, record_digest, binding_json, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest, state FROM recovery_route_authorizations WHERE route_digest=? AND task_id=?", (authorization.route_digest, identity.task_id)).fetchone()
+        encoded = json.dumps(_binding_payload(authorization.binding), sort_keys=True, separators=(",", ":"))
+        expected = (identity.repository_id, authorization.record_digest, encoded, authorization.target_role.value, authorization.target_profile_digest, authorization.target_route_digest, authorization.coordinate_digest, authorization.remaining_budget_digest, "issued")
+        if row != expected or (target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest) != (authorization.target_role, authorization.target_profile_digest, authorization.target_route_digest, authorization.coordinate_digest, authorization.remaining_budget_digest):
+            raise FailureRecoveryError("durable recovery route consumption has drifted")
+        _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
+        updated = connection.execute("UPDATE recovery_route_authorizations SET state='consumed', reservation_digest=?, consumed_at=? WHERE route_digest=? AND task_id=? AND state='issued'", (reservation_digest, observed, authorization.route_digest, identity.task_id)).rowcount
+        if updated != 1: raise FailureRecoveryError("durable recovery route is already consumed")
+        connection.commit()
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+
+
 def issue_recovery_route_admission(
     binding: FailureBinding, *, source_execution: object, target_execution: object,
 ) -> RecoveryRouteAdmission:

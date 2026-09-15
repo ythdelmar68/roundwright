@@ -949,6 +949,13 @@ MIGRATIONS = (
             ("denial_clearance_decisions", "CREATE TABLE denial_clearance_decisions (decision_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_id TEXT NOT NULL, command_kind TEXT NOT NULL CHECK(command_kind IN ('clear-denial', 'revoke-denial-clearance')), decision_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, record_digest, sequence), UNIQUE(task_id, command_kind, command_id))"),
         ),
     ),
+    Migration(
+        76,
+        (
+            "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))",
+        ),
+        (("recovery_route_authorizations", "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))"),),
+    ),
 )
 
 

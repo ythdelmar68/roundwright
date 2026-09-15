@@ -25,7 +25,7 @@
       {"identity":"advisory-native-dependency-review-bridge-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"c80f201409cc915527ac632f05cb84dae28fc922202cb7dfc04fe83ade698536"},
       {"identity":"advisory-provider-attempt-runtime-v1","path":"src/roundwright/provider_attempt_runtime.py","sha256":"c08b24294130fbdc1e5f36841e85302a7af9cdf4c99994d3548ed774ef28f26d"},
       {"identity":"advisory-provider-attempt-runtime-tests-v1","path":"tests/test_provider_attempt_runtime.py","sha256":"e74d4eef47027c837ad2f2096e3e0eea2c673824766c98fa3542d5658ff5d30e"},
-      {"identity":"advisory-worker-toolbox-v1","path":"src/roundwright/worker_toolbox.py","sha256":"3ce51d8a286b574c5068adebf33e20d6b6227e15383a344e0764763b639e744c"},
+      {"identity":"advisory-worker-toolbox-v1","path":"src/roundwright/worker_toolbox.py","sha256":"71df4b4575b71259df499cbea47de30aeac8cb8c501cec8facb7d90b8fbfc59d"},
       {"identity":"advisory-worker-toolbox-tests-v1","path":"tests/test_worker_toolbox.py","sha256":"5b749edcb3837f93928d27de2d407259ee6e7bdc5c76c39226ac26fd41ec9ec7"},
       {"identity":"advisory-worker-shadow-v1","path":"src/roundwright/worker_shadow.py","sha256":"7908f8ca3663a905fe810df654a0c4d0a2231f62dc5386b11866adb5d779e9f2"},
       {"identity":"advisory-worker-shadow-tests-v1","path":"tests/test_worker_shadow.py","sha256":"b6488715b5b6c6dbb9b5ff969e7eb07d29702508a11b5b6a6fdb97a0817b8e85"},
@@ -36,11 +36,11 @@
       {"identity":"advisory-runtime-defaults-tests-v1","path":"tests/test_configuration.py","sha256":"f08c87086c68b64c870028ef1d767b7c99e0d674daeea09eebe7e4a687f49a9f"},
       {"identity":"advisory-coding-tools-v1","path":"src/roundwright/coding_tools.py","sha256":"3c5f7b95455aea70ca3205317987831c222f030f2b84c3a5914c7b57fa9135e2"},
       {"identity":"advisory-coding-tools-tests-v1","path":"tests/test_coding_tools.py","sha256":"3de5d104f99b399c7b5ab28af8aef9de8ec08dfd058023923590f5a0973423b0"},
-      {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"ff0d8d185c4083c8fe8beaff1c28cb5f066b5cabc57c864f23a1f927934db246"},
+      {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"9bd568eb38fa438017077c28f43dbc68a044d8ef172fcf17a81e1f5314b6450e"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
-      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"9ea5087e73784946cc4d0365fc4b7a957dd8512e25c09a5a0e552809c5f3094d"},
-      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"bc8c35dfe90f8be387d3c29711c4f3a306f36a88d6961df2153f8f9cb3faa330"},
-      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"e6fdd0050ad24a897bb8ec9ff8c9c04f9a316e76604ab397401e63921db6d31b"}
+      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"cb878ea55a0a18e6b23d629ffbc0bb10621e0b7b83dadf0d5905bd4ae27d96b4"},
+      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"90b66f7b82504e88a3eaa7c0813ff8b98fffaa5fdf2d08b583704e22b324bd9b"},
+      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"8749f9352c68e008e5801287013d4aa1dc3de2525fbf08364e782733d673af3d"}
     ]
   },
   "issue_132_requirements": {
@@ -64,9 +64,9 @@
       {"identity":"failure-recovery-dependency-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"c80f201409cc915527ac632f05cb84dae28fc922202cb7dfc04fe83ade698536"},
       {"identity":"failure-recovery-candidate-review-tests-v1","path":"tests/test_candidate_review.py","sha256":"053241bdc335947e1a81af1ff35f6667d333116c95c4374c9b51352d243e4700"},
       {"identity":"failure-recovery-state-tests-v1","path":"tests/test_state.py","sha256":"2b3a764a028bf6e75af22bf6e7ad330ae0018ab9705af80c60b3be0aeb3f622c"},
-      {"identity":"failure-recovery-semantic-receipt-v1","path":"ci/phase5_semantic_receipt.py","sha256":"9ea5087e73784946cc4d0365fc4b7a957dd8512e25c09a5a0e552809c5f3094d"},
-      {"identity":"failure-recovery-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"bc8c35dfe90f8be387d3c29711c4f3a306f36a88d6961df2153f8f9cb3faa330"},
-      {"identity":"failure-recovery-qualification-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"e6fdd0050ad24a897bb8ec9ff8c9c04f9a316e76604ab397401e63921db6d31b"},
+      {"identity":"failure-recovery-semantic-receipt-v1","path":"ci/phase5_semantic_receipt.py","sha256":"cb878ea55a0a18e6b23d629ffbc0bb10621e0b7b83dadf0d5905bd4ae27d96b4"},
+      {"identity":"failure-recovery-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"90b66f7b82504e88a3eaa7c0813ff8b98fffaa5fdf2d08b583704e22b324bd9b"},
+      {"identity":"failure-recovery-qualification-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"8749f9352c68e008e5801287013d4aa1dc3de2525fbf08364e782733d673af3d"},
       {"identity":"failure-recovery-roadmap-v1","path":"docs/operations/dogfood-promotion-roadmap.md","sha256":"b6acdaa1d6e1580d13899757ce836b419beb19e4bbc5d1d8424546c56d86be0b"}
     ]
   },

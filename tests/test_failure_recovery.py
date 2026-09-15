@@ -28,7 +28,8 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertEqual(admit_recovery(record, binding, route=self.route(binding)), RecoveryAction.STOP_SCOPE)
         self.assertEqual(admit_recovery(record, binding, route=self.route(binding), clearance=Clearance(record.digest, binding, EvidenceSource.VERIFIED_HOST)), RecoveryAction.PREBOUND_FALLBACK)
         with self.assertRaises(FailureRecoveryError):
-            admit_recovery(record, self.binding(role=FailureRole.SUPERVISOR, session="replacement"), route_equivalent=True)
+            replacement = self.binding(role=FailureRole.SUPERVISOR, session="replacement")
+            admit_recovery(record, replacement, route=self.route(replacement))
 
     def test_prose_missing_output_and_partial_work_do_not_mint_fallback(self):
         binding = self.binding(role=FailureRole.DEPENDENCY_REVIEW)

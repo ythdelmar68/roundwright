@@ -406,27 +406,101 @@ def _require_attempt_admission(connection, identity, binding: FailureBinding) ->
         or row[16] != binding.configuration_digest
     ):
         raise FailureRecoveryError("durable failure admission is unavailable or has drifted")
+    _require_current_admission_authority(connection, identity, binding)
+
+
+def _require_current_admission_authority(connection, identity, binding: FailureBinding) -> None:
+    """Read the current task authority in the same snapshot as its admission.
+
+    The failure record's binding is evidence to be checked, never an authority
+    input.  A restart must therefore reject a removed admission, a moved
+    candidate seal, stale policy/configuration/runtime rows, or a substituted
+    session checkpoint even when the old JSON remains canonical.
+    """
+
+    row = connection.execute(
+        "SELECT seals.base_sha, seals.candidate_sha, seals.state_identity, "
+        "current_context.candidate_fingerprint, current_context.policy_fingerprint, "
+        "current_context.configuration_digest, current_context.worker_profile_identity, "
+        "current_context.supervisor_profile_identities, runtime.schema_version, "
+        "runtime.resolved_digest, runtime.worker_profile_identity, "
+        "runtime.supervisor_profile_identities, checkpoints.task_id, "
+        "checkpoints.attempt_id, checkpoints.session_identity "
+        "FROM candidate_seals AS seals "
+        "JOIN provider_attempt_contexts AS current_context "
+        "ON current_context.attempt_id = ? AND current_context.task_id = seals.task_id "
+        "JOIN runtime_configuration_bindings AS runtime "
+        "ON runtime.task_id = seals.task_id "
+        "JOIN provider_session_checkpoints AS checkpoints "
+        "ON checkpoints.attempt_id = ? "
+        "WHERE seals.task_id = ?",
+        (binding.attempt_identity, binding.attempt_identity, identity.task_id),
+    ).fetchone()
+    if row is None:
+        raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
+    (
+        base_sha, candidate_sha, state_identity, candidate_fingerprint,
+        policy_fingerprint, configuration_digest, context_worker_profile,
+        context_supervisor_profiles, runtime_schema, runtime_configuration,
+        runtime_worker_profile, runtime_supervisor_profiles, checkpoint_task,
+        checkpoint_attempt, checkpoint_session,
+    ) = row
+    expected_fingerprint = hashlib.sha256(binding.candidate_sha.encode()).hexdigest()
+    expected_policy = binding.policy_digest.removeprefix("sha256:")
+    try:
+        context_supervisors = tuple(json.loads(context_supervisor_profiles))
+        runtime_supervisors = tuple(json.loads(runtime_supervisor_profiles))
+    except (TypeError, json.JSONDecodeError):
+        raise FailureRecoveryError("durable failure authority is unavailable or has drifted") from None
+    expected_profile = (
+        runtime_worker_profile if binding.role is FailureRole.WORKER
+        else binding.profile_identity if binding.role is FailureRole.SUPERVISOR else None
+    )
+    if (
+        base_sha != identity.base_sha
+        or candidate_sha != binding.candidate_sha
+        or type(state_identity) is not str or not state_identity
+        or candidate_fingerprint != expected_fingerprint
+        or policy_fingerprint != expected_policy
+        or configuration_digest != binding.configuration_digest
+        or context_worker_profile != runtime_worker_profile
+        or context_supervisors != runtime_supervisors
+        or runtime_schema != "roundwright-runtime/v1"
+        or runtime_configuration != binding.configuration_digest
+        or expected_profile != binding.profile_identity
+        or (binding.role is FailureRole.SUPERVISOR and binding.profile_identity not in runtime_supervisors)
+        or checkpoint_task != identity.task_id
+        or checkpoint_attempt != binding.attempt_identity
+        or checkpoint_session != binding.session_identity
+    ):
+        raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
 
 
 def read_durable_failure(repository, identity, record_digest: str) -> FailureRecord:
-    """Return the closed record only when it remains task-bound and canonical."""
+    """Return a record only from one current, authoritative state snapshot."""
     from .state import _open_writable_connection, _require_matching_task
     connection = _open_writable_connection(repository)
     try:
+        connection.execute("BEGIN")
         _require_matching_task(connection, identity)
         row = connection.execute("SELECT record_json FROM failure_recovery_records WHERE record_digest=? AND task_id=?", (record_digest, identity.task_id)).fetchone()
+        if row is None:
+            raise FailureRecoveryError("durable failure record is unavailable")
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise FailureRecoveryError("durable failure record is malformed") from error
+        record = parse_failure_record(payload)
+        if record.digest != record_digest:
+            raise FailureRecoveryError("durable failure record digest has drifted")
+        _require_attempt_admission(connection, identity, record.binding)
+        connection.execute("COMMIT")
+        return record
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
-    if row is None:
-        raise FailureRecoveryError("durable failure record is unavailable")
-    try:
-        payload = json.loads(row[0])
-    except (TypeError, json.JSONDecodeError) as error:
-        raise FailureRecoveryError("durable failure record is malformed") from error
-    record = parse_failure_record(payload)
-    if record.digest != record_digest:
-        raise FailureRecoveryError("durable failure record digest has drifted")
-    return record
 
 
 def record_durable_clearance(repository, identity, clearance: Clearance, *, now: int | None = None) -> str:

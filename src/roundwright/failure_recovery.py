@@ -214,6 +214,19 @@ def read_durable_failure(repository, identity, record_digest: str) -> dict[str, 
     return payload
 
 
+def require_scope_open(connection, task_id: str, scope: str) -> None:
+    """Fail before an effect when an exact durable scope has an uncleared stop."""
+    if not isinstance(task_id, str) or not isinstance(scope, str):
+        raise FailureRecoveryError("failure scope is invalid")
+    for (encoded,) in connection.execute("SELECT record_json FROM failure_recovery_records WHERE task_id=?", (task_id,)):
+        try:
+            value = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise FailureRecoveryError("durable failure record is malformed") from error
+        if value.get("action") == RecoveryAction.STOP_SCOPE.value and value.get("binding", {}).get("authority_scope") == scope:
+            raise FailureRecoveryError("failure scope remains stopped")
+
+
 def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource | FailureEvidence) -> FailureRecord:
     """Map one typed observation to the only permitted recovery action."""
     if type(evidence) is FailureEvidence:

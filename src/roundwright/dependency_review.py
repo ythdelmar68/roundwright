@@ -15,6 +15,7 @@ from enum import StrEnum
 
 from .configuration import RepositoryIdentity
 from .state import _open_writable_connection
+from .failure_recovery import FailureRecoveryError, require_scope_open
 
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -291,6 +292,10 @@ class DependencyReviewStore:
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
+            try:
+                require_scope_open(connection, subset.task_id, "dependency-review:" + subset.task_id)
+            except FailureRecoveryError as error:
+                raise DependencyReviewError("dependency review dispatch scope is stopped") from error
             task = connection.execute("SELECT source_id FROM tasks WHERE task_id = ?", (subset.task_id,)).fetchone()
             source = connection.execute("SELECT source_digest FROM source_snapshots WHERE source_id = ?", task or (None,)).fetchone()
             if task is None or source != (subset.source_digest,):

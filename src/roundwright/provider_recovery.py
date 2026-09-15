@@ -19,7 +19,7 @@ from .configuration import RepositoryIdentity
 from .git_identity import TransitionLease, _require_current_lease
 from .runtime_binding import RuntimeBinding
 from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_runtime_binding, require_runtime_binding
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure, require_scope_open
 
 
 class ProviderRecoveryError(StateError):
@@ -354,6 +354,13 @@ def prepare_attempt(
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
+        try:
+            failure_role = FailureRole(role.value)
+            require_scope_open(connection, identity.task_id, failure_role.value + ":" + identity.task_id)
+        except (ValueError, Exception) as error:
+            if isinstance(error, ProviderRecoveryError):
+                raise
+            raise ProviderRecoveryError("provider dispatch scope is stopped") from error
         if role is ProviderRole.SUPERVISOR and connection.execute("SELECT 1 FROM review_limit_finalizations WHERE task_id = ?", (identity.task_id,)).fetchone() is not None:
             raise ProviderRecoveryError("review limit has consumed the final Worker repair")
         # The binding is first persisted only after lease and task validation,

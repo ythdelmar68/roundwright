@@ -637,6 +637,9 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 self.assertEqual(connection.execute(
                     "SELECT COUNT(*) FROM provider_invalid_outputs WHERE attempt_id = ?", (first.attempt_id,),
                 ).fetchone()[0], 0)
+                self.assertEqual(connection.execute(
+                    "SELECT logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE attempt_id = ?", (first.attempt_id,),
+                ).fetchone(), (1, 0))
             finally:
                 connection.close()
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
@@ -654,7 +657,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 descriptor.provider_profile_identity, 1, 1, runner,
             )
             graph = MaterializedProviderAttemptContext(descriptor, resources).snapshot(
-                (runner.selection.provider_attempt_id, second_selection.provider_attempt_id),
+                (runner.selection.provider_attempt_id,),
             )["event_graph"]
             assert graph is not None
             self.assertIn("provider-terminal-failure", tuple(item.event_kind for item in graph.events))

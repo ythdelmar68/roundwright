@@ -647,6 +647,10 @@ class DurableDiffReviewRunner:
             if existing.state is AttemptState.ACCEPTED:
                 return (existing.attempt_id, True)
             if existing.state is AttemptState.INVALIDATED:
+                if read_supervisor_terminal_failure(
+                    self.repository, self.identity, existing.attempt_id,
+                ) is not None:
+                    raise ProviderAttemptRuntimeError("provider terminal failure is not format-correctable")
                 return (existing.attempt_id, False)
             if existing.state is AttemptState.BLOCKED:
                 raise ProviderAttemptRuntimeError("provider attempt session ended before a durable turn checkpoint")

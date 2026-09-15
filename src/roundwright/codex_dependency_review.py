@@ -301,7 +301,7 @@ class DependencyReviewService:
                 admit()
                 store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code="proposal-rejected")
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.INVALID, result.session_identity, result.turn_identity, None, result.output_digest, "proposal-rejected")
-        elif result.kind is DependencyReviewResultKind.AMBIGUOUS:
+        elif result.kind in {DependencyReviewResultKind.AMBIGUOUS, DependencyReviewResultKind.BLOCKED}:
             admit()
             store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
         else:

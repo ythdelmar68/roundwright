@@ -31,7 +31,7 @@ from roundwright.dependency_review import (
     EdgeKind, ProposedEdge, RequestedDisposition, SourceOwnedRelation, DependencyReviewStore,
 )
 from roundwright.git_identity import acquire_transition_lease
-from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
@@ -295,6 +295,19 @@ class DependencyReviewServiceTests(unittest.TestCase):
             adapter = CodexDependencyReviewAdapter(backend, profile, audit)
             result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None, **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"))
             self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn"))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-116'").fetchone(), ("blocked",))
+            finally:
+                connection.close()
+
+    def test_typed_blocked_turn_is_terminal_not_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.BLOCKED, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None, **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"))
+            self.assertEqual(result.kind, DependencyReviewResultKind.BLOCKED)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-116'").fetchone(), ("blocked",))

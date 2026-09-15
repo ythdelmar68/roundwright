@@ -834,12 +834,15 @@ class ProviderRecoveryTests(unittest.TestCase):
             self.admit(repository, identity, lease)
             context = self.context(identity, role=ProviderRole.SUPERVISOR)
             profile = context.runtime_binding.supervisor_profile_identities[0]
+            # Coordinate replay is an identity check, not a clock-race test.
+            # Keep the lease input fixed across the adversarial sequence.
+            lease_expires_at = 2_000_000_000
 
             def reserve(attempt: str, *, epoch: int, review_round: int, physical: int):
                 return prepare_attempt(
                     repository, identity, context, attempt_id=attempt,
                     role=ProviderRole.SUPERVISOR, process_lease_id=f"lease-{attempt}",
-                    process_lease_expires_at=int(time.time()) + 10,
+                    process_lease_expires_at=lease_expires_at,
                     input_fingerprint="a" * 64, selected_profile_identity=profile,
                     logical_profile_position=1, physical_format_output_ordinal=physical,
                     review_epoch=epoch, review_round=review_round, lease=lease,

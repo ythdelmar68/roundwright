@@ -876,6 +876,32 @@ MIGRATIONS = (
             ("failure_recovery_clearance_revocations", "CREATE TABLE failure_recovery_clearance_revocations (revocation_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), clearance_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_clearances(clearance_digest), revocation_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))"),
         ),
     ),
+    # ``within_round_attempt`` historically conflated the configured profile
+    # position with the number of times that profile had emitted a malformed
+    # format response.  Retain it for legacy read-back, but persist the two
+    # identities independently for every new accounting record.
+    Migration(
+        71,
+        (
+            "ALTER TABLE provider_attempts ADD COLUMN logical_profile_position INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE provider_attempts ADD COLUMN physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN logical_profile_position INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN logical_profile_position INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0",
+            # Historical rows contain one physical response for their one
+            # configured profile.  A contradictory pre-existing value is a
+            # migration failure rather than an opportunity to invent history.
+            "UPDATE provider_attempts SET logical_profile_position = COALESCE((SELECT within_round_attempt FROM diff_review_attempts WHERE provider_attempt_id = provider_attempts.attempt_id), 0), physical_format_output_ordinal = 0 WHERE logical_profile_position = 0 AND physical_format_output_ordinal = 0",
+            "UPDATE diff_review_attempts SET logical_profile_position = within_round_attempt, physical_format_output_ordinal = 0 WHERE logical_profile_position = 0 AND physical_format_output_ordinal = 0",
+            "UPDATE accepted_provider_reviews SET logical_profile_position = within_round_attempt, physical_format_output_ordinal = 0 WHERE logical_profile_position = 0 AND physical_format_output_ordinal = 0",
+        ),
+        (
+            ("provider_attempts", "CREATE TABLE \"provider_attempts\" (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), provider_role TEXT NOT NULL CHECK(provider_role IN ('planning', 'worker', 'supervisor', 'aggregation')), attempt_number INTEGER NOT NULL CHECK(attempt_number > 0), process_lease_id TEXT NOT NULL, process_lease_expires_at INTEGER NOT NULL CHECK(process_lease_expires_at > 0), session_identity TEXT, external_turn_identity TEXT, input_fingerprint TEXT NOT NULL, output_pointer TEXT, completion_evidence_fingerprint TEXT, accepted_review_identity TEXT, state TEXT NOT NULL CHECK(state IN ('prepared', 'dispatched', 'completed', 'accepted', 'ambiguous', 'blocked', 'invalidated')), selected_profile_identity TEXT NOT NULL DEFAULT '', logical_profile_position INTEGER NOT NULL DEFAULT 0, physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0, UNIQUE(task_id, provider_role, attempt_number), UNIQUE(task_id, provider_role, external_turn_identity), UNIQUE(task_id, accepted_review_identity), CHECK((external_turn_identity IS NULL AND state IN ('prepared', 'blocked', 'invalidated')) OR (external_turn_identity IS NOT NULL AND state != 'prepared')), CHECK((state IN ('completed', 'accepted') AND output_pointer IS NOT NULL AND completion_evidence_fingerprint IS NOT NULL) OR state NOT IN ('completed', 'accepted')), CHECK((accepted_review_identity IS NOT NULL AND provider_role = 'supervisor' AND state = 'accepted') OR accepted_review_identity IS NULL))"),
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT, within_round_attempt INTEGER NOT NULL DEFAULT 0, selected_profile_identity TEXT NOT NULL DEFAULT '', review_round INTEGER NOT NULL DEFAULT 0, review_mode TEXT NOT NULL DEFAULT '', review_max_rounds INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_epoch INTEGER NOT NULL DEFAULT 0, logical_profile_position INTEGER NOT NULL DEFAULT 0, physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0)"),
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0, review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', review_epoch INTEGER NOT NULL DEFAULT 0, logical_profile_position INTEGER NOT NULL DEFAULT 0, physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0)"),
+        ),
+    ),
 )
 
 

@@ -83,6 +83,10 @@ class ProviderAttemptCheckpointFailure(ProviderAttemptRuntimeError):
         )
 
 
+class ProviderAttemptFormatCorrectionExhausted(ProviderAttemptRuntimeError):
+    """All three physical format slots for one logical profile were used."""
+
+
 def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -232,6 +236,8 @@ class DiffReviewSelection:
     objective: str
     acceptance_criteria: tuple[str, ...]
     within_round_attempt: int = 1
+    logical_profile_position: int = 0
+    physical_format_output_ordinal: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -244,8 +250,15 @@ class DiffReviewSelection:
             or type(self.acceptance_criteria) is not tuple
             or not self.acceptance_criteria or any(type(item) is not str or not item.strip() for item in self.acceptance_criteria)
             or type(self.within_round_attempt) is not int or self.within_round_attempt < 1
+            or type(self.logical_profile_position) is not int or self.logical_profile_position < 0
+            or type(self.physical_format_output_ordinal) is not int or not 0 <= self.physical_format_output_ordinal <= 2
+            or (self.logical_profile_position and self.logical_profile_position != self.within_round_attempt)
         ):
             raise ProviderAttemptRuntimeError("provider attempt selection is invalid")
+
+    @property
+    def resolved_logical_profile_position(self) -> int:
+        return self.logical_profile_position or self.within_round_attempt
 
 
 @dataclass(frozen=True)
@@ -332,7 +345,8 @@ def provider_attempt_effect_material(
         "review_attempt_id": selection.diff_review_attempt_id,
         "provider_attempt_id": selection.provider_attempt_id,
         "selected_profile_identity": audit.profile_identity,
-        "within_round_attempt": selection.within_round_attempt,
+        "logical_profile_position": selection.resolved_logical_profile_position,
+        "physical_format_output_ordinal": selection.physical_format_output_ordinal,
         "context": context.__dict__,
         "objective": ACCOUNTING_TRANSITION_OBJECTIVE,
         "acceptance_criteria": ACCOUNTING_TRANSITION_CRITERIA,
@@ -408,9 +422,10 @@ class DurableDiffReviewRunner:
                 or not _matching_execution_host(item.advisory_execution, item.execution_host)
                 for item in entries
             )
-            or len(entries) > runtime.review_max_supervisor_attempts_per_round
-            or tuple(item.selection.within_round_attempt for item in entries) != tuple(range(1, len(entries) + 1))
-            or tuple(item.audit.profile_identity for item in entries) != runtime.supervisor_profile_identities[:len(entries)]
+            or len({item.selection.resolved_logical_profile_position for item in entries}) > runtime.review_max_supervisor_attempts_per_round
+            or any(item.selection.resolved_logical_profile_position > runtime.review_max_supervisor_attempts_per_round or item.audit.profile_identity != runtime.supervisor_profile_identities[item.selection.resolved_logical_profile_position - 1] for item in entries)
+            or tuple((item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) for item in entries) != tuple(sorted((item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) for item in entries))
+            or any(item.selection.physical_format_output_ordinal and not any(previous.selection.resolved_logical_profile_position == item.selection.resolved_logical_profile_position and previous.selection.physical_format_output_ordinal == item.selection.physical_format_output_ordinal - 1 for previous in entries) for item in entries)
             or len({item.selection.provider_attempt_id for item in entries}) != len(entries)
             or any(
                 item.recovery.task_id != self.recovery.task_id
@@ -447,8 +462,9 @@ class DurableDiffReviewRunner:
                     process_lease_id=selection.process_lease_id,
                     process_lease_expires_at=selection.process_lease_expires_at,
                     selected_profile_identity=entry.audit.profile_identity,
-                    within_round_attempt=selection.within_round_attempt,
+                    within_round_attempt=selection.resolved_logical_profile_position,
                     review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
                 )
                 preflight_attempt_preparation(
                     self.identity, entry.recovery,
@@ -457,6 +473,8 @@ class DurableDiffReviewRunner:
                     process_lease_expires_at=selection.process_lease_expires_at,
                     input_fingerprint=input_digest,
                     selected_profile_identity=entry.audit.profile_identity,
+                    logical_profile_position=selection.resolved_logical_profile_position,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
                     now=self.dispatch_control.now,
                 )
             # Every provider-free eligibility dependency is normalized here.
@@ -540,7 +558,8 @@ class DurableDiffReviewRunner:
             process_lease_id=selection.process_lease_id,
             process_lease_expires_at=selection.process_lease_expires_at,
             selected_profile_identity=entry.audit.profile_identity,
-            within_round_attempt=selection.within_round_attempt, review_round=self.review_round, review_epoch=self.review_epoch,
+            within_round_attempt=selection.resolved_logical_profile_position, review_round=self.review_round, review_epoch=self.review_epoch,
+            physical_format_output_ordinal=selection.physical_format_output_ordinal,
             lease=self.lease, now=self.dispatch_control.now,
         )
         try:
@@ -549,6 +568,8 @@ class DurableDiffReviewRunner:
                 role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
                 process_lease_expires_at=selection.process_lease_expires_at,
                 input_fingerprint=input_fingerprint, selected_profile_identity=entry.audit.profile_identity,
+                logical_profile_position=selection.resolved_logical_profile_position,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
                 lease=self.lease, now=self.dispatch_control.now,
             )
             if prepared.state is not AttemptState.PREPARED:
@@ -559,8 +580,9 @@ class DurableDiffReviewRunner:
                 case_id=self.case_id, ready_at=self.ready_at, review_epoch=self.review_epoch,
                 review_round=self.review_round, review_mode=context.review_mode.value,
                 current_attempt_id=selection.provider_attempt_id,
-                current_within_round_attempt=selection.within_round_attempt,
+                current_within_round_attempt=selection.resolved_logical_profile_position,
                 current_profile_identity=entry.audit.profile_identity, prior_attempts=(),
+                current_physical_format_output_ordinal=selection.physical_format_output_ordinal,
                 seal_state_identity=self.lease.state_identity,
             )
         except ProviderRecoveryError:
@@ -644,7 +666,8 @@ class DurableDiffReviewRunner:
             implementation_attempt_id=selection.implementation_attempt_id, provider_attempt_id=selection.provider_attempt_id,
             message_identity=selection.message_identity, process_lease_id=selection.process_lease_id,
             process_lease_expires_at=selection.process_lease_expires_at, selected_profile_identity=selected,
-            within_round_attempt=selection.within_round_attempt, review_round=self.review_round, review_epoch=self.review_epoch,
+            within_round_attempt=selection.resolved_logical_profile_position, review_round=self.review_round, review_epoch=self.review_epoch,
+            physical_format_output_ordinal=selection.physical_format_output_ordinal,
             lease=self.lease, now=self.dispatch_control.now,
         )
         try:
@@ -677,14 +700,14 @@ class DurableDiffReviewRunner:
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider attempt dispatch claim is unavailable") from None
         entries = self.validate_sequence()
-        prior = tuple((item.selection.provider_attempt_id, item.selection.within_round_attempt, item.audit.profile_identity) for item in entries if item.selection.within_round_attempt < selection.within_round_attempt)
+        prior = tuple((item.selection.provider_attempt_id, item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal, item.audit.profile_identity) for item in entries if (item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) < (selection.resolved_logical_profile_position, selection.physical_format_output_ordinal))
         try:
             decision_material = read_supervisor_accounting_snapshot(
                 self.repository, self.identity, recovery, source_digest=self.source_digest, base_sha=self.identity.base_sha,
                 candidate_sha=self.seal.candidate_sha, case_id=self.case_id, ready_at=self.ready_at,
                 review_epoch=self.review_epoch, review_round=self.review_round, review_mode=context.review_mode.value,
-                current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.within_round_attempt,
-                current_profile_identity=selected, prior_attempts=prior, seal_state_identity=self.lease.state_identity,
+                current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.resolved_logical_profile_position,
+                current_profile_identity=selected, prior_attempts=prior, current_physical_format_output_ordinal=selection.physical_format_output_ordinal, seal_state_identity=self.lease.state_identity,
             )
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from None
@@ -692,21 +715,23 @@ class DurableDiffReviewRunner:
             raise ProviderAttemptRuntimeError("provider accounting dispatch claim has drifted")
         request = CodexSupervisorRequest(
             selection.diff_review_attempt_id, selection.provider_attempt_id, selected,
-            selection.within_round_attempt,
+            selection.resolved_logical_profile_position,
             supervisor_request_digest(
                 review_attempt_id=selection.diff_review_attempt_id,
                 provider_attempt_id=selection.provider_attempt_id,
                 selected_profile_identity=selected,
-                within_round_attempt=selection.within_round_attempt,
+                within_round_attempt=selection.resolved_logical_profile_position,
                 context=context, objective=ACCOUNTING_TRANSITION_OBJECTIVE,
                 acceptance_criteria=ACCOUNTING_TRANSITION_CRITERIA,
                 response_contract=SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING,
                 decision_material=decision_material,
                 decision_semantic=SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
             ),
             context, ACCOUNTING_TRANSITION_OBJECTIVE, ACCOUNTING_TRANSITION_CRITERIA,
             SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING, decision_material,
             SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2,
+            selection.physical_format_output_ordinal,
         )
         session_checkpointed = False
         turn_checkpointed = False
@@ -723,8 +748,9 @@ class DurableDiffReviewRunner:
                 process_lease_id=selection.process_lease_id,
                 process_lease_expires_at=selection.process_lease_expires_at,
                 selected_profile_identity=selected,
-                within_round_attempt=selection.within_round_attempt,
+                within_round_attempt=selection.resolved_logical_profile_position,
                 review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
             )
             session_checkpointed = True
 
@@ -740,8 +766,9 @@ class DurableDiffReviewRunner:
                 message_identity=selection.message_identity,
                 process_lease_id=selection.process_lease_id,
                 process_lease_expires_at=selection.process_lease_expires_at,
-                selected_profile_identity=selected, within_round_attempt=selection.within_round_attempt,
+                selected_profile_identity=selected, within_round_attempt=selection.resolved_logical_profile_position,
                 review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
             )
             turn_checkpointed = True
 
@@ -789,7 +816,10 @@ class DurableDiffReviewRunner:
                     max_attempts=runtime.review_max_supervisor_attempts_per_round,
                     lease=self.lease, now=self.dispatch_control.now,
                 )
-                return (selection.provider_attempt_id, False)
+                # Provider denials and classified transport failures are not
+                # malformed format output.  They neither consume a correction
+                # slot nor authorize a different configured profile.
+                raise ProviderAttemptRuntimeError("provider terminal failure is not format-correctable")
             if result.kind is SupervisorResultKind.INCOMPLETE:
                 if result.terminal_blocker is None:
                     raise ProviderAttemptRuntimeError("provider accounting terminal decision is invalid")
@@ -808,6 +838,14 @@ class DurableDiffReviewRunner:
                     lease=self.lease, now=self.dispatch_control.now,
                 )
                 raise ProviderAttemptRuntimeError("ambiguous provider attempt blocks the bounded sequence")
+            if result.diagnostic not in {SupervisorDiagnostic.SYNTAX, SupervisorDiagnostic.SHAPE}:
+                record_supervisor_accounting_blocker(
+                    self.repository, self.identity, recovery,
+                    attempt_id=selection.provider_attempt_id,
+                    blocker=SupervisorAccountingBlocker.INCOMPLETE_ACCOUNTING,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                raise ProviderAttemptRuntimeError("non-format Supervisor outcome is not correction-eligible")
             marker = hashlib.sha256((result.kind.value + ":" + (result.diagnostic.value if result.diagnostic else "none")).encode()).hexdigest()
             record_invalid_output(
                 self.repository, self.identity, recovery,
@@ -827,6 +865,10 @@ class DurableDiffReviewRunner:
                 max_attempts=runtime.review_max_supervisor_attempts_per_round,
                 lease=self.lease, now=self.dispatch_control.now,
             )
+            if selection.physical_format_output_ordinal == 2:
+                raise ProviderAttemptFormatCorrectionExhausted(
+                    "Supervisor format correction allowance is exhausted"
+                )
             return (selection.provider_attempt_id, False)
         if result.session_identity is None or result.turn_identity is None or result.output_fingerprint is None or result.verdict is None:
             raise ProviderAttemptRuntimeError("native Supervisor result is incomplete")

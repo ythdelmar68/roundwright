@@ -151,26 +151,26 @@ _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _bound_diff_review_output_digest(raw_digest: str, within_round_attempt: int, selected_profile_identity: str) -> str:
+def _bound_diff_review_output_digest(raw_digest: str, logical_profile_position: int, physical_format_output_ordinal: int, selected_profile_identity: str) -> str:
     """Bind one normalized review output to its exact configured Supervisor attempt."""
 
     _fingerprint(raw_digest, "normalized diff review output digest")
-    if type(within_round_attempt) is not int or within_round_attempt < 1:
-        raise CandidateReviewError("within-round Supervisor attempt is invalid")
+    if type(logical_profile_position) is not int or logical_profile_position < 1 or type(physical_format_output_ordinal) is not int or physical_format_output_ordinal < 0:
+        raise CandidateReviewError("Supervisor accounting position is invalid")
     _token(selected_profile_identity, "selected Supervisor profile identity")
-    return _digest({"normalized_output_digest": raw_digest, "within_round_attempt": within_round_attempt, "selected_profile_identity": selected_profile_identity})
+    return _digest({"normalized_output_digest": raw_digest, "logical_profile_position": logical_profile_position, "physical_format_output_ordinal": physical_format_output_ordinal, "selected_profile_identity": selected_profile_identity})
 
 
-def _validate_diff_review_profile_mapping(runtime_binding: RuntimeBinding, within_round_attempt: int, selected_profile_identity: str) -> None:
+def _validate_diff_review_profile_mapping(runtime_binding: RuntimeBinding, logical_profile_position: int, selected_profile_identity: str, physical_format_output_ordinal: int = 0) -> None:
     """Require the exact configured Supervisor profile at one positive attempt ordinal."""
 
     if type(runtime_binding) is not RuntimeBinding:
         raise CandidateReviewError("resolved configuration binding is invalid")
     profiles = runtime_binding.supervisor_profile_identities
-    if type(within_round_attempt) is not int or not 1 <= within_round_attempt <= len(profiles):
-        raise CandidateReviewError("within-round Supervisor attempt is invalid")
-    if type(selected_profile_identity) is not str or selected_profile_identity != profiles[within_round_attempt - 1]:
-        raise CandidateReviewError("selected Supervisor profile does not match the within-round attempt")
+    if type(logical_profile_position) is not int or not 1 <= logical_profile_position <= len(profiles) or type(physical_format_output_ordinal) is not int or not 0 <= physical_format_output_ordinal <= 2:
+        raise CandidateReviewError("Supervisor accounting position is invalid")
+    if type(selected_profile_identity) is not str or selected_profile_identity != profiles[logical_profile_position - 1]:
+        raise CandidateReviewError("selected Supervisor profile does not match the logical profile position")
 
 
 def _diff_review_input_digest(
@@ -183,8 +183,9 @@ def _diff_review_input_digest(
     within_round_attempt: int,
     selected_profile_identity: str,
     policy_projection: _ReviewPolicyProjection,
+    physical_format_output_ordinal: int = 0,
 ) -> str:
-    material = {"task": identity.task_id, "implementation": implementation_attempt_id, "base": base_sha, "candidate": candidate_sha, "message": message_identity, "verifications": verification_digest, "within_round_attempt": within_round_attempt, "selected_profile_identity": selected_profile_identity, "review_round": policy_projection.review_round, "review_mode": policy_projection.review_mode.value, "review_complete_rounds": policy_projection.complete_rounds, "review_max_rounds": policy_projection.max_rounds, "review_max_supervisor_attempts_per_round": policy_projection.max_supervisor_attempts_per_round, "review_on_final_findings": policy_projection.on_final_findings.value, "review_policy_digest": policy_projection.policy_digest}
+    material = {"task": identity.task_id, "implementation": implementation_attempt_id, "base": base_sha, "candidate": candidate_sha, "message": message_identity, "verifications": verification_digest, "logical_profile_position": within_round_attempt, "physical_format_output_ordinal": physical_format_output_ordinal, "selected_profile_identity": selected_profile_identity, "review_round": policy_projection.review_round, "review_mode": policy_projection.review_mode.value, "review_complete_rounds": policy_projection.complete_rounds, "review_max_rounds": policy_projection.max_rounds, "review_max_supervisor_attempts_per_round": policy_projection.max_supervisor_attempts_per_round, "review_on_final_findings": policy_projection.on_final_findings.value, "review_policy_digest": policy_projection.policy_digest}
     # Migration 49 maps records written before epochs existed to epoch zero.
     # Retain their pre-migration input identity; all new formal epochs bind it.
     if policy_projection.review_epoch:
@@ -262,6 +263,11 @@ class DiffReviewDispatch:
     within_round_attempt: int
     selected_profile_identity: str
     review_policy: _ReviewPolicyProjection
+    physical_format_output_ordinal: int = 0
+
+    @property
+    def logical_profile_position(self) -> int:
+        return self.within_round_attempt
 
 
 @dataclass(frozen=True)
@@ -610,6 +616,7 @@ def preflight_diff_review_session_checkpoint(
     lease: TransitionLease | None,
     now: int,
     review_epoch: int = 0,
+    physical_format_output_ordinal: int = 0,
 ) -> str:
     """Read-only eligibility check for a future diff-review session checkpoint.
 
@@ -651,11 +658,11 @@ def preflight_diff_review_session_checkpoint(
     _require_diff_review_context(repository, identity, context, seal, implementation_attempt_id)
     verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
     policy_projection = _project_review_policy(review_epoch, review_round, context.runtime_binding)
-    _validate_diff_review_profile_mapping(context.runtime_binding, within_round_attempt, selected_profile_identity)
+    _validate_diff_review_profile_mapping(context.runtime_binding, within_round_attempt, selected_profile_identity, physical_format_output_ordinal)
     return _diff_review_input_digest(
         identity, implementation_attempt_id, seal.base_sha, seal.candidate_sha,
         message_identity, verification_digest, within_round_attempt,
-        selected_profile_identity, policy_projection,
+        selected_profile_identity, policy_projection, physical_format_output_ordinal,
     )
 
 
@@ -680,6 +687,7 @@ def checkpoint_diff_review_session(
     lease: TransitionLease | None,
     now: int | None = None,
     review_epoch: int = 0,
+    physical_format_output_ordinal: int = 0,
 ) -> None:
     """Durably checkpoint one real Supervisor session before its first turn.
 
@@ -696,6 +704,7 @@ def checkpoint_diff_review_session(
         process_lease_expires_at=process_lease_expires_at,
         selected_profile_identity=selected_profile_identity,
         within_round_attempt=within_round_attempt, review_round=review_round, review_epoch=review_epoch,
+        physical_format_output_ordinal=physical_format_output_ordinal,
         lease=lease,
         now=now,
     )
@@ -708,7 +717,8 @@ def checkpoint_diff_review_session(
         role=ProviderRole.SUPERVISOR, process_lease_id=process_lease_id,
         process_lease_expires_at=process_lease_expires_at,
         input_fingerprint=input_digest,
-        selected_profile_identity=selected_profile_identity, lease=lease, now=now,
+        selected_profile_identity=selected_profile_identity, logical_profile_position=within_round_attempt,
+        physical_format_output_ordinal=physical_format_output_ordinal, lease=lease, now=now,
     )
     if provider.state is AttemptState.PREPARED:
         record_session_identity(
@@ -744,6 +754,7 @@ def dispatch_diff_review(
     lease: TransitionLease | None,
     now: int | None = None,
     review_epoch: int = 0,
+    physical_format_output_ordinal: int = 0,
 ) -> DiffReviewDispatch:
     """Dispatch one fresh read-only review of exactly ``base...candidate``."""
 
@@ -774,11 +785,11 @@ def dispatch_diff_review(
     _require_diff_review_context(repository, identity, context, seal, implementation_attempt_id)
     verification_digest = _verification_snapshot(repository, identity, seal.candidate_sha)
     policy_projection = _project_review_policy(review_epoch, review_round, context.runtime_binding)
-    _validate_diff_review_profile_mapping(context.runtime_binding, within_round_attempt, selected_profile_identity)
+    _validate_diff_review_profile_mapping(context.runtime_binding, within_round_attempt, selected_profile_identity, physical_format_output_ordinal)
     if _session_is_plan_review(repository, identity, supervisor_session_identity):
         raise CandidateReviewError("diff review must use a session distinct from plan review")
-    input_digest = _diff_review_input_digest(identity, implementation_attempt_id, seal.base_sha, seal.candidate_sha, message_identity, verification_digest, within_round_attempt, selected_profile_identity, policy_projection)
-    expected = DiffReviewDispatch(diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, seal.base_sha, seal.candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, policy_projection)
+    input_digest = _diff_review_input_digest(identity, implementation_attempt_id, seal.base_sha, seal.candidate_sha, message_identity, verification_digest, within_round_attempt, selected_profile_identity, policy_projection, physical_format_output_ordinal)
+    expected = DiffReviewDispatch(diff_review_attempt_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, seal.base_sha, seal.candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, policy_projection, physical_format_output_ordinal)
     existing = _read_diff_dispatch(repository, identity, diff_review_attempt_id)
     if existing is not None:
         if existing != expected:
@@ -787,7 +798,7 @@ def dispatch_diff_review(
     _require_unconsumed_formal_round(repository, identity, policy_projection.review_epoch, policy_projection.review_round)
     provider = prepare_attempt(repository, identity, context, attempt_id=provider_attempt_id, role=ProviderRole.SUPERVISOR,
                                process_lease_id=process_lease_id, process_lease_expires_at=process_lease_expires_at,
-                               input_fingerprint=input_digest, selected_profile_identity=selected_profile_identity, lease=lease, now=now)
+                               input_fingerprint=input_digest, selected_profile_identity=selected_profile_identity, logical_profile_position=within_round_attempt, physical_format_output_ordinal=physical_format_output_ordinal, lease=lease, now=now)
     if provider.state is AttemptState.PREPARED:
         record_session_identity(repository, identity, context, attempt_id=provider_attempt_id, session_identity=supervisor_session_identity, lease=lease, now=now)
         record_external_turn(repository, identity, context, attempt_id=provider_attempt_id, session_identity=supervisor_session_identity, external_turn_identity=external_turn_identity, lease=lease, now=now)
@@ -801,11 +812,11 @@ def dispatch_diff_review(
         current = _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id)
         if current is None:
             connection.execute(
-                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest, within_round_attempt, selected_profile_identity, review_round, review_epoch, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO diff_review_attempts(diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, input_digest, state, created_at, verification_digest, within_round_attempt, selected_profile_identity, logical_profile_position, physical_format_output_ordinal, review_round, review_epoch, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     diff_review_attempt_id, identity.task_id, implementation_attempt_id,
                     provider_attempt_id, supervisor_session_identity, external_turn_identity,
-                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now), verification_digest, within_round_attempt, selected_profile_identity, policy_projection.review_round, policy_projection.review_epoch, policy_projection.review_mode.value, policy_projection.max_rounds, policy_projection.on_final_findings.value, policy_projection.policy_digest, policy_projection.complete_rounds, policy_projection.max_supervisor_attempts_per_round,
+                    message_identity, seal.base_sha, seal.candidate_sha, input_digest, _clock(now), verification_digest, within_round_attempt, selected_profile_identity, within_round_attempt, physical_format_output_ordinal, policy_projection.review_round, policy_projection.review_epoch, policy_projection.review_mode.value, policy_projection.max_rounds, policy_projection.on_final_findings.value, policy_projection.policy_digest, policy_projection.complete_rounds, policy_projection.max_supervisor_attempts_per_round,
                 ),
             )
         elif current != expected:
@@ -842,7 +853,8 @@ def record_diff_review(
         raise CandidateReviewError("diff review output is malformed")
     normalized = output.normalized()
     bound_output_digest = _bound_diff_review_output_digest(
-        normalized.digest, dispatch.within_round_attempt, dispatch.selected_profile_identity,
+        normalized.digest, dispatch.logical_profile_position,
+        dispatch.physical_format_output_ordinal, dispatch.selected_profile_identity,
     )
     if tuple(normalized.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")) != tuple(dispatch.__dict__[field] for field in ("diff_review_attempt_id", "provider_attempt_id", "supervisor_session_identity", "external_turn_identity", "message_identity", "base_sha", "candidate_sha")):
         raise CandidateReviewError("diff review output identity does not match the durable dispatch")
@@ -947,7 +959,7 @@ def read_diff_review(
             raise CandidateReviewError("diff review dispatch is unavailable")
         provider = connection.execute("SELECT state, accepted_review_identity, output_pointer, completion_evidence_fingerprint, selected_profile_identity, input_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?", (row[8], identity.task_id)).fetchone()
         output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id = ?", (row[8],)).fetchone()
-        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
+        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, logical_profile_position, physical_format_output_ordinal, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (row[7],)).fetchone() if row[7] is not None else None
         try:
             follow_ups = tuple(json.loads(row[12] or "[]"))
         except (TypeError, json.JSONDecodeError) as error:
@@ -971,7 +983,7 @@ def read_diff_review(
         and output == (row[11],)
         and provider[4] == dispatch.selected_profile_identity
         and provider[5] == dispatch.input_digest
-        and accepted_provider == (identity.task_id, row[8], provider[3], *context.runtime_binding.columns(), dispatch.selected_profile_identity, dispatch.within_round_attempt, *context.runtime_binding.complete_columns()[4:], dispatch.review_policy.review_epoch)
+        and accepted_provider == (identity.task_id, row[8], provider[3], *context.runtime_binding.columns(), dispatch.selected_profile_identity, dispatch.within_round_attempt, dispatch.logical_profile_position, dispatch.physical_format_output_ordinal, *context.runtime_binding.complete_columns()[4:], dispatch.review_policy.review_epoch)
         and current_snapshot == row[5]
         and persisted_follow_up_digests == expected_follow_up_digests
         and provenance_count == len(expected_follow_up_digests)
@@ -1272,13 +1284,13 @@ def _read_diff_dispatch(repository, identity, diff_review_attempt_id):
 
 
 def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id):
-    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, review_round, review_epoch, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
+    row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, logical_profile_position, physical_format_output_ordinal, review_round, review_epoch, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
     if row is None:
         return None
-    if type(row[11]) is not int or row[11] < 1 or type(row[12]) is not int or row[12] < 0 or type(row[14]) is not int or type(row[17]) is not int or type(row[18]) is not int or row[11] > row[14] or type(row[16]) is not str or not _FINGERPRINT.fullmatch(row[16]):
+    if type(row[13]) is not int or row[13] < 1 or type(row[14]) is not int or row[14] < 0 or type(row[16]) is not int or type(row[19]) is not int or type(row[20]) is not int or row[13] > row[16] or type(row[18]) is not str or not _FINGERPRINT.fullmatch(row[18]) or row[11] != row[9] or row[12] < 0:
         raise CandidateReviewError("persisted diff review profile mapping is invalid")
     try:
-        projection = _ReviewPolicyProjection(row[12], row[11], ReviewMode(row[13]), row[17], row[14], row[18], FinalFindingsPolicy(row[15]), row[16])
+        projection = _ReviewPolicyProjection(row[14], row[13], ReviewMode(row[15]), row[19], row[16], row[20], FinalFindingsPolicy(row[17]), row[18])
     except (TypeError, ValueError) as error:
         raise CandidateReviewError("persisted review policy projection is invalid") from error
     binding_row = connection.execute(
@@ -1289,17 +1301,17 @@ def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id)
         runtime_binding = RuntimeBinding(*binding_row[:3], tuple(json.loads(binding_row[3]))) if binding_row is not None else None
     except (TypeError, ValueError, json.JSONDecodeError, RuntimeBindingError) as error:
         raise CandidateReviewError("persisted resolved configuration binding is invalid") from error
-    _validate_diff_review_profile_mapping(runtime_binding, row[9], row[10])
+    _validate_diff_review_profile_mapping(runtime_binding, row[11], row[10], row[12])
     policy_row = connection.execute("SELECT configuration_digest, complete_rounds, max_rounds, max_supervisor_attempts_per_round, on_final_findings, policy_digest FROM runtime_review_policies WHERE task_id = ?", (identity.task_id,)).fetchone()
     expected_policy = (runtime_binding.resolved_digest, projection.complete_rounds, projection.max_rounds, projection.max_supervisor_attempts_per_round, projection.on_final_findings.value, projection.policy_digest)
     if policy_row != expected_policy or projection.max_supervisor_attempts_per_round != len(runtime_binding.supervisor_profile_identities):
         raise CandidateReviewError("persisted review policy binding has drifted")
     if type(row[7]) is not str or not _FINGERPRINT.fullmatch(row[7]):
         raise CandidateReviewError("persisted diff review verification digest is invalid")
-    expected_input_digest = _diff_review_input_digest(identity, row[0], row[5], row[6], row[4], row[7], row[9], row[10], projection)
+    expected_input_digest = _diff_review_input_digest(identity, row[0], row[5], row[6], row[4], row[7], row[11], row[10], projection, row[12])
     if row[8] != expected_input_digest:
         raise CandidateReviewError("persisted diff review input digest has drifted")
-    return DiffReviewDispatch(diff_review_attempt_id, *row[:11], projection)
+    return DiffReviewDispatch(diff_review_attempt_id, *row[:11], projection, row[12])
 
 
 def _require_current_candidate(repository, identity, seal, implementation_attempt_id=None):
@@ -1366,10 +1378,10 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now, pass_
             provider = (provider[0], AttemptState.ACCEPTED.value, accepted_identity, provider[3], provider[4], provider[5], provider[6])
         if provider[1] != AttemptState.ACCEPTED.value or provider[2] != accepted_identity:
             raise CandidateReviewError("accepted PASS provider attempt conflicts with committed state")
-        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
-        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4], *context.runtime_binding.columns(), dispatch.selected_profile_identity, dispatch.within_round_attempt, *context.runtime_binding.complete_columns()[4:], dispatch.review_policy.review_epoch)
+        accepted_provider = connection.execute("SELECT task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, logical_profile_position, physical_format_output_ordinal, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch FROM accepted_provider_reviews WHERE accepted_review_identity = ?", (accepted_identity,)).fetchone()
+        expected_provider = (identity.task_id, dispatch.provider_attempt_id, provider[4], *context.runtime_binding.columns(), dispatch.selected_profile_identity, dispatch.within_round_attempt, dispatch.logical_profile_position, dispatch.physical_format_output_ordinal, *context.runtime_binding.complete_columns()[4:], dispatch.review_policy.review_epoch)
         if accepted_provider is None:
-            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (accepted_identity, *expected_provider))
+            connection.execute("INSERT INTO accepted_provider_reviews(accepted_review_identity, task_id, attempt_id, completion_evidence_fingerprint, configuration_schema_version, configuration_digest, worker_profile_identity, supervisor_profile_identities, selected_profile_identity, within_round_attempt, logical_profile_position, physical_format_output_ordinal, review_complete_rounds, review_max_rounds, review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest, review_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (accepted_identity, *expected_provider))
         elif accepted_provider != expected_provider:
             raise CandidateReviewError("accepted provider review conflicts with committed state")
         if row[0] in ("recorded", "accepted") and row[1] in (None, accepted_identity):

@@ -178,9 +178,10 @@ class CodexSupervisorRequest:
     response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT
     decision_material: SupervisorAccountingSnapshot | None = None
     decision_semantic: SupervisorAccountingDecisionSemantic | None = None
+    physical_format_output_ordinal: int = 0
 
     def __post_init__(self) -> None:
-        if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or type(self.response_contract) is not SupervisorResponseContract or (self.response_contract is SupervisorResponseContract.VERDICT and (self.decision_material is not None or self.decision_semantic is not None)) or (self.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and (not _accounting_material(self.decision_material) or self.decision_material.dispatch_claim is not SupervisorDispatchClaimState.CLAIMED or self.decision_semantic is not SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2 or self.objective != ACCOUNTING_TRANSITION_OBJECTIVE or self.acceptance_criteria != ACCOUNTING_TRANSITION_CRITERIA)) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria, response_contract=self.response_contract, decision_material=self.decision_material, decision_semantic=self.decision_semantic):
+        if not _token(self.review_attempt_id) or not _token(self.provider_attempt_id) or not _token(self.selected_profile_identity) or type(self.within_round_attempt) is not int or self.within_round_attempt < 1 or type(self.physical_format_output_ordinal) is not int or not 0 <= self.physical_format_output_ordinal <= 2 or not _DIGEST.fullmatch(self.input_digest) or type(self.context) is not CodexSupervisorContext or not _text(self.objective) or not _items(self.acceptance_criteria) or type(self.response_contract) is not SupervisorResponseContract or (self.response_contract is SupervisorResponseContract.VERDICT and (self.decision_material is not None or self.decision_semantic is not None)) or (self.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING and (not _accounting_material(self.decision_material) or self.decision_material.dispatch_claim is not SupervisorDispatchClaimState.CLAIMED or self.decision_semantic is not SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2 or self.objective != ACCOUNTING_TRANSITION_OBJECTIVE or self.acceptance_criteria != ACCOUNTING_TRANSITION_CRITERIA)) or self.input_digest != supervisor_request_digest(review_attempt_id=self.review_attempt_id, provider_attempt_id=self.provider_attempt_id, selected_profile_identity=self.selected_profile_identity, within_round_attempt=self.within_round_attempt, physical_format_output_ordinal=self.physical_format_output_ordinal, context=self.context, objective=self.objective, acceptance_criteria=self.acceptance_criteria, response_contract=self.response_contract, decision_material=self.decision_material, decision_semantic=self.decision_semantic):
             raise CodexSupervisorError("Supervisor request is invalid")
 
 
@@ -275,7 +276,8 @@ class CodexSupervisorAdapter:
                 "review_attempt_id": request.review_attempt_id,
                 "provider_attempt_id": request.provider_attempt_id,
                 "selected_profile_identity": request.selected_profile_identity,
-                "within_round_attempt": request.within_round_attempt,
+                "logical_profile_position": request.within_round_attempt,
+                "physical_format_output_ordinal": request.physical_format_output_ordinal,
                 "context": request.context.__dict__,
                 "objective": request.objective,
                 "acceptance_criteria": request.acceptance_criteria,
@@ -363,7 +365,7 @@ class CodexSupervisorAdapter:
         # The native schema intentionally contains no ambient context.  Bind
         # its parsed verdict to the persisted request here, so identical prose
         # cannot be replayed across attempts, profiles, rounds, or candidates.
-        return CodexSupervisorResult(SupervisorResultKind.ACCEPTED, session_identity, turn_identity, verdict, findings, _digest({"input_digest": request.input_digest, "profile_identity": request.selected_profile_identity, "within_round_attempt": request.within_round_attempt, "candidate_sha": request.context.candidate_sha, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "verdict": verdict.value, "findings": findings}))
+        return CodexSupervisorResult(SupervisorResultKind.ACCEPTED, session_identity, turn_identity, verdict, findings, _digest({"input_digest": request.input_digest, "profile_identity": request.selected_profile_identity, "logical_profile_position": request.within_round_attempt, "physical_format_output_ordinal": request.physical_format_output_ordinal, "candidate_sha": request.context.candidate_sha, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "verdict": verdict.value, "findings": findings}))
 
 
 @dataclass(frozen=True)
@@ -387,7 +389,7 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     attempted: list[str] = []
     first = requests[0].context
     for ordinal, (request, adapter, advisory_execution, execution_host, budget_ledger_path) in enumerate(zip(requests, adapters, advisory_executions, execution_hosts, budget_ledger_paths), start=1):
-        if type(request) is not CodexSupervisorRequest or type(adapter) is not CodexSupervisorAdapter or request.within_round_attempt != ordinal or request.selected_profile_identity != adapter.profile_identity or request.selected_profile_identity in seen or request.context != first:
+        if type(request) is not CodexSupervisorRequest or type(adapter) is not CodexSupervisorAdapter or request.within_round_attempt != ordinal or request.physical_format_output_ordinal != 0 or request.selected_profile_identity != adapter.profile_identity or request.selected_profile_identity in seen or request.context != first:
             raise CodexSupervisorError("Supervisor failover profile mapping is invalid")
         seen.add(request.selected_profile_identity)
         attempted.append(request.selected_profile_identity)
@@ -411,8 +413,8 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     return SupervisorFailoverResult(None, tuple(attempted), True)
 
 
-def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: str, selected_profile_identity: str, within_round_attempt: int, context: CodexSupervisorContext, objective: str, acceptance_criteria: tuple[str, ...], response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT, decision_material: SupervisorAccountingSnapshot | None = None, decision_semantic: SupervisorAccountingDecisionSemantic | None = None) -> str:
-    value: dict[str, object] = {"review_attempt_id": review_attempt_id, "provider_attempt_id": provider_attempt_id, "selected_profile_identity": selected_profile_identity, "within_round_attempt": within_round_attempt, "context": {"task_id": context.task_id, "source_digest": context.source_digest, "repository_fingerprint": context.repository_fingerprint, "worktree_fingerprint": context.worktree_fingerprint, "branch_fingerprint": context.branch_fingerprint, "base_sha": context.base_sha, "candidate_sha": context.candidate_sha, "policy_digest": context.policy_digest, "configuration_digest": context.configuration_digest, "review_epoch": context.review_epoch, "review_round": context.review_round, "review_mode": context.review_mode.value}, "objective": objective, "acceptance_criteria": acceptance_criteria}
+def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: str, selected_profile_identity: str, within_round_attempt: int, context: CodexSupervisorContext, objective: str, acceptance_criteria: tuple[str, ...], response_contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT, decision_material: SupervisorAccountingSnapshot | None = None, decision_semantic: SupervisorAccountingDecisionSemantic | None = None, physical_format_output_ordinal: int = 0) -> str:
+    value: dict[str, object] = {"review_attempt_id": review_attempt_id, "provider_attempt_id": provider_attempt_id, "selected_profile_identity": selected_profile_identity, "logical_profile_position": within_round_attempt, "physical_format_output_ordinal": physical_format_output_ordinal, "context": {"task_id": context.task_id, "source_digest": context.source_digest, "repository_fingerprint": context.repository_fingerprint, "worktree_fingerprint": context.worktree_fingerprint, "branch_fingerprint": context.branch_fingerprint, "base_sha": context.base_sha, "candidate_sha": context.candidate_sha, "policy_digest": context.policy_digest, "configuration_digest": context.configuration_digest, "review_epoch": context.review_epoch, "review_round": context.review_round, "review_mode": context.review_mode.value}, "objective": objective, "acceptance_criteria": acceptance_criteria}
     if response_contract is not SupervisorResponseContract.VERDICT:
         value["response_contract"] = response_contract.value
         value["decision_material"] = decision_material.canonical_material() if type(decision_material) is SupervisorAccountingSnapshot else decision_material
@@ -422,8 +424,8 @@ def supervisor_request_digest(*, review_attempt_id: str, provider_attempt_id: st
 
 def canonical_supervisor_review_material(request: CodexSupervisorRequest) -> dict[str, object]:
     if request.response_contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
-        return {"schema": "roundwright-provider-attempt-accounting-material/v2", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria), "decision_semantic": request.decision_semantic.value, "decision_rule": "pre-dispatch eligibility: complete authorizes this exact response to create one completion and accepted formal review; it does not assert either already exists", "decision_material": request.decision_material.canonical_material()}
-    return {"schema": "roundwright-supervisor-review-material/v1", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria)}
+        return {"schema": "roundwright-provider-attempt-accounting-material/v3", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "logical_profile_position": request.within_round_attempt, "physical_format_output_ordinal": request.physical_format_output_ordinal, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria), "decision_semantic": request.decision_semantic.value, "decision_rule": "pre-dispatch eligibility: complete authorizes this response to create one completion and accepted review at this exact logical profile and physical format ordinal", "decision_material": request.decision_material.canonical_material()}
+    return {"schema": "roundwright-supervisor-review-material/v2", "input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "logical_profile_position": request.within_round_attempt, "physical_format_output_ordinal": request.physical_format_output_ordinal, "profile_identity": request.selected_profile_identity, "review_epoch": request.context.review_epoch, "review_round": request.context.review_round, "review_mode": request.context.review_mode.value, "objective": request.objective, "acceptance_criteria": list(request.acceptance_criteria)}
 
 
 def _accounting_material(value: object) -> bool:
@@ -441,10 +443,12 @@ def _accounting_output(value: object) -> tuple[bool, SupervisorAccountingBlocker
 
 
 def _output(value: object, request: CodexSupervisorRequest) -> tuple[SupervisorVerdict, tuple[str, ...]]:
-    binding = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity}
-    if type(value) is dict and set(value) == {"verdict", "findings", "binding"} and type(value.get("binding")) is dict and set(value["binding"]) == set(binding) and value["binding"].get("candidate_sha") != binding["candidate_sha"]:
+    binding = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "logical_profile_position": request.within_round_attempt, "physical_format_output_ordinal": request.physical_format_output_ordinal, "profile_identity": request.selected_profile_identity}
+    legacy_binding = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity}
+    if type(value) is dict and set(value) == {"verdict", "findings", "binding"} and type(value.get("binding")) is dict and frozenset(value["binding"]) in {frozenset(binding), frozenset(legacy_binding)} and value["binding"].get("candidate_sha") != binding["candidate_sha"]:
         raise _CandidateBindingDrift("Supervisor output candidate has drifted")
-    if type(value) is not dict or set(value) != {"verdict", "findings", "binding"} or type(value["verdict"]) is not str or type(value["findings"]) is not list or any(not _token(item) for item in value["findings"]) or value["binding"] != binding:
+    accepted_binding = value.get("binding") == binding or (request.physical_format_output_ordinal == 0 and value.get("binding") == legacy_binding)
+    if type(value) is not dict or set(value) != {"verdict", "findings", "binding"} or type(value["verdict"]) is not str or type(value["findings"]) is not list or any(not _token(item) for item in value["findings"]) or not accepted_binding:
         raise CodexSupervisorError("Supervisor output is malformed")
     try:
         verdict = SupervisorVerdict(value["verdict"])

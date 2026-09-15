@@ -68,6 +68,20 @@ ISSUE_136_ARTIFACTS = {
     "advisory-qualification-validator-v1": "ci/validate_phase5_coverage.py",
     "advisory-qualification-validator-tests-v1": "tests/test_phase5_coverage.py",
 }
+ISSUE_132_REQUIREMENTS = {
+    "issue": "132",
+    "destinations": [
+        "scoped-denial-classification", "bounded-recovery-eligibility",
+        "public-safe-recovery-qualification",
+    ],
+}
+ISSUE_132_ARTIFACTS = {
+    "failure-recovery-contract-v1": "src/roundwright/failure_recovery.py",
+    "failure-recovery-tests-v1": "tests/test_failure_recovery.py",
+    "failure-recovery-migration-v1": "docs/migration/issue-132-scoped-denial-recovery-coverage.md",
+    "failure-recovery-state-v1": "src/roundwright/state.py",
+    "failure-recovery-roadmap-v1": "docs/operations/dogfood-promotion-roadmap.md",
+}
 
 # Hashes establish candidate inventory, but do not by themselves establish
 # that the listed artifacts still enforce the Phase 5 boundary.  These named
@@ -279,7 +293,7 @@ def _require_current_candidate(candidate: str) -> None:
 
 def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     document = _read_json(source)
-    if set(document) != {"schema", "implementation_requirements", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
+    if set(document) != {"schema", "implementation_requirements", "issue_132_requirements", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
         raise CoverageError("coverage map schema is invalid")
     requirements = document["implementation_requirements"]
     if type(requirements) is not dict or {key: requirements.get(key) for key in ("issue", "destinations")} != ISSUE_136_REQUIREMENTS:
@@ -292,6 +306,10 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
             raise CoverageError("issue 136 artifact digest is invalid")
         if _git_blob_sha256(artifact["path"]) != artifact["sha256"]:
             raise CoverageError("issue 136 artifact digest has drifted")
+    _validate_implementation_requirements(
+        document["issue_132_requirements"], ISSUE_132_REQUIREMENTS,
+        ISSUE_132_ARTIFACTS, "issue 132",
+    )
     _validate_semantic_contracts()
     if type(document["sources"]) is not dict or set(document["sources"]) != {"ledger_sha256", "test_disposition_sha256"}:
         raise CoverageError("coverage source bindings are invalid")
@@ -348,6 +366,21 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     if not set(identifier for identifier in observed if identifier.startswith("TS-")) <= test_ids:
         raise CoverageError("coverage test identifier is stale")
     return document
+
+
+def _validate_implementation_requirements(
+    requirements: object, expected: dict[str, object], artifacts_expected: dict[str, str], label: str,
+) -> None:
+    if type(requirements) is not dict or {key: requirements.get(key) for key in ("issue", "destinations")} != expected:
+        raise CoverageError(f"{label} implementation coverage has drifted")
+    artifacts = requirements.get("artifacts")
+    if type(artifacts) is not list or {item.get("identity"): item.get("path") for item in artifacts if type(item) is dict} != artifacts_expected or len(artifacts) != len(artifacts_expected):
+        raise CoverageError(f"{label} artifact identities have drifted")
+    for artifact in artifacts:
+        if type(artifact) is not dict or set(artifact) != {"identity", "path", "sha256"} or type(artifact["sha256"]) is not str or not SHA256.fullmatch(artifact["sha256"]):
+            raise CoverageError(f"{label} artifact digest is invalid")
+        if _git_blob_sha256(artifact["path"]) != artifact["sha256"]:
+            raise CoverageError(f"{label} artifact digest has drifted")
 
 
 def _validate_semantic_contracts() -> None:

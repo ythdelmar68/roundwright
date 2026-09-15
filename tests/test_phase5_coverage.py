@@ -84,6 +84,18 @@ class Phase5CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(coverage.CoverageError, "artifact digest"):
             coverage.validate(self.source, self.ledger, self.tests)
 
+    def test_rejects_issue_132_requirement_and_artifact_drift(self) -> None:
+        document = self.document()
+        document["issue_132_requirements"]["destinations"].pop()
+        self.write_document(document)
+        with self.assertRaisesRegex(coverage.CoverageError, "issue 132"):
+            coverage.validate(self.source, self.ledger, self.tests)
+        document = self.document()
+        document["issue_132_requirements"]["artifacts"][0]["sha256"] = "0" * 64
+        self.write_document(document)
+        with self.assertRaisesRegex(coverage.CoverageError, "artifact digest"):
+            coverage.validate(self.source, self.ledger, self.tests)
+
     def test_rejects_semantic_boundary_contract_drift(self) -> None:
         contracts = dict(coverage.SEMANTIC_CONTRACTS)
         contracts["src/roundwright/worker_toolbox.py"] = ("missing-required-production-boundary",)

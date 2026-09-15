@@ -15,10 +15,10 @@
       {"identity":"advisory-migration-v2","path":"docs/migration/issue-136-trusted-advisory-role-coverage.md","sha256":"d145113ab055657949a83d478c06a15f270721971820f2db3d4da73d8225f885"},
       {"identity":"advisory-authority-model-v2","path":"docs/architecture/authority-model.md","sha256":"9eebef3c2fec690e711fdd4596f0bce3a70996519a207e0610d6b3700c7c29a4"},
       {"identity":"advisory-configuration-v1","path":"src/roundwright/configuration.py","sha256":"5f38c48e7c690b62a09ca50ac3d1121d1ee10189d0d676afd9a485a72b578239"},
-      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"780df764f1d13c2d89de08376727b2a804eaaec72a685f1ad142a634433ccda4"},
+      {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"58c0d6c20ae6de44d4d093cd0c152cfaf8c1fd359764ae442e4a88bafb6520d0"},
       {"identity":"advisory-worker-seam-tests-v1","path":"tests/test_codex_worker.py","sha256":"6f8f6141109dfb3ded4d3dcb72cdf417048b686acf258eb694ee9fcf5db65db6"},
-      {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"5da5966c94ff32dc2b787090a6a987a6bdbffb8bff51bd77162063f2a82a1f62"},
-      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"776adf8d8e4657ed10bb2f8383623d0c876f95b8e81c105685d859f9c5151ae9"},
+      {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"761ea292a96b90d86d96e241753a676d685f20f52452b33d773ad4f104199d4f"},
+      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"eb60d57f8dba5c3722e70fe7b393763ba7de0c9e5290ccadf0aa6d2989f0f02e"},
       {"identity":"advisory-native-supervisor-bridge-v1","path":"src/roundwright/supervisor_toolbox.py","sha256":"d8694e9a2b3097e7d0be1da0abf6227c9a53658a07d3e4696e809d814ca1220b"},
       {"identity":"advisory-native-supervisor-bridge-tests-v1","path":"tests/test_codex_supervisor.py","sha256":"6bbb1465417dd246bb75f2fccd287128ebc9cbaec17c66d09c6f0a6a01ee4532"},
       {"identity":"advisory-native-dependency-review-bridge-v1","path":"src/roundwright/dependency_review_toolbox.py","sha256":"5244f1c88488e8b15c0f4bb1c6101ad87bbef1d08501572306da2e18f3706eea"},
@@ -39,8 +39,19 @@
       {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"ff0d8d185c4083c8fe8beaff1c28cb5f066b5cabc57c864f23a1f927934db246"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
       {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"570485e5e1289e761dc20082aa1f47212b8376ae2672cd473d3a819bb812a498"},
-      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"32f8943d91aad812ee73ba452427a4bc080b56d6691b5df48e4b81b0905fd28e"},
-      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"ff510047f8809cfda5e5852237fa3fb1b4ae86a4fa791e046d18a99ae7ff4a9a"}
+      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"c540c4a66a5507189e09f8529eba3e2828f2b0b0fe2fdc935946a572d6f62261"},
+      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"4c8af9d4bd7ec9718cfad7e0e73c3b9809faf564ced52b1602868650eed6b325"}
+    ]
+  },
+  "issue_132_requirements": {
+    "issue": "132",
+    "destinations": ["scoped-denial-classification", "bounded-recovery-eligibility", "public-safe-recovery-qualification"],
+    "artifacts": [
+      {"identity":"failure-recovery-contract-v1","path":"src/roundwright/failure_recovery.py","sha256":"0dc2c4abdd92eb60648a50e75b025199ef0abbaa8ab3dd7e4747ba91fd82f9ed"},
+      {"identity":"failure-recovery-tests-v1","path":"tests/test_failure_recovery.py","sha256":"3e97e39477c139d1d65432dbd942fa35831b762ed8fd8ce46644c8f8d4264ab2"},
+      {"identity":"failure-recovery-migration-v1","path":"docs/migration/issue-132-scoped-denial-recovery-coverage.md","sha256":"376472a1db20b51f6e1e95b68cbd6b6f5fba460e8affb0b1b343b2e77baaf0a7"},
+      {"identity":"failure-recovery-state-v1","path":"src/roundwright/state.py","sha256":"17f4fc5f96eca6bc99f39fda2ab388ae3df2e16a9e6ce4acbb5ac99a8840eef4"},
+      {"identity":"failure-recovery-roadmap-v1","path":"docs/operations/dogfood-promotion-roadmap.md","sha256":"b6acdaa1d6e1580d13899757ce836b419beb19e4bbc5d1d8424546c56d86be0b"}
     ]
   },
   "sources": {"ledger_sha256":"9cc1b9bac7f3e0df4165d308ddaebbd7c75d287a471504cca019bfbda5262a2e","test_disposition_sha256":"0e42cfc6f1e0dbaedef34762af348823e11c406978680bd5b1f1af0a44d29676"},

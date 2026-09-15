@@ -50,6 +50,25 @@ class EvidenceSource(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class EvidenceConfidence(StrEnum):
+    VERIFIED = "verified"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class FailureEvidence:
+    """Closed provenance: prose is never an authority-bearing observation."""
+
+    source: EvidenceSource
+    confidence: EvidenceConfidence
+
+    def __post_init__(self) -> None:
+        if type(self.source) is not EvidenceSource or type(self.confidence) is not EvidenceConfidence:
+            raise FailureRecoveryError("failure evidence is invalid")
+        if self.source in {EvidenceSource.MODEL_SELF_REPORT, EvidenceSource.UNAVAILABLE} and self.confidence is not EvidenceConfidence.UNAVAILABLE:
+            raise FailureRecoveryError("untrusted evidence cannot be verified")
+
+
 class RecoveryAction(StrEnum):
     CONTINUE_SAME_SESSION = "continue-same-session"
     RECONCILE = "reconcile"
@@ -115,6 +134,31 @@ class Clearance:
             raise FailureRecoveryError("clearance is invalid")
 
 
+@dataclass(frozen=True)
+class RecoveryRouteAdmission:
+    """Product-issued, exact route identity; callers cannot assert equivalence."""
+
+    binding: FailureBinding
+    capability_digest: str
+    target_identity: str
+
+    def __post_init__(self) -> None:
+        if type(self.binding) is not FailureBinding or not self.capability_digest.startswith("sha256:") or len(self.capability_digest) != 71 or not isinstance(self.target_identity, str) or not self.target_identity:
+            raise FailureRecoveryError("recovery route admission is invalid")
+
+
+@dataclass(frozen=True)
+class RecoveryAdvice:
+    """A digest-only recommendation for #140; it cannot authorize an effect."""
+
+    record_digest: str
+    recommendation_digest: str
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(value, str) and value.startswith("sha256:") and len(value) == 71 for value in (self.record_digest, self.recommendation_digest)):
+            raise FailureRecoveryError("recovery advice is invalid")
+
+
 def _payload(record: FailureRecord) -> dict[str, object]:
     return {"schema": "roundwright-failure-recovery/v1", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
 
@@ -166,8 +210,10 @@ def read_durable_failure(repository, identity, record_digest: str) -> dict[str, 
     return payload
 
 
-def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource) -> FailureRecord:
+def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource | FailureEvidence) -> FailureRecord:
     """Map one typed observation to the only permitted recovery action."""
+    if type(evidence) is FailureEvidence:
+        evidence = evidence.source if evidence.confidence is EvidenceConfidence.VERIFIED else EvidenceSource.UNAVAILABLE
     if type(binding) is not FailureBinding or type(failure) is not FailureClass or type(evidence) is not EvidenceSource:
         raise FailureRecoveryError("failure classification inputs are invalid")
     # Provider prose and unavailable telemetry never establish capacity, death,
@@ -196,16 +242,16 @@ def classify_for_role(role: FailureRole, binding: FailureBinding, failure: Failu
     return classify(binding, failure, evidence)
 
 
-def admit_recovery(record: FailureRecord, current: FailureBinding, *, route_equivalent: bool, clearance: Clearance | None = None) -> RecoveryAction:
+def admit_recovery(record: FailureRecord, current: FailureBinding, *, route: RecoveryRouteAdmission, clearance: Clearance | None = None) -> RecoveryAction:
     """Recheck immutable context before a retry; denial survives restarts."""
-    if type(record) is not FailureRecord or type(current) is not FailureBinding or record.binding != current:
+    if type(record) is not FailureRecord or type(current) is not FailureBinding or record.binding != current or type(route) is not RecoveryRouteAdmission or route.binding != current:
         raise FailureRecoveryError("recovery context has drifted")
     if record.clearance_required:
         if clearance is None or clearance.record_digest != record.digest or clearance.binding != current:
             return RecoveryAction.STOP_SCOPE
         # A clearance is a new, exact host decision.  It does not mutate the
         # old record or permit a changed role/session/scope to inherit it.
-        return RecoveryAction.PREBOUND_FALLBACK if route_equivalent else RecoveryAction.RECONCILE
+        return RecoveryAction.PREBOUND_FALLBACK
     if record.action is RecoveryAction.PREBOUND_FALLBACK:
-        return RecoveryAction.PREBOUND_FALLBACK if record.retryable and route_equivalent else RecoveryAction.RECONCILE
+        return RecoveryAction.PREBOUND_FALLBACK if record.retryable else RecoveryAction.RECONCILE
     return record.action

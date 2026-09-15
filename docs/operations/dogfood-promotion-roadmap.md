@@ -66,7 +66,7 @@ zero-mutation target state.
 | 2 — substrate | Hermetic single-task baseline is defined. | Isolated-package, local-Git, restart, and adversarial-path evidence. | #26 and #27 are closed; no external-runtime claim. | No Roundwright mutation authority; return to blocked local diagnosis on failure. | None; Phase 2 does not promote. |
 | 3 — contracts | Phase 2 evidence is complete. | Roadmap, immutable Shadow protocol, typed contracts, fail-closed Boolean policy, provider health, receipts, provenance, and qualification evidence. | Every Phase 3 P0 leaf and qualification issue pass on the exact candidate; Shadow and any forward-target observation remain read-only. | Roundlet remains authoritative for Roundwright. Rollback means stop the candidate, preserve evidence, and resume `SHADOW_ONLY` or `DORMANT_RECOVERY`. | No fresh per-attempt approval for conforming read-only routes; Phase 3 never performs Canary mutation. |
 | 4 — controlled canary | Phase 3 qualification is complete and an exact leaf-scoped forward-test route matches standing and target authority. | Forward-test and cross-environment canary evidence, read-back, semantic receipts, and rollback rehearsal. | Every stated environment has matching evidence or a recorded blocked/rejected disposition. | Roundlet remains the Roundwright authority. The public forward-test repository is limited to the exact leaf/target-policy intersection. Disable the affected route and reconcile on failure. | Approve, reject, or constrain a Phase 5 promotion evaluation. |
-| 5 — promotion evaluation | Controlled-canary evidence is complete and comparable. | Legacy parity, retention, maintenance, cleanup eligibility, final promotion evidence, and Roundlet stop/reconciliation plan. | An owner has a complete, candidate-bound evidence bundle; no automatic transition occurs. | No dual dispatch: any replacement requires stopping and reconciling Roundlet before a successor can dispatch. Roll back to `DORMANT_RECOVERY` on uncertainty. | Make the external self-hosting/activation decision, or reject it. |
+| 5 — promotion evaluation | Controlled-canary evidence is complete and comparable. | Legacy parity, unattended Worker continuity, complete recoverable state, durable validation jobs, resource-policy qualification, retention, maintenance, automatic-cleanup evidence, final promotion evidence, and Roundlet stop/reconciliation plan. | An owner has a complete, candidate-bound bundle including positive unattended continuity/recovery evidence; no automatic transition occurs. | No dual dispatch: replacing the active Orchestrator requires stopping and reconciling Roundlet first. Same-instance Worker succession follows the continuity contract below and grants no authority. Roll back to `DORMANT_RECOVERY` on authority uncertainty. | Make the external self-hosting/activation decision, or reject it. |
 | 6+ — release/publication | A separate owner decision authorizes release preparation. | Release-specific checks and public artifacts. | Criteria defined by that separate decision. | This roadmap grants none. | Authorize each release/publication action separately. |
 
 The Phase 3 sequence is the canonical order in umbrella #2: #37, #38, #39,
@@ -121,6 +121,91 @@ Phase 3 reuses the routing source for native/Shadow qualification; Phase 4 for
 canary and cross-environment work; Phase 5 for operations, migration, and
 promotion evaluation; and Phase 6 for release-readiness validation. These are
 evidence routes only and never expand the authority stated in this roadmap.
+
+## Phase 5 unattended Worker continuity
+
+Phase 5 requires sustained autonomous work toward verified completion within
+existing authority. This is a product delivery requirement, not a claim that
+the current package already qualifies, and not a guarantee that every task can
+finish or that resources/context are unlimited. The live umbrella bodies #2,
+#3 and #4 remain the canonical scheduling order and dependency source.
+
+### Continue work before replacing a Worker
+
+A completed turn, partial local validation, small repair, ordinary Supervisor
+findings or waiting validation job must continue in the same usable Worker
+session by default. None proves session death. #132 distinguishes these states
+from no-progress, confirmed terminal context/session loss, ambiguous output,
+topology violations and verified security/authority denial.
+
+#133 owns same-session continuation and evidence-gated successor admission.
+Before replacement, preserve and reconcile work/effects and fence the previous
+writer. Only the deterministic lifecycle owner admits a successor; a
+Worker-created child is not automatically adopted. Missing stdout or a quiet
+turn is not permission to create a new session or bypass a refusal.
+
+### Complete retained state, selective model context
+
+#133 must retain complete required recoverable state: objectives, findings,
+decisions and supersession, committed and dirty/untracked work, exact candidate
+identities, pending effects, validation jobs/results, cumulative counters and
+authority references. Preserve available permitted session/tool records under
+access control and applicable retention holds; do not claim unavailable model
+internals or publish private context.
+
+A prompt handoff is a bounded, digest-bound index with paginated/on-demand
+access to retained evidence, not a lossy summary replacing machine truth.
+Required state must not be discarded to fit a prompt. Current facts and
+superseded history remain distinguishable. Use observed context telemetry
+where supported; absence stays explicit rather than an invented remaining-token
+estimate. Whole-transcript replay is not the default recovery mechanism.
+
+### Unattended recovery and resource boundaries
+
+Replacement count/frequency is a diagnostic threshold by default, not the sole
+owner-input or terminal-stop trigger. #140 diagnoses repeated equivalent
+non-progress and unnecessary churn on demand, preferring same-Worker
+continuation, retained-context retrieval, a smaller in-scope next step or an
+existing-job wait. Runtime validates every proposal; the Advisor cannot
+dispatch, mint PASS, change acceptance criteria or clear a denial.
+
+#119 qualifies finite call/execution slices, bounded diagnostic strategies,
+explicitly preauthorized renewable windows/cooldown and any owner-selected
+non-renewable task totals. All lifetime usage remains cumulative across turns,
+sessions, generations and restarts. Renewal must follow an existing valid
+policy; it cannot mint/extend a grant, erase usage, or change formal review,
+format-correction or final-repair limits. "Continue until complete" is not
+unlimited spending or authority. Repeated equivalent failure cannot become an
+endless loop by changing an ID or waiting through a cooldown.
+
+#118 resumes eligible cooldown/maintenance automatically after current
+policy/identity checks. An explicit owner pause requires authenticated resume;
+expired/revoked authority, actual hard-total exhaustion, verified denial and
+unreconciled side effects retain their stop boundaries. #139 distinguishes
+automatic waiting, next wake, diagnosis, genuine owner questions and terminal
+non-convergence. A safely preserved unresolved outcome is not completion.
+
+### Durable validation and acceptance ownership
+
+#133 supplies the durable validation-job contract; #118 integrates it into
+installed run-once/daemon operation. Bind one canonical job to task, candidate,
+validation purpose, command/toolchain and environment; reserve before launch.
+Retain process ownership, stdout/stderr references and terminal exit receipts
+outside model-session lifetime. Reattach/reconcile after interruption rather
+than launching duplicate tests or mistaking inventory for executed results.
+
+#128 must demonstrate multiple partial repairs in one usable physical Worker,
+separate evidenced terminal recovery, retrieval of older required checkpoint
+facts and no duplicate validation. #143 adds actual bounded Advisor/control
+interaction and policy-authorized autonomous resumption, preserving its
+separate trace lane. #120 consumes all these compatible receipts and rejects
+generation churn, summary-only state, counter resets or manual completion as
+unattended success.
+
+These obligations remain Phase 5; Phase 6 owns release/publication preparation,
+not missing runtime continuity. Existing evidence routes, reviewed profile
+versioning, target budgets, capability blockers and permanent read-only Shadow
+remain binding. The documents/issues grant no activation or live permission.
 
 ## Deferred Phase 5 dependency-review lifecycle
 

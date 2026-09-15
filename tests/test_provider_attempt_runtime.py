@@ -38,7 +38,7 @@ from roundwright.provider_health import CodexFailure
 from roundwright.role_capability_policy import AdvisoryRole, DurableRoleBudgetLedger, RoleBudget, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.provider_recovery import (
     AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, SupervisorAccountingSnapshot,
-    SupervisorTerminalFailure, claim_supervisor_dispatch, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
+    SupervisorTerminalFailure, claim_supervisor_dispatch, prepare_attempt, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
     record_supervisor_terminal_failure,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
 )
@@ -505,6 +505,16 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT attempt_id, logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE attempt_id IN (?, ?) ORDER BY attempt_number", (runner.selection.provider_attempt_id, next_selection.provider_attempt_id)).fetchall(), [(runner.selection.provider_attempt_id, 1, 0), (next_selection.provider_attempt_id, 1, 1)])
             finally:
                 connection.close()
+
+    def test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, _ = self.durable_runner(Path(temporary) / "repository", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE))
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            self.assertEqual(backend.calls, 1)
+            with self.assertRaisesRegex(ProviderRecoveryError, "replay conflicts"):
+                prepare_attempt(repository, identity, recovery, attempt_id=runner.selection.provider_attempt_id, role=ProviderRole.SUPERVISOR, process_lease_id=runner.selection.process_lease_id, process_lease_expires_at=runner.selection.process_lease_expires_at, input_fingerprint="c" * 64, selected_profile_identity=runner.audit.profile_identity, logical_profile_position=1, physical_format_output_ordinal=0, lease=runner.lease, now=runner.dispatch_control.now)
+            self.assertEqual(backend.calls, 1)
 
     def test_fallback_reserves_its_own_exact_binding_and_reconstructs_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:

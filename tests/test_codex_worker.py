@@ -200,6 +200,12 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         result = self.dispatch(self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events), self.request(), events)
         self.assertEqual((result.kind, result.failure, result.session_identity, result.turn_identity), (WorkerResultKind.BLOCKED, CodexFailure.SANDBOX_OR_APPROVAL_DENIED, "thread-43", "turn-43"))
         self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:thread-43:turn-43", "read", "abort", "close"])
+        events = []; request = self.request()
+        turn = FakeTurn("turn-43", None, events, (NativeWorkerTurnStep(request=NativeWorkerToolRequest(2, WorkerTool.WORKSPACE_READ, path="a")),))
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events); execution, reservation = self.admission(adapter, request)
+        result = adapter.dispatch(request, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, execute_tool_request=lambda _: self.fail("callback"), advisory_execution=execution, effect_reservation=reservation)
+        self.assertEqual(result.kind, WorkerResultKind.AMBIGUOUS)
+        self.assertEqual((events.count("abort"), events.count("close")), (1, 1))
 
     def test_generic_read_failure_aborts_then_closes_once_without_a_second_turn(self) -> None:
         events: list[str] = []

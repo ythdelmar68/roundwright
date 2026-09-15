@@ -9,7 +9,7 @@ output.
 
 | E1R2 finding | Requirement | Producer | Public-safe consuming gate |
 | --- | --- | --- | --- |
-| E1R2-01 | Production Worker denial stays typed and cannot mint a substitute turn | `codex_worker.py` native seam | `test_codex_worker.test_typed_denial_and_transport_failure_remain_typed` |
+| E1R2-01 | Production Worker preserves an authenticated typed denial, while an out-of-order tool protocol remains ambiguous and cannot mint a substitute turn | `codex_worker.py` native seam | `test_codex_worker.test_typed_denial_and_transport_failure_remain_typed` |
 | E1R2-02 | Production Supervisor denial stops before any prebound fallback | `codex_supervisor.py` native seam | `test_codex_supervisor.test_security_denial_stops_before_a_prebound_profile_fallback` |
 | E1R2-03 | Dependency-review restart denial blocks before a second provider session | `codex_dependency_review.py` native seam | `test_codex_dependency_review.test_restart_scope_denial_blocks_before_dependency_provider_session` |
 | E1R2-04 | Only authenticated verified transient evidence reaches the prebound equivalent route | `failure_recovery.py` admission | `test_failure_recovery.test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route` |

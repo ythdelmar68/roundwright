@@ -1088,7 +1088,7 @@ def admit_recovery(record: FailureRecord, current: FailureBinding, *, route: Rec
     if type(record) is not FailureRecord or type(current) is not FailureBinding or record.binding != current or type(route) is not RecoveryRouteAdmission or route.binding != current:
         raise FailureRecoveryError("recovery context has drifted")
     _require_failure_compatibility(record)
-    if record.record_schema != "roundwright-failure-recovery/v2":
+    if record.record_schema != "roundwright-failure-recovery/v3":
         raise FailureRecoveryError("legacy failure record cannot admit a recovery route")
     if record.clearance_required:
         # Durable scope admission is the only clearance authority.  A caller

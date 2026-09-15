@@ -108,6 +108,8 @@ SEMANTIC_CONTRACTS = {
     "src/roundwright/worker_toolbox.py": (
         "require_external_production_activation()",
         "class ProductionCodingWorkerRuntime",
+        "class ProductionWorkerFailureLifecycle",
+        "record_terminal_failure",
         "production coding activation is unavailable",
     ),
     "src/roundwright/coding_tools.py": (
@@ -124,7 +126,7 @@ SEMANTIC_CONTRACTS = {
     "tests/test_production_coding_runtime.py": (
         "test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
         "test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
-        "test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage",
+        "test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
     ),
     "tests/test_coding_tools.py": (
         "test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
@@ -505,7 +507,7 @@ SEMANTIC_TESTS = (
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_later_accounting_request_reads_prior_invalid_recovery_without_disclosure",
-    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
     "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
@@ -522,7 +524,7 @@ ISSUE_132_FINDING_REQUIREMENTS = {
     "E1R2-08": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic"),
 }
 ISSUE_132_E1R3_TESTS = (
-    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_test_only_harness_preserves_drift_feedback_and_reconciliation_coverage",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
     "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",

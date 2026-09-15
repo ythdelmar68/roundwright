@@ -85,6 +85,30 @@ class RecoveryAction(StrEnum):
 
 
 @dataclass(frozen=True)
+class ClearanceConditionSet:
+    """Closed, versioned requirements for reopening a security-denial scope.
+
+    The condition names are data only when they occur outside this exact type;
+    a persisted record must carry this complete set and an exact copy of its
+    failure binding.  The durable ledger supplies the task, repository, and
+    current candidate-seal portions of that provenance at read-back time.
+    """
+
+    schema: str = "roundwright-denial-clearance-conditions/v1"
+    conditions: tuple[str, ...] = (
+        "dedicated-denial-authority",
+        "exact-denial-target",
+        "current-candidate-seal",
+        "verified-host-result",
+        "single-use-command",
+    )
+
+    def __post_init__(self) -> None:
+        if self.schema != "roundwright-denial-clearance-conditions/v1" or self.conditions != _CLEARANCE_CONDITIONS:
+            raise FailureRecoveryError("clearance conditions are invalid")
+
+
+@dataclass(frozen=True)
 class FailureCompatibility:
     """The closed evidence-to-recovery contract for one failure taxonomy."""
 
@@ -211,10 +235,12 @@ class FailureRecord:
     action: RecoveryAction
     clearance_required: bool
     evidence_confidence: EvidenceConfidence = EvidenceConfidence.VERIFIED
-    record_schema: str = "roundwright-failure-recovery/v2"
+    record_schema: str = "roundwright-failure-recovery/v3"
+    clearance_conditions: ClearanceConditionSet | None = None
+    clearance_provenance: FailureBinding | None = None
 
     def __post_init__(self) -> None:
-        if type(self.binding) is not FailureBinding or type(self.failure) is not FailureClass or type(self.evidence) is not EvidenceSource or type(self.retryable) is not bool or type(self.action) is not RecoveryAction or type(self.clearance_required) is not bool or type(self.evidence_confidence) is not EvidenceConfidence or self.record_schema not in {"roundwright-failure-recovery/v1", "roundwright-failure-recovery/v2"}:
+        if type(self.binding) is not FailureBinding or type(self.failure) is not FailureClass or type(self.evidence) is not EvidenceSource or type(self.retryable) is not bool or type(self.action) is not RecoveryAction or type(self.clearance_required) is not bool or type(self.evidence_confidence) is not EvidenceConfidence or self.record_schema not in {"roundwright-failure-recovery/v1", "roundwright-failure-recovery/v2", "roundwright-failure-recovery/v3"}:
             raise FailureRecoveryError("failure record is invalid")
         if self.record_schema == "roundwright-failure-recovery/v1" and self.evidence_confidence is not EvidenceConfidence.UNAVAILABLE:
             raise FailureRecoveryError("legacy failure evidence confidence is unavailable")
@@ -222,6 +248,12 @@ class FailureRecord:
             raise FailureRecoveryError("untrusted failure evidence cannot be verified")
         if self.failure is FailureClass.HOST_SECURITY_DENIAL and (self.retryable or self.action is not RecoveryAction.STOP_SCOPE or not self.clearance_required):
             raise FailureRecoveryError("security denial must stop its scope")
+        if self.record_schema == "roundwright-failure-recovery/v3":
+            expected_conditions = self.clearance_required
+            if expected_conditions != (type(self.clearance_conditions) is ClearanceConditionSet and self.clearance_provenance == self.binding):
+                raise FailureRecoveryError("security denial clearance provenance is invalid")
+        elif self.clearance_conditions is not None or self.clearance_provenance is not None:
+            raise FailureRecoveryError("legacy failure clearance provenance is invalid")
         if self.failure in {FailureClass.UNKNOWN, FailureClass.MISSING_OUTPUT, FailureClass.AMBIGUOUS_EFFECT} and (self.retryable or self.action is not RecoveryAction.RECONCILE):
             raise FailureRecoveryError("unverified outcome must reconcile")
         _require_failure_compatibility(self)
@@ -235,9 +267,10 @@ class FailureRecord:
 class Clearance:
     """A request to append one authenticated owner clearance decision.
 
-    ``command_id`` names an already-consumed #115 owner command.  It is not
-    enough to label a caller-supplied value ``verified-host``: the recorder
-    re-derives the host receipt and current authority from durable state.
+    ``command_id`` names an already-consumed dedicated denial-clearance
+    command.  It is not enough to label a caller-supplied value
+    ``verified-host``: the recorder re-derives the host receipt and current
+    authority from durable state.
     """
 
     record_digest: str
@@ -377,6 +410,14 @@ def _payload(record: FailureRecord) -> dict[str, object]:
     payload = {"schema": record.record_schema, "binding": _binding_payload(record.binding), "failure": record.failure.value, "evidence": record.evidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
     if record.record_schema == "roundwright-failure-recovery/v2":
         payload["evidence_confidence"] = record.evidence_confidence.value
+    if record.record_schema == "roundwright-failure-recovery/v3":
+        payload["evidence_confidence"] = record.evidence_confidence.value
+        assert record.clearance_conditions is not None or not record.clearance_required
+        payload["clearance_conditions"] = None if record.clearance_conditions is None else {
+            "schema": record.clearance_conditions.schema,
+            "conditions": list(record.clearance_conditions.conditions),
+        }
+        payload["clearance_provenance"] = None if record.clearance_provenance is None else _binding_payload(record.clearance_provenance)
     return payload
 
 
@@ -385,10 +426,11 @@ def _binding_payload(binding: FailureBinding) -> dict[str, object]:
 
 
 _CLEARANCE_CONDITIONS = (
-    "authenticated-owner-command",
-    "consumed-owner-command",
+    "dedicated-denial-authority",
+    "exact-denial-target",
     "current-candidate-seal",
-    "verified-host-receipt",
+    "verified-host-result",
+    "single-use-command",
 )
 
 
@@ -400,12 +442,12 @@ def _decision_payload(
     if kind not in {"clear", "revoke"} or type(sequence) is not int or sequence <= 0:
         raise FailureRecoveryError("durable clearance decision is invalid")
     return {
-        "schema": "roundwright-failure-clearance-decision/v2",
+        "schema": "roundwright-failure-clearance-decision/v3",
         "kind": kind,
         "record_digest": record_digest,
         "binding": _binding_payload(binding),
         "conditions": list(_CLEARANCE_CONDITIONS),
-        "host_receipt": command,
+        "denial_command": command,
         "predecessor_digest": predecessor_digest,
         "sequence": sequence,
     }
@@ -420,20 +462,36 @@ def parse_failure_record(value: object) -> FailureRecord:
         raise FailureRecoveryError("durable failure record is malformed")
     schema = value.get("schema")
     expected = {"schema", "binding", "failure", "evidence", "retryable", "action", "clearance_required"}
-    if schema == "roundwright-failure-recovery/v2":
+    if schema in {"roundwright-failure-recovery/v2", "roundwright-failure-recovery/v3"}:
         expected = expected | {"evidence_confidence"}
-    if schema not in {"roundwright-failure-recovery/v1", "roundwright-failure-recovery/v2"} or set(value) != expected:
+    if schema == "roundwright-failure-recovery/v3":
+        expected = expected | {"clearance_conditions", "clearance_provenance"}
+    if schema not in {"roundwright-failure-recovery/v1", "roundwright-failure-recovery/v2", "roundwright-failure-recovery/v3"} or set(value) != expected:
         raise FailureRecoveryError("durable failure record is malformed")
     binding = value["binding"]
     if set(binding) != {"candidate_sha", "policy_digest", "configuration_digest", "authority_scope", "role", "profile_identity", "session_identity", "attempt_identity"}:
         raise FailureRecoveryError("durable failure record is malformed")
     try:
+        parsed_binding = FailureBinding(binding["candidate_sha"], binding["policy_digest"], binding["configuration_digest"], binding["authority_scope"], FailureRole(binding["role"]), binding["profile_identity"], binding["session_identity"], binding["attempt_identity"])
+        conditions_value = value.get("clearance_conditions")
+        provenance_value = value.get("clearance_provenance")
+        conditions = None
+        provenance = None
+        if schema == "roundwright-failure-recovery/v3":
+            if conditions_value is not None:
+                if type(conditions_value) is not dict or set(conditions_value) != {"schema", "conditions"} or type(conditions_value["conditions"]) is not list:
+                    raise FailureRecoveryError("durable failure record is malformed")
+                conditions = ClearanceConditionSet(conditions_value["schema"], tuple(conditions_value["conditions"]))
+            if provenance_value is not None:
+                if type(provenance_value) is not dict or set(provenance_value) != set(binding):
+                    raise FailureRecoveryError("durable failure record is malformed")
+                provenance = FailureBinding(provenance_value["candidate_sha"], provenance_value["policy_digest"], provenance_value["configuration_digest"], provenance_value["authority_scope"], FailureRole(provenance_value["role"]), provenance_value["profile_identity"], provenance_value["session_identity"], provenance_value["attempt_identity"])
         record = FailureRecord(
-            FailureBinding(binding["candidate_sha"], binding["policy_digest"], binding["configuration_digest"], binding["authority_scope"], FailureRole(binding["role"]), binding["profile_identity"], binding["session_identity"], binding["attempt_identity"]),
+            parsed_binding,
             FailureClass(value["failure"]), EvidenceSource(value["evidence"]), value["retryable"],
             RecoveryAction(value["action"]), value["clearance_required"],
-            EvidenceConfidence(value["evidence_confidence"]) if schema.endswith("/v2") else EvidenceConfidence.UNAVAILABLE,
-            schema,
+            EvidenceConfidence(value["evidence_confidence"]) if schema.endswith(("/v2", "/v3")) else EvidenceConfidence.UNAVAILABLE,
+            schema, conditions, provenance,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise FailureRecoveryError("durable failure record is malformed") from error
@@ -456,7 +514,7 @@ def record_durable_failure(repository, identity, record: FailureRecord, *, now: 
     try:
         _require_matching_task(connection, identity)
         _require_failure_compatibility(record)
-        if record.record_schema != "roundwright-failure-recovery/v2":
+        if record.record_schema != "roundwright-failure-recovery/v3":
             raise FailureRecoveryError("legacy failure records cannot be persisted")
         _require_attempt_admission(connection, identity, record.binding)
         current = connection.execute("SELECT task_id, record_json FROM failure_recovery_records WHERE record_digest=?", (record.digest,)).fetchone()
@@ -664,30 +722,82 @@ def read_durable_failure(repository, identity, record_digest: str) -> FailureRec
         connection.close()
 
 
-def _owner_command_receipt(connection, task_id: str, binding: FailureBinding, command_id: str) -> dict[str, str]:
-    """Rebuild the authenticated #115 receipt; a caller enum is never proof."""
-    from .review_lifecycle import _valid_owner_grant
+def _denial_authority_digest(*, kind: str, owner: str, task_id: str, repository_id: str, candidate_sha: str, candidate_seal: str, authority_scope: str, target_digest: str) -> str:
+    """Domain-separated authority digest for a dedicated denial operation."""
+    return hashlib.sha256("\x1f".join((
+        "roundwright-denial-clearance-authority/v1", kind, owner, task_id,
+        repository_id, candidate_sha, candidate_seal, authority_scope, target_digest,
+    )).encode("ascii")).hexdigest()
+
+
+def _denial_command_receipt(connection, task_id: str, record_digest: str, binding: FailureBinding, command_id: str, *, kind: str) -> dict[str, str]:
+    """Read one exact dedicated denial command and its current host proof.
+
+    This deliberately does not look at owner_command_records.  The schemas do
+    not share a foreign key, command kind, or grant table, making a generic
+    review resolution structurally incapable of reopening a denied scope.
+    """
+    if kind == "clear":
+        table, grants, expected_kind = "denial_clearance_commands", "denial_clearance_authority_grants", "clear-denial"
+    elif kind == "revoke":
+        table, grants, expected_kind = "denial_revocation_commands", "denial_revocation_authority_grants", "revoke-denial-clearance"
+    else:
+        raise FailureRecoveryError("dedicated denial command is invalid")
     row = connection.execute(
-        "SELECT commands.task_id, commands.candidate_sha, commands.command_kind, commands.owner_identity, commands.authority_grant_id, commands.command_digest, commands.scope_digest, commands.state, commands.result_digest, grants.owner_identity, grants.command_scope, grants.task_id, grants.candidate_sha, grants.authority_digest, grants.state, seals.candidate_sha FROM owner_command_records AS commands JOIN owner_authority_grants AS grants ON grants.grant_id = commands.authority_grant_id JOIN candidate_seals AS seals ON seals.task_id = commands.task_id WHERE commands.command_id = ?",
+        f"SELECT commands.task_id, commands.repository_id, commands.denial_digest, commands.authority_grant_id, "
+        f"commands.candidate_sha, commands.candidate_seal, commands.authority_scope, commands.target_digest, "
+        f"commands.command_kind, commands.command_digest, commands.host_result_digest, commands.result_digest, commands.state, "
+        f"grants.owner_identity, grants.task_id, grants.repository_id, grants.candidate_sha, grants.candidate_seal, "
+        f"grants.authority_scope, grants.target_digest, grants.authority_digest, grants.state, seals.candidate_sha, seals.state_identity, tasks.repository_id "
+        f"FROM {table} AS commands JOIN {grants} AS grants ON grants.grant_id = commands.authority_grant_id "
+        "JOIN candidate_seals AS seals ON seals.task_id = commands.task_id "
+        "JOIN tasks AS tasks ON tasks.task_id = commands.task_id WHERE commands.command_id = ?",
         (command_id,),
     ).fetchone()
     if row is None:
-        raise FailureRecoveryError("authenticated owner command is unavailable")
-    task, candidate, kind, owner, grant_id, command_digest, scope_digest, state, result_digest, *grant, sealed_candidate = row
+        raise FailureRecoveryError("dedicated denial command is unavailable")
+    (task, repository, denial, grant_id, candidate, seal, scope, target, command_kind,
+     command_digest, host_result, result_digest, state, owner, grant_task, grant_repository,
+     grant_candidate, grant_seal, grant_scope, grant_target, authority_digest, grant_state,
+     sealed_candidate, sealed_state, task_repository) = row
+    values = (task, repository, denial, grant_id, candidate, seal, scope, target, command_kind,
+              command_digest, host_result, result_digest, state, owner, grant_task, grant_repository,
+              grant_candidate, grant_seal, grant_scope, grant_target, authority_digest, grant_state,
+              sealed_candidate, sealed_state, task_repository)
     if (
-        not all(type(value) is str for value in (task, candidate, kind, owner, grant_id, command_digest, scope_digest, state, result_digest, sealed_candidate))
-        or task != task_id or candidate != binding.candidate_sha or sealed_candidate != binding.candidate_sha
-        or state != "consumed" or not _valid_owner_grant(tuple(grant), owner, kind, task_id, candidate)
-        or not _DIGEST.fullmatch("sha256:" + command_digest)
-        or not _DIGEST.fullmatch("sha256:" + result_digest)
-        or not re.fullmatch(r"^[0-9a-f]{64}$", scope_digest)
+        not all(type(value) is str for value in values)
+        or task != task_id or repository != task_repository or denial != record_digest or target != record_digest
+        or candidate != binding.candidate_sha or scope != binding.authority_scope
+        or command_kind != expected_kind or state != "consumed" or grant_state != "active"
+        or (grant_task, grant_repository, grant_candidate, grant_seal, grant_scope, grant_target) != (task, repository, candidate, seal, scope, target)
+        or (sealed_candidate, sealed_state) != (candidate, seal)
+        or owner != "ythdelmar68"
+        or not all(_DIGEST.fullmatch("sha256:" + value) for value in (command_digest, host_result, result_digest, authority_digest))
+        or authority_digest != _denial_authority_digest(kind=expected_kind, owner=owner, task_id=task, repository_id=repository, candidate_sha=candidate, candidate_seal=seal, authority_scope=scope, target_digest=target)
     ):
-        raise FailureRecoveryError("authenticated owner command has drifted")
-    return {"schema": "roundwright-owner-command-receipt/v1", "command_id": command_id, "command_digest": "sha256:" + command_digest, "result_digest": "sha256:" + result_digest, "owner_identity": owner, "authority_grant_id": grant_id, "authority_digest": "sha256:" + grant[4]}
+        raise FailureRecoveryError("dedicated denial command has drifted")
+    receipt = {
+        "schema": "roundwright-dedicated-denial-command-receipt/v1",
+        "command_id": command_id,
+        "command_kind": command_kind,
+        "denial_digest": denial,
+        "target_digest": target,
+        "repository_id": repository,
+        "candidate_sha": candidate,
+        "candidate_seal": seal,
+        "authority_scope": scope,
+        "owner_identity": owner,
+        "authority_grant_id": grant_id,
+        "authority_digest": "sha256:" + authority_digest,
+        "command_digest": "sha256:" + command_digest,
+        "verified_host_result_digest": "sha256:" + host_result,
+        "result_digest": "sha256:" + result_digest,
+    }
+    return receipt
 
 
 def _decision_history(connection, task_id: str, record_digest: str, binding: FailureBinding) -> list[tuple[str, dict[str, object]]]:
-    rows = connection.execute("SELECT decision_digest, decision_json, sequence FROM failure_recovery_clearance_decisions WHERE task_id = ? AND record_digest = ? ORDER BY sequence", (task_id, record_digest)).fetchall()
+    rows = connection.execute("SELECT decision_digest, decision_json, sequence FROM denial_clearance_decisions WHERE task_id = ? AND record_digest = ? ORDER BY sequence", (task_id, record_digest)).fetchall()
     history: list[tuple[str, dict[str, object]]] = []
     predecessor: str | None = None
     state = "stopped"
@@ -698,14 +808,14 @@ def _decision_history(connection, task_id: str, record_digest: str, binding: Fai
             payload = json.loads(encoded)
         except (TypeError, json.JSONDecodeError) as error:
             raise FailureRecoveryError("durable clearance decision is malformed") from error
-        if type(payload) is not dict or set(payload) != {"schema", "kind", "record_digest", "binding", "conditions", "host_receipt", "predecessor_digest", "sequence"}:
+        if type(payload) is not dict or set(payload) != {"schema", "kind", "record_digest", "binding", "conditions", "denial_command", "predecessor_digest", "sequence"}:
             raise FailureRecoveryError("durable clearance decision is malformed")
-        if (payload.get("schema") != "roundwright-failure-clearance-decision/v2" or payload.get("record_digest") != record_digest or payload.get("binding") != _binding_payload(binding) or payload.get("conditions") != list(_CLEARANCE_CONDITIONS) or payload.get("sequence") != sequence or payload.get("predecessor_digest") != predecessor or not _DIGEST.fullmatch(digest) or digest != "sha256:" + _digest_json(payload)):
+        if (payload.get("schema") != "roundwright-failure-clearance-decision/v3" or payload.get("record_digest") != record_digest or payload.get("binding") != _binding_payload(binding) or payload.get("conditions") != list(_CLEARANCE_CONDITIONS) or payload.get("sequence") != sequence or payload.get("predecessor_digest") != predecessor or not _DIGEST.fullmatch(digest) or digest != "sha256:" + _digest_json(payload)):
             raise FailureRecoveryError("durable clearance decision has drifted")
-        receipt = payload.get("host_receipt")
-        if type(receipt) is not dict or set(receipt) != {"schema", "command_id", "command_digest", "result_digest", "owner_identity", "authority_grant_id", "authority_digest"} or receipt != _owner_command_receipt(connection, task_id, binding, receipt["command_id"]):
-            raise FailureRecoveryError("durable clearance receipt has drifted")
+        receipt = payload.get("denial_command")
         kind = payload.get("kind")
+        if kind not in {"clear", "revoke"} or type(receipt) is not dict or receipt != _denial_command_receipt(connection, task_id, record_digest, binding, receipt.get("command_id"), kind=kind):
+            raise FailureRecoveryError("durable clearance receipt has drifted")
         if kind not in {"clear", "revoke"} or (kind == "clear" and state != "stopped") or (kind == "revoke" and state != "clear"):
             raise FailureRecoveryError("clearance decision is stale or out of order")
         state = "clear" if kind == "clear" else "stopped"
@@ -723,10 +833,12 @@ def _require_clearance_record(connection, identity, record_digest: str, binding:
         record = parse_failure_record(json.loads(original[0]))
     except (TypeError, json.JSONDecodeError) as error:
         raise FailureRecoveryError("durable clearance denial is malformed") from error
-    if record.digest != record_digest or record.binding != binding or record.action is not RecoveryAction.STOP_SCOPE or not record.clearance_required:
+    if (record.digest != record_digest or record.binding != binding or record.action is not RecoveryAction.STOP_SCOPE
+            or not record.clearance_required or record.clearance_conditions != ClearanceConditionSet()
+            or record.clearance_provenance != binding):
         raise FailureRecoveryError("durable clearance denial has drifted")
     _require_failure_compatibility(record)
-    if record.record_schema != "roundwright-failure-recovery/v2":
+    if record.record_schema != "roundwright-failure-recovery/v3":
         raise FailureRecoveryError("legacy failure records cannot be cleared")
 
 
@@ -736,14 +848,15 @@ def _append_clearance_decision(connection, identity, *, kind: str, record_digest
     prior_kind = history[-1][1]["kind"] if history else None
     if (kind == "clear" and prior_kind not in {None, "revoke"}) or (kind == "revoke" and prior_kind != "clear"):
         raise FailureRecoveryError("clearance decision is stale or out of order")
-    receipt = _owner_command_receipt(connection, identity.task_id, binding, command_id)
+    receipt = _denial_command_receipt(connection, identity.task_id, record_digest, binding, command_id, kind=kind)
     payload = _decision_payload(kind=kind, record_digest=record_digest, binding=binding, command=receipt, predecessor_digest=predecessor, sequence=len(history) + 1)
     digest = "sha256:" + _digest_json(payload)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    existing = connection.execute("SELECT task_id, record_digest, decision_json FROM failure_recovery_clearance_decisions WHERE decision_digest = ?", (digest,)).fetchone()
+    command_kind = receipt["command_kind"]
+    existing = connection.execute("SELECT task_id, record_digest, decision_json FROM denial_clearance_decisions WHERE decision_digest = ?", (digest,)).fetchone()
     expected = (identity.task_id, record_digest, encoded)
     if existing is None:
-        connection.execute("INSERT INTO failure_recovery_clearance_decisions(decision_digest, task_id, record_digest, command_id, decision_json, sequence, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (digest, identity.task_id, record_digest, command_id, encoded, len(history) + 1, observed))
+        connection.execute("INSERT INTO denial_clearance_decisions(decision_digest, task_id, record_digest, command_id, command_kind, decision_json, sequence, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (digest, identity.task_id, record_digest, command_id, command_kind, encoded, len(history) + 1, observed))
     elif existing != expected:
         raise FailureRecoveryError("durable clearance decision conflicts")
     return digest
@@ -784,7 +897,7 @@ def record_durable_clearance_revocation(repository, identity, revocation: Cleara
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
-        row = connection.execute("SELECT record_digest FROM failure_recovery_clearance_decisions WHERE task_id=? AND decision_digest=?", (identity.task_id, revocation.clearance_digest)).fetchone()
+        row = connection.execute("SELECT record_digest FROM denial_clearance_decisions WHERE task_id=? AND decision_digest=? AND command_kind='clear-denial'", (identity.task_id, revocation.clearance_digest)).fetchone()
         if row is None:
             raise FailureRecoveryError("clearance revocation clearance is unavailable")
         _require_clearance_record(connection, identity, row[0], revocation.binding)
@@ -834,7 +947,9 @@ def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceS
     if evidence not in expected.evidence_sources:
         failure = FailureClass.UNKNOWN
         expected = _FAILURE_COMPATIBILITY_MATRIX[failure]
-    return FailureRecord(binding, failure, evidence, expected.retryable, expected.action, expected.clearance_required, confidence)
+    conditions = ClearanceConditionSet() if expected.clearance_required else None
+    provenance = binding if expected.clearance_required else None
+    return FailureRecord(binding, failure, evidence, expected.retryable, expected.action, expected.clearance_required, confidence, "roundwright-failure-recovery/v3", conditions, provenance)
 
 
 def classify_for_role(role: FailureRole, binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource) -> FailureRecord:

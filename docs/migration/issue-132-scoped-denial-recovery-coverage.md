@@ -17,6 +17,7 @@ output.
 | E1R2-06 | Missing or stale authoritative durable read-back is not accepted | `provider_recovery.py` read-back gate | `test_provider_recovery.test_durable_failure_readback_revalidates_current_admission_authority` |
 | E1R2-07 | Fabricated, replayed, stale, cross-task, and revoked clearances remain closed until an exact newer decision | `failure_recovery.py` clearance ledger | `test_provider_recovery.test_durable_clearance_and_revocation_are_append_only_and_restart_verified` |
 | E1R2-08 | Duplicate, gapped, regressive, and conflicting attempt coordinates fail closed | `provider_recovery.py` coordinate ledger | `test_provider_recovery.test_supervisor_coordinates_are_unique_and_strictly_monotonic` |
+| E1R3-01 | A security denial can reopen only through a dedicated, single-use clear/revoke authority bound to the exact denial, repository/task, candidate seal, scope, target, and verified-host result; generic review-item commands are inert | `failure_recovery.py` denial ledger | `test_provider_recovery.test_durable_clearance_and_revocation_are_append_only_and_restart_verified` |
 
 This extends #112's public-safe coverage destinations with public type names,
 case identities, and record digests only.  It does not rewrite historical
@@ -25,8 +26,13 @@ receipts, publish provider output, or establish live-provider qualification.
 The durable state migration retains an idempotent canonical record per digest.
 The original denial remains immutable: an explicit verified-host clearance is a
 new decision bound to the same candidate, policy, configuration, scope, role,
-profile, session, and attempt.  Changed binding, unavailable evidence, or an
-unapproved route fails closed.
+profile, session, and attempt.  The record seals a closed, versioned clearance
+condition set and its exact provenance binding.  A separate authority and
+command namespace binds the denial digest, repository/task, current candidate
+seal, scope, target, command result, and verified-host result; the generic
+review-item command tables have no clearance read path.  Changed binding,
+unavailable evidence, replayed command, malformed provenance, or an unapproved
+route fails closed.
 
 The receipt also executes independently pinned continuation checks: restart
 continues only the next format ordinal, bounded profile/format retries exhaust

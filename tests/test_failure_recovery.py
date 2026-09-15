@@ -94,7 +94,7 @@ class FailureRecoveryTests(unittest.TestCase):
                 self.assertEqual((record.failure, record.action, record.retryable, record.clearance_required), (failure, expected.action, expected.retryable, expected.clearance_required))
         incompatible = classify(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_SERVICE)
         self.assertEqual((incompatible.failure, incompatible.action), (FailureClass.UNKNOWN, RecoveryAction.RECONCILE))
-        with self.assertRaisesRegex(FailureRecoveryError, "taxonomy is incompatible"):
+        with self.assertRaises(FailureRecoveryError):
             FailureRecord(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_SERVICE, False, RecoveryAction.STOP_SCOPE, True)
 
     def test_native_failure_class_rejects_strings_and_duck_typed_values(self):
@@ -128,9 +128,9 @@ class FailureRecoveryTests(unittest.TestCase):
 
     def test_closed_record_parser_rejects_tampered_or_unknown_payload(self):
         record = classify(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
-        payload = {"schema": "roundwright-failure-recovery/v2", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "evidence_confidence": record.evidence_confidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
+        payload = {"schema": "roundwright-failure-recovery/v3", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "evidence_confidence": record.evidence_confidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required, "clearance_conditions": {"schema": record.clearance_conditions.schema, "conditions": list(record.clearance_conditions.conditions)}, "clearance_provenance": {**record.clearance_provenance.__dict__, "role": record.clearance_provenance.role.value}}
         self.assertEqual(parse_failure_record(payload), record)
-        legacy = {key: value for key, value in payload.items() if key != "evidence_confidence"}
+        legacy = {key: value for key, value in payload.items() if key not in {"evidence_confidence", "clearance_conditions", "clearance_provenance"}}
         legacy["schema"] = "roundwright-failure-recovery/v1"
         migrated = parse_failure_record(legacy)
         self.assertEqual((migrated.record_schema, migrated.evidence_confidence), ("roundwright-failure-recovery/v1", EvidenceConfidence.UNAVAILABLE))

@@ -42,7 +42,7 @@ from roundwright.provider_recovery import (
 from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult, _owner_authority_digest
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
-from roundwright.failure_recovery import Clearance, ClearanceRevocation, EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, require_scope_open
+from roundwright.failure_recovery import Clearance, ClearanceRevocation, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, classify, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, require_scope_open
 
 
 class ProviderRecoveryTests(unittest.TestCase):
@@ -116,19 +116,34 @@ class ProviderRecoveryTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def owner_command(self, repository: RepositoryIdentity, identity: TaskIdentity, candidate: str, command_id: str) -> None:
-        """Seed one already-consumed, allowlisted #115 command receipt."""
+    def denial_command(self, repository: RepositoryIdentity, identity: TaskIdentity, record, command_id: str, *, kind: str) -> None:
+        """Seed one consumed command in the dedicated denial namespace."""
         connection = sqlite3.connect(database_path(repository))
-        grant_id = f"grant-{identity.task_id}"
+        grant_id = f"{kind}-grant-{identity.task_id}"
+        candidate = record.binding.candidate_sha
+        seal = connection.execute("SELECT state_identity FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()[0]
+        scope = record.binding.authority_scope
+        denial = record.digest
+        command_kind = "clear-denial" if kind == "clear" else "revoke-denial-clearance"
+        grants = "denial_clearance_authority_grants" if kind == "clear" else "denial_revocation_authority_grants"
+        commands = "denial_clearance_commands" if kind == "clear" else "denial_revocation_commands"
+        authority = _denial_authority_digest(kind=command_kind, owner="ythdelmar68", task_id=identity.task_id, repository_id=identity.repository_id, candidate_sha=candidate, candidate_seal=seal, authority_scope=scope, target_digest=denial)
         try:
             connection.execute(
-                "INSERT OR IGNORE INTO owner_authority_grants(grant_id, owner_identity, command_scope, task_id, candidate_sha, authority_digest, state) VALUES (?, 'ythdelmar68', 'resolve-review-item', ?, ?, ?, 'active')",
-                (grant_id, identity.task_id, candidate, _owner_authority_digest("ythdelmar68", "resolve-review-item", identity.task_id, candidate)),
+                f"INSERT OR IGNORE INTO {grants}(grant_id, owner_identity, task_id, repository_id, candidate_sha, candidate_seal, authority_scope, target_digest, authority_digest, state) VALUES (?, 'ythdelmar68', ?, ?, ?, ?, ?, ?, ?, 'active')",
+                (grant_id, identity.task_id, identity.repository_id, candidate, seal, scope, denial, authority),
             )
-            connection.execute(
-                "INSERT INTO owner_command_records(command_id, task_id, command_kind, owner_identity, authority_grant_id, target_item_id, candidate_sha, command_digest, scope_digest, idempotency_key, state, result_digest) VALUES (?, ?, 'resolve-review-item', 'ythdelmar68', ?, 'item-clearance', ?, ?, ?, ?, 'consumed', ?)",
-                (command_id, identity.task_id, grant_id, candidate, "a" * 64, "b" * 64, f"key-{command_id}", "c" * 64),
-            )
+            if kind == "clear":
+                connection.execute(
+                    f"INSERT INTO {commands}(command_id, task_id, repository_id, denial_digest, authority_grant_id, candidate_sha, candidate_seal, authority_scope, target_digest, command_kind, command_digest, host_result_digest, result_digest, idempotency_key, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'clear-denial', ?, ?, ?, ?, 'consumed')",
+                    (command_id, identity.task_id, identity.repository_id, denial, grant_id, candidate, seal, scope, denial, "a" * 64, "b" * 64, "c" * 64, f"key-{command_id}"),
+                )
+            else:
+                clearance = connection.execute("SELECT decision_digest FROM denial_clearance_decisions WHERE task_id = ? AND record_digest = ? AND command_kind = 'clear-denial' ORDER BY sequence DESC LIMIT 1", (identity.task_id, denial)).fetchone()[0]
+                connection.execute(
+                    f"INSERT INTO {commands}(command_id, task_id, repository_id, denial_digest, clearance_digest, authority_grant_id, candidate_sha, candidate_seal, authority_scope, target_digest, command_kind, command_digest, host_result_digest, result_digest, idempotency_key, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'revoke-denial-clearance', ?, ?, ?, ?, 'consumed')",
+                    (command_id, identity.task_id, identity.repository_id, denial, clearance, grant_id, candidate, seal, scope, denial, "a" * 64, "b" * 64, "c" * 64, f"key-{command_id}"),
+                )
             connection.commit()
         finally:
             connection.close()
@@ -863,14 +878,25 @@ class ProviderRecoveryTests(unittest.TestCase):
             record_session_identity(repository, identity, context, attempt_id="clearance-attempt", session_identity="clearance-session", lease=lease)
             binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "worker:" + identity.task_id, FailureRole.WORKER, context.runtime_binding.worker_profile_identity, "clearance-session", "clearance-attempt")
             record = classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST); record_durable_failure(repository, identity, record)
-            with self.assertRaisesRegex(Exception, "authenticated owner command"):
+            # A consumed generic review command has a deliberately disjoint
+            # namespace.  It cannot become a denial-clearance receipt.
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("INSERT INTO owner_authority_grants(grant_id, owner_identity, command_scope, task_id, candidate_sha, authority_digest, state) VALUES ('generic-denial-grant', 'ythdelmar68', 'resolve-review-item', ?, ?, ?, 'active')", (identity.task_id, candidate, _owner_authority_digest("ythdelmar68", "resolve-review-item", identity.task_id, candidate)))
+                connection.execute("INSERT INTO owner_command_records(command_id, task_id, command_kind, owner_identity, authority_grant_id, target_item_id, candidate_sha, command_digest, scope_digest, idempotency_key, state, result_digest) VALUES ('generic-denial-command', ?, 'resolve-review-item', 'ythdelmar68', 'generic-denial-grant', 'generic-target', ?, ?, ?, 'generic-denial-key', 'consumed', ?)", (identity.task_id, candidate, "a" * 64, "b" * 64, "c" * 64))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(Exception, "dedicated denial command"):
+                record_durable_clearance(repository, identity, Clearance(record.digest, binding, "generic-denial-command"))
+            with self.assertRaisesRegex(Exception, "dedicated denial command"):
                 record_durable_clearance(repository, identity, Clearance(record.digest, binding, "fabricated-host-proof"))
             other = self.identity("clearance-other"); self.admit(repository, other, lease)
             self.seal_candidate(repository, other, lease, candidate)
-            self.owner_command(repository, other, candidate, "owner-cross-task")
-            with self.assertRaisesRegex(Exception, "authenticated owner command"):
+            self.denial_command(repository, other, record, "owner-cross-task", kind="clear")
+            with self.assertRaisesRegex(Exception, "dedicated denial command"):
                 record_durable_clearance(repository, identity, Clearance(record.digest, binding, "owner-cross-task"))
-            self.owner_command(repository, identity, candidate, "owner-clear-1")
+            self.denial_command(repository, identity, record, "owner-clear-1", kind="clear")
             clearance = Clearance(record.digest, binding, "owner-clear-1")
             clearance_digest = record_durable_clearance(repository, identity, clearance)
             with self.assertRaisesRegex(Exception, "stale|out of order"):
@@ -880,22 +906,25 @@ class ProviderRecoveryTests(unittest.TestCase):
             finally: connection.close()
             with self.assertRaisesRegex(Exception, "denial"):
                 record_durable_clearance(repository, identity, Clearance("sha256:" + "d" * 64, binding, "owner-clear-1"))
-            self.owner_command(repository, identity, candidate, "owner-revoke-1")
+            self.denial_command(repository, identity, record, "owner-revoke-1", kind="revoke")
             revocation = ClearanceRevocation(clearance_digest, binding, "owner-revoke-1")
             revocation_digest = record_durable_clearance_revocation(repository, identity, revocation)
             connection = sqlite3.connect(database_path(repository))
             try:
                 with self.assertRaisesRegex(Exception, "stopped"): require_scope_open(connection, identity.task_id, binding.authority_scope)
             finally: connection.close()
-            self.owner_command(repository, identity, candidate, "owner-clear-2")
+            self.denial_command(repository, identity, record, "owner-clear-2", kind="clear")
             reclear_digest = record_durable_clearance(repository, identity, Clearance(record.digest, binding, "owner-clear-2"))
             connection = sqlite3.connect(database_path(repository))
             try:
                 require_scope_open(connection, identity.task_id, binding.authority_scope)
-                connection.execute("UPDATE owner_authority_grants SET authority_digest = ? WHERE grant_id = ?", ("0" * 64, f"grant-{identity.task_id}")); connection.commit()
+                grant_id = f"clear-grant-{identity.task_id}"
+                connection.execute("UPDATE denial_clearance_authority_grants SET authority_digest = ? WHERE grant_id = ?", ("0" * 64, grant_id)); connection.commit()
                 with self.assertRaisesRegex(Exception, "drifted"): require_scope_open(connection, identity.task_id, binding.authority_scope)
-                connection.execute("UPDATE owner_authority_grants SET authority_digest = ? WHERE grant_id = ?", (_owner_authority_digest("ythdelmar68", "resolve-review-item", identity.task_id, candidate), f"grant-{identity.task_id}")); connection.commit()
-                connection.execute("UPDATE failure_recovery_clearance_decisions SET decision_json = '{}' WHERE decision_digest = ?", (reclear_digest,)); connection.commit()
+                seal = connection.execute("SELECT state_identity FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()[0]
+                authority = _denial_authority_digest(kind="clear-denial", owner="ythdelmar68", task_id=identity.task_id, repository_id=identity.repository_id, candidate_sha=candidate, candidate_seal=seal, authority_scope=binding.authority_scope, target_digest=record.digest)
+                connection.execute("UPDATE denial_clearance_authority_grants SET authority_digest = ? WHERE grant_id = ?", (authority, grant_id)); connection.commit()
+                connection.execute("UPDATE denial_clearance_decisions SET decision_json = '{}' WHERE decision_digest = ?", (reclear_digest,)); connection.commit()
                 with self.assertRaisesRegex(Exception, "malformed"): require_scope_open(connection, identity.task_id, binding.authority_scope)
             finally: connection.close()
 

@@ -8,9 +8,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.failure_recovery import (
     Clearance, EvidenceConfidence, EvidenceSource, FailureBinding, FailureClass, FailureEvidence, FailureRecoveryError,
-    FailureRole, RecoveryAction, admit_recovery, classify,
+    FailureRecord, FailureRole, RecoveryAction, admit_recovery, classify,
     RecoveryRouteAdmission, issue_recovery_route_admission,
-    parse_failure_record,
+    failure_compatibility_matrix, parse_failure_record,
 )
 from roundwright.codex_worker import classify_worker_failure
 from roundwright.codex_supervisor import classify_supervisor_failure
@@ -72,7 +72,7 @@ class FailureRecoveryTests(unittest.TestCase):
     def test_missing_owner_scope_stops_and_persists_confidence_independently(self):
         record = classify(
             self.binding(), FailureClass.MISSING_OWNER_SCOPE,
-            FailureEvidence(EvidenceSource.VERIFIED_HOST, EvidenceConfidence.VERIFIED),
+            FailureEvidence(EvidenceSource.VERIFIED_LIFECYCLE, EvidenceConfidence.VERIFIED),
         )
         self.assertEqual((record.action, record.clearance_required, record.evidence_confidence), (RecoveryAction.STOP_SCOPE, True, EvidenceConfidence.VERIFIED))
         unverified = classify(
@@ -80,6 +80,21 @@ class FailureRecoveryTests(unittest.TestCase):
             FailureEvidence(EvidenceSource.VERIFIED_HOST, EvidenceConfidence.UNAVAILABLE),
         )
         self.assertEqual((unverified.failure, unverified.evidence, unverified.evidence_confidence), (FailureClass.UNKNOWN, EvidenceSource.VERIFIED_HOST, EvidenceConfidence.UNAVAILABLE))
+
+    def test_closed_matrix_allows_only_canonical_evidence_and_recovery_categories(self):
+        matrix = failure_compatibility_matrix()
+        self.assertEqual(set(matrix), set(FailureClass))
+        for failure, expected in matrix.items():
+            if failure is FailureClass.UNKNOWN:
+                continue
+            with self.subTest(failure=failure.value):
+                evidence = next(iter(expected.evidence_sources))
+                record = classify(self.binding(), failure, evidence)
+                self.assertEqual((record.failure, record.action, record.retryable, record.clearance_required), (failure, expected.action, expected.retryable, expected.clearance_required))
+        incompatible = classify(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_SERVICE)
+        self.assertEqual((incompatible.failure, incompatible.action), (FailureClass.UNKNOWN, RecoveryAction.RECONCILE))
+        with self.assertRaisesRegex(FailureRecoveryError, "taxonomy is incompatible"):
+            FailureRecord(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_SERVICE, False, RecoveryAction.STOP_SCOPE, True)
 
     def test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route(self):
         binding, route = self.live_route()
@@ -110,6 +125,12 @@ class FailureRecoveryTests(unittest.TestCase):
         legacy["schema"] = "roundwright-failure-recovery/v1"
         migrated = parse_failure_record(legacy)
         self.assertEqual((migrated.record_schema, migrated.evidence_confidence), ("roundwright-failure-recovery/v1", EvidenceConfidence.UNAVAILABLE))
+        payload["evidence"] = EvidenceSource.VERIFIED_SERVICE.value
+        with self.assertRaisesRegex(FailureRecoveryError, "malformed"):
+            parse_failure_record(payload)
+        payload["evidence"] = "future-evidence"
+        with self.assertRaisesRegex(FailureRecoveryError, "malformed"):
+            parse_failure_record(payload)
         payload["extra"] = True
         with self.assertRaises(FailureRecoveryError):
             parse_failure_record(payload)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -796,6 +797,12 @@ class ProviderRecoveryTests(unittest.TestCase):
                 self.assertEqual(read_durable_failure(repository, identity, record.digest), record)
                 connection = sqlite3.connect(database_path(repository))
                 try:
+                    canonical = connection.execute("SELECT record_json FROM failure_recovery_records WHERE record_digest = ?", (record.digest,)).fetchone()[0]
+                    tampered = json.loads(canonical); tampered["evidence"] = EvidenceSource.VERIFIED_SERVICE.value
+                    connection.execute("UPDATE failure_recovery_records SET record_json = ? WHERE record_digest = ?", (json.dumps(tampered, sort_keys=True, separators=(",", ":")), record.digest)); connection.commit()
+                    with self.assertRaisesRegex(Exception, "malformed"):
+                        read_durable_failure(repository, identity, record.digest)
+                    connection.execute("UPDATE failure_recovery_records SET record_json = ? WHERE record_digest = ?", (canonical, record.digest))
                     connection.execute(mutation); connection.commit()
                 finally:
                     connection.close()

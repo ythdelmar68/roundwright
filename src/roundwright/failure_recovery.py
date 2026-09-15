@@ -84,6 +84,58 @@ class RecoveryAction(StrEnum):
     PREBOUND_FALLBACK = "prebound-fallback"
 
 
+@dataclass(frozen=True)
+class FailureCompatibility:
+    """The closed evidence-to-recovery contract for one failure taxonomy."""
+
+    evidence_sources: frozenset[EvidenceSource]
+    action: RecoveryAction
+    retryable: bool
+    clearance_required: bool
+
+
+_ALL_EVIDENCE_SOURCES = frozenset(EvidenceSource)
+_FAILURE_COMPATIBILITY_MATRIX = {
+    FailureClass.PARTIAL_INCREMENT: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_OUTPUT}), RecoveryAction.CONTINUE_SAME_SESSION, False, False),
+    FailureClass.ORDINARY_REVIEW_HANDOFF: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_OUTPUT}), RecoveryAction.CONTINUE_SAME_SESSION, False, False),
+    FailureClass.VALIDATION_RUNNING: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_LIFECYCLE}), RecoveryAction.CONTINUE_SAME_SESSION, False, False),
+    FailureClass.NO_PROGRESS: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_OUTPUT}), RecoveryAction.CONTINUE_SAME_SESSION, False, False),
+    FailureClass.SESSION_TERMINATED: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_LIFECYCLE}), RecoveryAction.PREBOUND_FALLBACK, True, False),
+    FailureClass.MISSING_OUTPUT: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_OUTPUT}), RecoveryAction.RECONCILE, False, False),
+    FailureClass.TOPOLOGY_VIOLATION: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_TOPOLOGY}), RecoveryAction.RECONCILE, False, False),
+    FailureClass.HOST_SECURITY_DENIAL: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_HOST}), RecoveryAction.STOP_SCOPE, False, True),
+    FailureClass.TRANSIENT_SERVICE: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_SERVICE}), RecoveryAction.PREBOUND_FALLBACK, True, False),
+    FailureClass.CREDENTIAL_FAILURE: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_HOST}), RecoveryAction.RECONCILE, False, True),
+    FailureClass.MISSING_OWNER_SCOPE: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_LIFECYCLE}), RecoveryAction.STOP_SCOPE, False, True),
+    FailureClass.BUDGET_EXHAUSTED: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_SERVICE}), RecoveryAction.RECONCILE, False, True),
+    FailureClass.AMBIGUOUS_EFFECT: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_OUTPUT}), RecoveryAction.RECONCILE, False, False),
+    FailureClass.UNKNOWN: FailureCompatibility(_ALL_EVIDENCE_SOURCES, RecoveryAction.RECONCILE, False, False),
+}
+
+
+def failure_compatibility_matrix() -> dict[FailureClass, FailureCompatibility]:
+    """Return the auditable closed contract without exposing mutable state."""
+    return dict(_FAILURE_COMPATIBILITY_MATRIX)
+
+
+def _require_failure_compatibility(record: "FailureRecord") -> None:
+    """Reject any record outside the taxonomy/evidence/action cross-product."""
+    if record.record_schema == "roundwright-failure-recovery/v1":
+        # v1 did not persist confidence.  Preserve it for read-only historical
+        # scope stops, but never let it mint a new record, clearance, or route.
+        expected = _FAILURE_COMPATIBILITY_MATRIX[record.failure]
+        if (record.action, record.retryable, record.clearance_required) != (expected.action, expected.retryable, expected.clearance_required):
+            raise FailureRecoveryError("legacy failure recovery category is incompatible")
+        return
+    expected = _FAILURE_COMPATIBILITY_MATRIX.get(record.failure)
+    if expected is None or record.evidence not in expected.evidence_sources:
+        raise FailureRecoveryError("failure evidence taxonomy is incompatible")
+    if record.failure is not FailureClass.UNKNOWN and record.evidence_confidence is not EvidenceConfidence.VERIFIED:
+        raise FailureRecoveryError("authenticated failure evidence is unavailable")
+    if (record.action, record.retryable, record.clearance_required) != (expected.action, expected.retryable, expected.clearance_required):
+        raise FailureRecoveryError("failure recovery category is incompatible")
+
+
 def native_failure_class(value: object) -> tuple[FailureClass, EvidenceSource]:
     """Project one closed native error category onto recovery evidence.
 
@@ -168,6 +220,7 @@ class FailureRecord:
             raise FailureRecoveryError("security denial must stop its scope")
         if self.failure in {FailureClass.UNKNOWN, FailureClass.MISSING_OUTPUT, FailureClass.AMBIGUOUS_EFFECT} and (self.retryable or self.action is not RecoveryAction.RECONCILE):
             raise FailureRecoveryError("unverified outcome must reconcile")
+        _require_failure_compatibility(self)
 
     @property
     def digest(self) -> str:
@@ -398,6 +451,9 @@ def record_durable_failure(repository, identity, record: FailureRecord, *, now: 
     connection = _open_writable_connection(repository) if owned_connection else connection
     try:
         _require_matching_task(connection, identity)
+        _require_failure_compatibility(record)
+        if record.record_schema != "roundwright-failure-recovery/v2":
+            raise FailureRecoveryError("legacy failure records cannot be persisted")
         _require_attempt_admission(connection, identity, record.binding)
         current = connection.execute("SELECT task_id, record_json FROM failure_recovery_records WHERE record_digest=?", (record.digest,)).fetchone()
         expected = (identity.task_id, encoded)
@@ -532,6 +588,7 @@ def read_durable_failure(repository, identity, record_digest: str) -> FailureRec
         record = parse_failure_record(payload)
         if record.digest != record_digest:
             raise FailureRecoveryError("durable failure record digest has drifted")
+        _require_failure_compatibility(record)
         _require_attempt_admission(connection, identity, record.binding)
         connection.execute("COMMIT")
         return record
@@ -603,6 +660,9 @@ def _require_clearance_record(connection, identity, record_digest: str, binding:
         raise FailureRecoveryError("durable clearance denial is malformed") from error
     if record.digest != record_digest or record.binding != binding or record.action is not RecoveryAction.STOP_SCOPE or not record.clearance_required:
         raise FailureRecoveryError("durable clearance denial has drifted")
+    _require_failure_compatibility(record)
+    if record.record_schema != "roundwright-failure-recovery/v2":
+        raise FailureRecoveryError("legacy failure records cannot be cleared")
 
 
 def _append_clearance_decision(connection, identity, *, kind: str, record_digest: str, binding: FailureBinding, command_id: str, observed: int) -> str:
@@ -684,6 +744,7 @@ def require_scope_open(connection, task_id: str, scope: str) -> None:
             raise FailureRecoveryError("durable failure record is malformed") from error
         if record.digest != digest:
             raise FailureRecoveryError("durable failure record digest has drifted")
+        _require_failure_compatibility(record)
         if record.action is not RecoveryAction.STOP_SCOPE or record.binding.authority_scope != scope:
             continue
         history = _decision_history(connection, task_id, digest, record.binding)
@@ -692,7 +753,7 @@ def require_scope_open(connection, task_id: str, scope: str) -> None:
 
 
 def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource | FailureEvidence) -> FailureRecord:
-    """Map one typed observation to the only permitted recovery action."""
+    """Project observations onto the only matrix-approved durable decision."""
     if type(evidence) is FailureEvidence:
         confidence = evidence.confidence
         evidence = evidence.source
@@ -700,25 +761,15 @@ def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceS
         confidence = EvidenceConfidence.UNAVAILABLE if evidence in {EvidenceSource.MODEL_SELF_REPORT, EvidenceSource.UNAVAILABLE} else EvidenceConfidence.VERIFIED
     if type(binding) is not FailureBinding or type(failure) is not FailureClass or type(evidence) is not EvidenceSource:
         raise FailureRecoveryError("failure classification inputs are invalid")
-    # Provider prose and unavailable telemetry never establish capacity, death,
-    # denial, or an eligible retry.
+    # Provider prose, unavailable telemetry, and incompatible authenticated
+    # observations never establish capacity, denial, or an eligible retry.
     if confidence is not EvidenceConfidence.VERIFIED or evidence in {EvidenceSource.MODEL_SELF_REPORT, EvidenceSource.UNAVAILABLE}:
         failure = FailureClass.UNKNOWN
-    if failure is FailureClass.HOST_SECURITY_DENIAL:
-        return FailureRecord(binding, failure, evidence, False, RecoveryAction.STOP_SCOPE, True, confidence)
-    if failure is FailureClass.MISSING_OWNER_SCOPE:
-        return FailureRecord(binding, failure, evidence, False, RecoveryAction.STOP_SCOPE, True, confidence)
-    if failure in {FailureClass.UNKNOWN, FailureClass.MISSING_OUTPUT, FailureClass.AMBIGUOUS_EFFECT, FailureClass.TOPOLOGY_VIOLATION, FailureClass.CREDENTIAL_FAILURE, FailureClass.BUDGET_EXHAUSTED}:
-        return FailureRecord(binding, failure, evidence, False, RecoveryAction.RECONCILE, failure in {FailureClass.CREDENTIAL_FAILURE, FailureClass.BUDGET_EXHAUSTED}, confidence)
-    if failure in {FailureClass.PARTIAL_INCREMENT, FailureClass.ORDINARY_REVIEW_HANDOFF, FailureClass.VALIDATION_RUNNING, FailureClass.NO_PROGRESS}:
-        return FailureRecord(binding, failure, evidence, False, RecoveryAction.CONTINUE_SAME_SESSION, False, confidence)
-    if failure is FailureClass.SESSION_TERMINATED:
-        if evidence is not EvidenceSource.VERIFIED_LIFECYCLE:
-            return FailureRecord(binding, FailureClass.UNKNOWN, evidence, False, RecoveryAction.RECONCILE, False, confidence)
-        return FailureRecord(binding, failure, evidence, True, RecoveryAction.PREBOUND_FALLBACK, False, confidence)
-    if failure is FailureClass.TRANSIENT_SERVICE and evidence is EvidenceSource.VERIFIED_SERVICE:
-        return FailureRecord(binding, failure, evidence, True, RecoveryAction.PREBOUND_FALLBACK, False, confidence)
-    return FailureRecord(binding, FailureClass.UNKNOWN, evidence, False, RecoveryAction.RECONCILE, False, confidence)
+    expected = _FAILURE_COMPATIBILITY_MATRIX[failure]
+    if evidence not in expected.evidence_sources:
+        failure = FailureClass.UNKNOWN
+        expected = _FAILURE_COMPATIBILITY_MATRIX[failure]
+    return FailureRecord(binding, failure, evidence, expected.retryable, expected.action, expected.clearance_required, confidence)
 
 
 def classify_for_role(role: FailureRole, binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource) -> FailureRecord:
@@ -732,6 +783,9 @@ def admit_recovery(record: FailureRecord, current: FailureBinding, *, route: Rec
     """Recheck immutable context before a retry; denial survives restarts."""
     if type(record) is not FailureRecord or type(current) is not FailureBinding or record.binding != current or type(route) is not RecoveryRouteAdmission or route.binding != current:
         raise FailureRecoveryError("recovery context has drifted")
+    _require_failure_compatibility(record)
+    if record.record_schema != "roundwright-failure-recovery/v2":
+        raise FailureRecoveryError("legacy failure record cannot admit a recovery route")
     _require_live_recovery_route(route, current)
     if record.clearance_required:
         # Durable scope admission is the only clearance authority.  A caller

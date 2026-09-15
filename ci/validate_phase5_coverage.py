@@ -160,7 +160,7 @@ SEMANTIC_CONTRACTS = {
         "SANDBOX_OR_APPROVAL_DENIED",
     ),
     "src/roundwright/codex_dependency_review.py": (
-        "def classify_dependency_review_failure",
+        "record_durable_failure(",
         "DependencyReviewResultKind.BLOCKED",
     ),
     "tests/test_failure_recovery.py": (

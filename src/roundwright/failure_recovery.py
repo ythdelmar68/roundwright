@@ -294,7 +294,8 @@ class ClearanceRevocation:
 
 
 _ROUTE_ADMISSION_SEAL = object()
-_ROUTE_AUTHORITIES: "weakref.WeakKeyDictionary[RecoveryRouteAdmission, tuple[object, object, object]]" = weakref.WeakKeyDictionary()
+_ROUTE_AUTHORITIES: "weakref.WeakKeyDictionary[RecoveryRouteAdmission, tuple[object, object]]" = weakref.WeakKeyDictionary()
+_CONSUMED_RECOVERY_ROUTES: "weakref.WeakKeyDictionary[RecoveryRouteAdmission, object]" = weakref.WeakKeyDictionary()
 
 
 @dataclass(frozen=True)
@@ -310,7 +311,6 @@ class RecoveryRouteAdmission:
     source_capability_digest: str
     target_capability_digest: str
     target_identity: str
-    reservation_identity: str
     _seal: object | None = None
 
     def __post_init__(self) -> None:
@@ -319,7 +319,7 @@ class RecoveryRouteAdmission:
             or type(self.binding) is not FailureBinding
             or any(type(value) is not str or not _DIGEST.fullmatch(value) for value in (
                 self.source_capability_digest, self.target_capability_digest,
-                self.target_identity, self.reservation_identity,
+                self.target_identity,
             ))
         ):
             raise FailureRecoveryError("recovery route admission is invalid")
@@ -327,9 +327,8 @@ class RecoveryRouteAdmission:
 
 def issue_recovery_route_admission(
     binding: FailureBinding, *, source_execution: object, target_execution: object,
-    target_reservation: object,
 ) -> RecoveryRouteAdmission:
-    """Issue one route only from live #136 authority plus a reserved target.
+    """Issue one sealed route before reserving any target effect.
 
     The caller cannot supply a digest, target identity, or budget claim.  Each
     is derived from sealed execution capsules and revalidated before every
@@ -337,18 +336,17 @@ def issue_recovery_route_admission(
     """
 
     from .role_capability_policy import (
-        AdvisoryRole, SealedRoleExecution, TrustedRoleEffectReservation,
+        AdvisoryRole, SealedRoleExecution,
     )
 
     if (
         type(binding) is not FailureBinding
         or type(source_execution) is not SealedRoleExecution
         or type(target_execution) is not SealedRoleExecution
-        or type(target_reservation) is not TrustedRoleEffectReservation
     ):
         raise FailureRecoveryError("recovery route authority is unavailable")
     source = source_execution.execution_binding
-    target = target_reservation.require_recovery_route(target_execution)
+    target = target_execution.execution_binding
     expected_role = AdvisoryRole(binding.role.value)
     task_scope = f"{binding.role.value}:{source.task_identity}"
     if (
@@ -359,7 +357,6 @@ def issue_recovery_route_admission(
         or target.candidate_sha != binding.candidate_sha
         or source.task_identity != target.task_identity
         or binding.authority_scope != task_scope
-        or target_reservation.execution_binding.digest != target.digest
     ):
         raise FailureRecoveryError("recovery route authority has drifted")
     source_receipt = source_execution.require_before_effect(expected_execution=source)
@@ -367,31 +364,36 @@ def issue_recovery_route_admission(
     route = RecoveryRouteAdmission(
         binding,
         "sha256:" + _digest_json({"execution": source.digest, "admission": source_receipt}),
-        "sha256:" + _digest_json({"execution": target.digest, "admission": target_receipt}),
-        target.digest,
-        "sha256:" + _digest_json({"reservation": target_reservation.execution_binding.digest}),
+        "sha256:" + _digest_json({"execution": target.digest, "admission": target_receipt}), target.digest,
         _seal=_ROUTE_ADMISSION_SEAL,
     )
-    _ROUTE_AUTHORITIES[route] = (source_execution, target_execution, target_reservation)
+    _ROUTE_AUTHORITIES[route] = (source_execution, target_execution)
     return route
 
 
-def _require_live_recovery_route(route: RecoveryRouteAdmission, current: FailureBinding) -> None:
+def consume_recovery_route_admission(route: RecoveryRouteAdmission, current: FailureBinding, *, target_reservation: object) -> None:
+    """Consume one sealed route with one already-reserved exact target effect."""
+    from .role_capability_policy import TrustedRoleEffectReservation
     try:
-        source_execution, target_execution, target_reservation = _ROUTE_AUTHORITIES[route]
+        source_execution, target_execution = _ROUTE_AUTHORITIES[route]
     except (KeyError, TypeError) as error:
         raise FailureRecoveryError("recovery route authority is unavailable") from error
-    refreshed = issue_recovery_route_admission(
-        current, source_execution=source_execution, target_execution=target_execution,
-        target_reservation=target_reservation,
-    )
+    if type(target_reservation) is not TrustedRoleEffectReservation or route in _CONSUMED_RECOVERY_ROUTES:
+        raise FailureRecoveryError("recovery route authority is unavailable")
+    refreshed = issue_recovery_route_admission(current, source_execution=source_execution, target_execution=target_execution)
     if (
         refreshed.source_capability_digest != route.source_capability_digest
         or refreshed.target_capability_digest != route.target_capability_digest
         or refreshed.target_identity != route.target_identity
-        or refreshed.reservation_identity != route.reservation_identity
     ):
         raise FailureRecoveryError("recovery route authority has drifted")
+    try:
+        target = target_reservation.require_recovery_route(target_execution)
+    except Exception as error:
+        raise FailureRecoveryError("recovery route reservation is unavailable") from error
+    if target.digest != route.target_identity:
+        raise FailureRecoveryError("recovery route reservation has drifted")
+    _CONSUMED_RECOVERY_ROUTES[route] = target_reservation
 
 
 @dataclass(frozen=True)
@@ -959,19 +961,19 @@ def classify_for_role(role: FailureRole, binding: FailureBinding, failure: Failu
     return classify(binding, failure, evidence)
 
 
-def admit_recovery(record: FailureRecord, current: FailureBinding, *, route: RecoveryRouteAdmission, clearance: Clearance | None = None) -> RecoveryAction:
+def admit_recovery(record: FailureRecord, current: FailureBinding, *, route: RecoveryRouteAdmission, target_reservation: object | None = None, clearance: Clearance | None = None) -> RecoveryAction:
     """Recheck immutable context before a retry; denial survives restarts."""
     if type(record) is not FailureRecord or type(current) is not FailureBinding or record.binding != current or type(route) is not RecoveryRouteAdmission or route.binding != current:
         raise FailureRecoveryError("recovery context has drifted")
     _require_failure_compatibility(record)
     if record.record_schema != "roundwright-failure-recovery/v2":
         raise FailureRecoveryError("legacy failure record cannot admit a recovery route")
-    _require_live_recovery_route(route, current)
     if record.clearance_required:
         # Durable scope admission is the only clearance authority.  A caller
         # cannot construct a host enum (or a ``Clearance`` request) and bypass
         # the authenticated, sequenced receipt checked at dispatch.
         return RecoveryAction.STOP_SCOPE
     if record.action is RecoveryAction.PREBOUND_FALLBACK:
+        consume_recovery_route_admission(route, current, target_reservation=target_reservation)
         return RecoveryAction.PREBOUND_FALLBACK if record.retryable else RecoveryAction.RECONCILE
     return record.action

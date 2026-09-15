@@ -48,11 +48,10 @@ class FailureRecoveryTests(unittest.TestCase):
         )
         return binding, issue_recovery_route_admission(
             binding, source_execution=execution, target_execution=execution,
-            target_reservation=reservation,
-        )
+        ), reservation
 
     def test_denial_blocks_same_scope_across_restart_until_exact_clearance(self):
-        binding, route = self.live_route(FailureRole.SUPERVISOR)
+        binding, route, _reservation = self.live_route(FailureRole.SUPERVISOR)
         record = classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
         self.assertEqual(admit_recovery(record, binding, route=route), RecoveryAction.STOP_SCOPE)
         self.assertEqual(admit_recovery(record, binding, route=route, clearance=Clearance(record.digest, binding, "command-1")), RecoveryAction.STOP_SCOPE)
@@ -106,11 +105,12 @@ class FailureRecoveryTests(unittest.TestCase):
                 self.assertEqual(native_failure_class(value), (FailureClass.UNKNOWN, EvidenceSource.UNAVAILABLE))
 
     def test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route(self):
-        binding, route = self.live_route()
+        binding, route, reservation = self.live_route()
         ended = classify(binding, FailureClass.SESSION_TERMINATED, EvidenceSource.VERIFIED_LIFECYCLE)
         transient = classify(binding, FailureClass.TRANSIENT_SERVICE, EvidenceSource.VERIFIED_SERVICE)
-        self.assertEqual(admit_recovery(ended, binding, route=route), RecoveryAction.PREBOUND_FALLBACK)
-        self.assertEqual(admit_recovery(transient, binding, route=route), RecoveryAction.PREBOUND_FALLBACK)
+        self.assertEqual(admit_recovery(ended, binding, route=route, target_reservation=reservation), RecoveryAction.PREBOUND_FALLBACK)
+        with self.assertRaises(FailureRecoveryError):
+            admit_recovery(transient, binding, route=route, target_reservation=reservation)
 
     def test_route_admission_cannot_be_caller_constructed(self):
         binding = self.binding()

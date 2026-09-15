@@ -48,7 +48,7 @@
     "destinations": ["scoped-denial-classification", "bounded-recovery-eligibility", "public-safe-recovery-qualification"],
     "artifacts": [
       {"identity":"failure-recovery-contract-v1","path":"src/roundwright/failure_recovery.py","sha256":"3f09798f87b874a0b6b32d807890ccf8c822264bf187e785f82329e47f7d2cd0"},
-      {"identity":"failure-recovery-provider-runtime-v1","path":"src/roundwright/provider_recovery.py","sha256":"b8afd27af158c282c7fe05b0f52506b83dc67297401f8a100bc7c8cad9e223d9"},
+      {"identity":"failure-recovery-provider-runtime-v1","path":"src/roundwright/provider_recovery.py","sha256":"bedf91531c45163cfbc4279dfbbad983e8d2cfe5f803105ea2edf630c6d4c85d"},
       {"identity":"failure-recovery-tests-v1","path":"tests/test_failure_recovery.py","sha256":"2fe48544727835c113dd15874e7c602e448a4504ea5cfbdb02b4d6aeead9817f"},
       {"identity":"failure-recovery-migration-v1","path":"docs/migration/issue-132-scoped-denial-recovery-coverage.md","sha256":"72b8df6029cb8a46d054f0b53b476b9afcf11c1a1083a868afc0f77c86e95805"},
       {"identity":"failure-recovery-state-v1","path":"src/roundwright/state.py","sha256":"c07edb579f071660048280e4986400a1ad15ca1e6a4de3de9e6e7e5441327094"},

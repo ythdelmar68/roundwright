@@ -163,6 +163,21 @@ def _payload(record: FailureRecord) -> dict[str, object]:
     return {"schema": "roundwright-failure-recovery/v1", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
 
 
+def parse_failure_record(value: object) -> FailureRecord:
+    if type(value) is not dict or set(value) != {"schema", "binding", "failure", "evidence", "retryable", "action", "clearance_required"} or value.get("schema") != "roundwright-failure-recovery/v1" or type(value.get("binding")) is not dict:
+        raise FailureRecoveryError("durable failure record is malformed")
+    binding = value["binding"]
+    if set(binding) != {"candidate_sha", "policy_digest", "configuration_digest", "authority_scope", "role", "profile_identity", "session_identity", "attempt_identity"}:
+        raise FailureRecoveryError("durable failure record is malformed")
+    try:
+        record = FailureRecord(FailureBinding(binding["candidate_sha"], binding["policy_digest"], binding["configuration_digest"], binding["authority_scope"], FailureRole(binding["role"]), binding["profile_identity"], binding["session_identity"], binding["attempt_identity"]), FailureClass(value["failure"]), EvidenceSource(value["evidence"]), value["retryable"], RecoveryAction(value["action"]), value["clearance_required"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise FailureRecoveryError("durable failure record is malformed") from error
+    if _payload(record) != value:
+        raise FailureRecoveryError("durable failure record is non-canonical")
+    return record
+
+
 def record_durable_failure(repository, identity, record: FailureRecord, *, now: int | None = None, connection=None) -> str:
     """Append an idempotent public-safe failure record to the product ledger."""
     from .state import _open_writable_connection, _require_matching_task
@@ -194,7 +209,7 @@ def record_durable_failure(repository, identity, record: FailureRecord, *, now: 
     return record.digest
 
 
-def read_durable_failure(repository, identity, record_digest: str) -> dict[str, object]:
+def read_durable_failure(repository, identity, record_digest: str) -> FailureRecord:
     """Return the closed record only when it remains task-bound and canonical."""
     from .state import _open_writable_connection, _require_matching_task
     connection = _open_writable_connection(repository)
@@ -209,9 +224,10 @@ def read_durable_failure(repository, identity, record_digest: str) -> dict[str, 
         payload = json.loads(row[0])
     except (TypeError, json.JSONDecodeError) as error:
         raise FailureRecoveryError("durable failure record is malformed") from error
-    if type(payload) is not dict or payload.get("schema") != "roundwright-failure-recovery/v1":
-        raise FailureRecoveryError("durable failure record is malformed")
-    return payload
+    record = parse_failure_record(payload)
+    if record.digest != record_digest:
+        raise FailureRecoveryError("durable failure record digest has drifted")
+    return record
 
 
 def require_scope_open(connection, task_id: str, scope: str) -> None:

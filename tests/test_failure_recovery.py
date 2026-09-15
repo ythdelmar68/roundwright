@@ -9,6 +9,7 @@ from roundwright.failure_recovery import (
     Clearance, EvidenceSource, FailureBinding, FailureClass, FailureRecoveryError,
     FailureRole, RecoveryAction, admit_recovery, classify,
     RecoveryRouteAdmission,
+    parse_failure_record,
 )
 from roundwright.codex_worker import classify_worker_failure
 from roundwright.codex_supervisor import classify_supervisor_failure
@@ -49,3 +50,11 @@ class FailureRecoveryTests(unittest.TestCase):
             self.assertEqual(seam(self.binding(role=role), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST).action, RecoveryAction.STOP_SCOPE)
         with self.assertRaises(FailureRecoveryError):
             classify_supervisor_failure(self.binding(), FailureClass.TRANSIENT_SERVICE, EvidenceSource.VERIFIED_SERVICE)
+
+    def test_closed_record_parser_rejects_tampered_or_unknown_payload(self):
+        record = classify(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
+        payload = {"schema": "roundwright-failure-recovery/v1", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
+        self.assertEqual(parse_failure_record(payload), record)
+        payload["extra"] = True
+        with self.assertRaises(FailureRecoveryError):
+            parse_failure_record(payload)

@@ -525,9 +525,16 @@ class DurableDiffReviewRunner:
             route = None
             if position:
                 # A successor is not merely an ordered list item.  It must be
-                # authorized from the exact terminal source before it can
-                # reserve budget, claim a dispatch, or open a provider session.
-                route = self._authorize_terminal_successor(entries[position - 1], entry)
+                # be authorized from the exact *terminal* source before it
+                # can reserve budget, claim a dispatch, or open a provider
+                # session.  Same-profile format corrections are separately
+                # bounded durable accounting transitions, not fallbacks.
+                terminal = read_supervisor_terminal_failure(
+                    self.repository, self.identity,
+                    entries[position - 1].selection.provider_attempt_id,
+                )
+                if terminal is not None:
+                    route = self._authorize_terminal_successor(entries[position - 1], entry)
             attempt_id, accepted = self._execute_selection(entry, recovery_route=route)
             attempt_ids.append(attempt_id)
             if accepted:

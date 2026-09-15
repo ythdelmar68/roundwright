@@ -140,6 +140,7 @@ class SupervisorTests(unittest.TestCase):
 
     def dispatch_ordered(self, requests, adapters, **kwargs):
         ledger_path = self.next_budget_path()
+        kwargs.setdefault("authorize_fallback", lambda _source, _result, _target: None)
         return dispatch_ordered_supervisor_attempts(
             requests, adapters, self.admissions(adapters, requests),
             self.execution_hosts(adapters),

@@ -409,7 +409,7 @@ class SupervisorFailoverResult:
     exhausted: bool
 
 
-def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None) -> SupervisorFailoverResult:
+def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None, authorize_fallback: Callable[[CodexSupervisorRequest, CodexSupervisorResult, CodexSupervisorRequest], None] | None = None) -> SupervisorFailoverResult:
     """Run a bounded configured sequence without retrying uncertain outcomes.
 
     Only a typed format-invalid result may advance.  A typed ``BLOCKED`` is a
@@ -417,7 +417,7 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     another profile from a local enum would create a second effect without a
     separately admitted recovery route.
     """
-    if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(budget_ledger_paths) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or len(execution_hosts) != len(budget_ledger_paths) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or any(not isinstance(item, Path) for item in budget_ledger_paths) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)):
+    if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(budget_ledger_paths) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or len(execution_hosts) != len(budget_ledger_paths) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or any(not isinstance(item, Path) for item in budget_ledger_paths) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)) or (authorize_fallback is not None and not callable(authorize_fallback)):
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
     attempted: list[str] = []
     first = requests[0].context
@@ -448,6 +448,10 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
             return SupervisorFailoverResult(result, tuple(attempted), False)
         if result.kind is not SupervisorResultKind.INVALID:
             return SupervisorFailoverResult(result, tuple(attempted), False)
+        if ordinal < len(requests):
+            if authorize_fallback is None:
+                return SupervisorFailoverResult(result, tuple(attempted), False)
+            authorize_fallback(request, result, requests[ordinal])
         if expected_physical == 2:
             expected_logical += 1
             expected_physical = 0

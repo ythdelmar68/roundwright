@@ -181,3 +181,30 @@ class Phase5CoverageTests(unittest.TestCase):
             self.semantic.write_text(json.dumps({**payload, "receipt_digest": "sha256:" + coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
             with self.subTest(payload=payload), self.assertRaisesRegex(coverage.CoverageError, "stale or forged"):
                 coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
+
+    def test_issue_132_semantic_inventory_is_independently_pinned_and_ordered(self) -> None:
+        required = (
+            "tests.test_failure_recovery.FailureRecoveryTests.test_denial_blocks_same_scope_across_restart_until_exact_clearance",
+            "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
+            "tests.test_codex_supervisor.SupervisorTests.test_ambiguous_and_incomplete_results_stop_before_fallback",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_later_accounting_request_reads_prior_invalid_recovery_without_disclosure",
+        )
+        self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
+        self.assertEqual(tuple(test for test in coverage._SEMANTIC_TESTS if test in required), required)
+
+    def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:
+        required = coverage.ISSUE_132_SEMANTIC_TESTS
+        variants = (
+            tuple(test for test in coverage._SEMANTIC_TESTS if test != required[-1]),
+            (*coverage._SEMANTIC_TESTS[:3], required[4], required[3], *coverage._SEMANTIC_TESTS[5:]),
+        )
+        candidate = coverage.current_candidate()
+        payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": list(coverage._SEMANTIC_TESTS), "status": "passed"}
+        self.semantic.write_text(json.dumps({**payload, "receipt_digest": "sha256:" + coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
+        for semantic_tests in variants:
+            with self.subTest(semantic_tests=semantic_tests), patch.object(coverage, "_SEMANTIC_TESTS", semantic_tests), self.assertRaisesRegex(coverage.CoverageError, "Issue 132 semantic test inventory"):
+                coverage._semantic_execution(self.semantic, candidate)

@@ -34,6 +34,7 @@ from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
+from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
 from tests.role_admission_fixture import independent_execution, sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
@@ -314,6 +315,17 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
             )
             self.assertEqual((result.kind, result.reason_code, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn", 0))
+
+    def test_restart_scope_denial_blocks_before_dependency_provider_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = TaskIdentity("task-116", "source-116", "repo-116", "codex/116", "C:/review-116", "a" * 40)
+            record_durable_failure(repository, identity, classify(FailureBinding(subset.candidate_sha, subset.policy_digest, subset.configuration_digest, "dependency-review:" + subset.task_id, FailureRole.DEPENDENCY_REVIEW, binding.profile_identity, "prior-session", "prior-attempt"), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            with self.assertRaisesRegex(Exception, "scope is stopped"):
+                DependencyReviewStore().start_attempt(repository, subset, attempt_id="changed-attempt", binding=binding)
+            self.assertEqual(backend.sessions, [])
 
     def test_digit_leading_native_ids_persist_the_exact_durable_turn_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

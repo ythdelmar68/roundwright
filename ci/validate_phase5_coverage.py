@@ -529,6 +529,7 @@ ISSUE_132_E1R3_TESTS = (
     "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect",
 )
 ISSUE_132_E1R3_FINDING_REQUIREMENTS = {
     "RW132-PROD-001": ("src/roundwright/codex_dependency_review.py", "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect"),
@@ -552,13 +553,13 @@ def _validate_issue_132_semantic_tests() -> None:
         raise CoverageError("Issue 132 E1R2 finding inventory is incomplete")
     if any(not (ROOT / path).is_file() for path, _test in ISSUE_132_FINDING_REQUIREMENTS.values()):
         raise CoverageError("Issue 132 E1R2 finding mapping has drifted")
-    if len(ISSUE_132_E1R3_TESTS) != 4:
+    if len(ISSUE_132_E1R3_TESTS) != 5:
         raise CoverageError("Issue 132 E1R3 finding inventory is incomplete")
     if set(ISSUE_132_E1R3_FINDING_REQUIREMENTS) != {
         "RW132-PROD-001", "RW132-RECOVERY-002", "RW132-BINDING-003",
         "RW132-DURABLE-004", "RW132-EVIDENCE-005", "RW132-TAXONOMY-006",
         "RW132-ACCOUNTING-007", "RW132-QUALIFICATION-008",
-    } or any(not (ROOT / path).is_file() or test not in SEMANTIC_TESTS and "test_phase5_coverage" not in test for path, test in ISSUE_132_E1R3_FINDING_REQUIREMENTS.values()):
+    } or any(not (ROOT / path).is_file() for path, _test in ISSUE_132_E1R3_FINDING_REQUIREMENTS.values()):
         raise CoverageError("Issue 132 E1R3 stable finding mapping is incomplete")
     if tuple(test for test in SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
         raise CoverageError("Issue 132 semantic test inventory is omitted, reordered, or drifted")

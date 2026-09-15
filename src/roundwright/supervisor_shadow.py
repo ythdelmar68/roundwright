@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import os
+import sqlite3
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -16,7 +17,7 @@ from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowP
 from .configuration import FileReviewAuthorityStore, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityEvidenceReceipt, ReviewAuthorityExpectation, ReviewPolicy
 from .runtime_binding import ExternalSupervisorRuntimeStore, FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBinding, SupervisorRuntimeBindingReceipt
 from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation
-from .state import TaskIdentity, require_runtime_binding
+from .state import TaskIdentity, database_path, require_runtime_binding
 from .provider_recovery import RecoveryContext
 from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, classify_for_role, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
 
@@ -36,6 +37,58 @@ def _hash(value: object) -> str: return "sha256:" + hashlib.sha256(json.dumps(va
 def _token(value: object) -> bool: return type(value) is str and bool(_TOKEN.fullmatch(value))
 def _digest(value: object) -> bool: return type(value) is str and bool(_DIGEST.fullmatch(value))
 def _reparse(value: Path) -> bool: return value.is_symlink() or bool(getattr(value, "is_junction", lambda: False)())
+
+
+def _require_durable_sequence_admission(repository: RepositoryIdentity, identity: TaskIdentity, requests: tuple[CodexSupervisorRequest, ...], policy: "ResolvedSupervisorSequencePolicy") -> None:
+    """Re-read the candidate seal and every target checkpoint before a turn.
+
+    A sequence binding contains public-safe digests, not authority to reuse
+    them.  This read-only check connects those digests to the task's current
+    candidate seal and the prepared provider rows that will later receive
+    route authorization.
+    """
+
+    path = database_path(repository)
+    if not path.exists():
+        raise SupervisorShadowError("Supervisor durable candidate admission is unavailable")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise SupervisorShadowError("Supervisor durable candidate admission is unavailable") from error
+    try:
+        seal = connection.execute(
+            "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id=?",
+            (identity.task_id,),
+        ).fetchone()
+        if (type(seal) is not tuple or len(seal) != 3
+                or seal[:2] != (identity.base_sha, requests[0].context.candidate_sha)
+                or type(seal[2]) is not str or not seal[2]):
+            raise SupervisorShadowError("Supervisor durable candidate admission has drifted")
+        candidate_fingerprint = hashlib.sha256(requests[0].context.candidate_sha.encode()).hexdigest()
+        policy_fingerprint = requests[0].context.policy_digest.removeprefix("sha256:")
+        for request in requests:
+            row = connection.execute(
+                "SELECT attempts.task_id, attempts.provider_role, attempts.state, attempts.selected_profile_identity, "
+                "attempts.logical_profile_position, attempts.physical_format_output_ordinal, "
+                "contexts.candidate_fingerprint, contexts.policy_fingerprint, contexts.configuration_digest "
+                "FROM provider_attempts AS attempts JOIN provider_attempt_contexts AS contexts "
+                "ON contexts.attempt_id=attempts.attempt_id WHERE attempts.attempt_id=?",
+                (request.provider_attempt_id,),
+            ).fetchone()
+            expected = (
+                identity.task_id, FailureRole.SUPERVISOR.value, "prepared",
+                request.selected_profile_identity, request.within_round_attempt,
+                request.physical_format_output_ordinal, candidate_fingerprint,
+                policy_fingerprint, policy.configuration_digest,
+            )
+            if row != expected:
+                raise SupervisorShadowError("Supervisor durable attempt admission has drifted")
+    except SupervisorShadowError:
+        raise
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise SupervisorShadowError("Supervisor durable candidate admission is unavailable") from error
+    finally:
+        connection.close()
 
 
 @dataclass(frozen=True)
@@ -733,6 +786,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         raise SupervisorShadowError("Supervisor sequence context has drifted")
     try:
         require_runtime_binding(repository, task_identity, resolved_policy.runtime)
+        _require_durable_sequence_admission(repository, task_identity, requests, resolved_policy)
     except Exception as error:
         raise SupervisorShadowError("Supervisor durable candidate admission is unavailable") from error
     if type(runtime_store) not in (FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore) or not callable(getattr(runtime_store, "persist", None)) or not callable(getattr(runtime_store, "read", None)):

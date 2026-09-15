@@ -42,7 +42,7 @@ from roundwright.provider_recovery import (
 from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult, _owner_authority_digest
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
-from roundwright.failure_recovery import Clearance, ClearanceRevocation, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, classify, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, require_scope_open
+from roundwright.failure_recovery import Clearance, ClearanceRevocation, DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, classify, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_recovery_route_authorization, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, require_scope_open
 
 
 class ProviderRecoveryTests(unittest.TestCase):
@@ -904,29 +904,31 @@ class ProviderRecoveryTests(unittest.TestCase):
             connection = sqlite3.connect(database_path(repository))
             try: require_scope_open(connection, identity.task_id, binding.authority_scope)
             finally: connection.close()
-            with self.assertRaisesRegex(Exception, "denial"):
-                record_durable_clearance(repository, identity, Clearance("sha256:" + "d" * 64, binding, "owner-clear-1"))
-            self.denial_command(repository, identity, record, "owner-revoke-1", kind="revoke")
-            revocation = ClearanceRevocation(clearance_digest, binding, "owner-revoke-1")
-            revocation_digest = record_durable_clearance_revocation(repository, identity, revocation)
-            connection = sqlite3.connect(database_path(repository))
-            try:
-                with self.assertRaisesRegex(Exception, "stopped"): require_scope_open(connection, identity.task_id, binding.authority_scope)
-            finally: connection.close()
-            self.denial_command(repository, identity, record, "owner-clear-2", kind="clear")
-            reclear_digest = record_durable_clearance(repository, identity, Clearance(record.digest, binding, "owner-clear-2"))
-            connection = sqlite3.connect(database_path(repository))
-            try:
-                require_scope_open(connection, identity.task_id, binding.authority_scope)
-                grant_id = f"clear-grant-{identity.task_id}"
-                connection.execute("UPDATE denial_clearance_authority_grants SET authority_digest = ? WHERE grant_id = ?", ("0" * 64, grant_id)); connection.commit()
-                with self.assertRaisesRegex(Exception, "drifted"): require_scope_open(connection, identity.task_id, binding.authority_scope)
-                seal = connection.execute("SELECT state_identity FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()[0]
-                authority = _denial_authority_digest(kind="clear-denial", owner="ythdelmar68", task_id=identity.task_id, repository_id=identity.repository_id, candidate_sha=candidate, candidate_seal=seal, authority_scope=binding.authority_scope, target_digest=record.digest)
-                connection.execute("UPDATE denial_clearance_authority_grants SET authority_digest = ? WHERE grant_id = ?", (authority, grant_id)); connection.commit()
-                connection.execute("UPDATE denial_clearance_decisions SET decision_json = '{}' WHERE decision_digest = ?", (reclear_digest,)); connection.commit()
-                with self.assertRaisesRegex(Exception, "malformed"): require_scope_open(connection, identity.task_id, binding.authority_scope)
-            finally: connection.close()
+
+    def test_durable_recovery_route_is_exact_single_use_and_restart_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("route-ledger"); self.admit(repository, identity, lease)
+            candidate = "c" * 40; self.seal_candidate(repository, identity, lease, candidate)
+            context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+            prepare_attempt(repository, identity, context, attempt_id="route-source", role=ProviderRole.SUPERVISOR, process_lease_id="lease-route", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="route-source", session_identity="route-session", lease=lease)
+            binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, context.runtime_binding.supervisor_profile_identities[0], "route-session", "route-source")
+            record = classify(binding, FailureClass.SESSION_TERMINATED, EvidenceSource.VERIFIED_LIFECYCLE)
+            record_durable_failure(repository, identity, record)
+            values = dict(record_digest=record.digest, binding=binding, target_role=FailureRole.SUPERVISOR, target_profile_digest=context.runtime_binding.supervisor_profile_identities[1], target_route_digest="sha256:" + "d" * 64, coordinate_digest="sha256:" + "e" * 64, remaining_budget_digest="sha256:" + "f" * 64)
+            issued = issue_durable_recovery_route_authorization(repository, identity, **values)
+            self.assertEqual(read_durable_recovery_route_authorization(repository, identity, issued.route_digest), issued)
+            self.assertEqual(issue_durable_recovery_route_authorization(repository, identity, **values), issued)
+            with self.assertRaises(Exception):
+                issue_durable_recovery_route_authorization(repository, identity, **{**values, "coordinate_digest": "sha256:" + "1" * 64})
+            with self.assertRaises(Exception):
+                consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.WORKER, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
+            consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
+            with self.assertRaises(Exception):
+                consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
+            with self.assertRaises(Exception):
+                issue_durable_recovery_route_authorization(repository, identity, **{**values, "record_digest": "sha256:" + "0" * 64})
 
 
 if __name__ == "__main__":

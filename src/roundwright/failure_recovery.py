@@ -371,6 +371,9 @@ def issue_durable_recovery_route_authorization(repository, identity, *, record_d
         if repository_id != (identity.repository_id,):
             raise FailureRecoveryError("durable recovery route authority has drifted")
         encoded = json.dumps(_binding_payload(binding), sort_keys=True, separators=(",", ":"))
+        prior = connection.execute("SELECT route_digest FROM recovery_route_authorizations WHERE task_id=? AND record_digest=? AND target_route_digest=?", (identity.task_id, record_digest, target_route_digest)).fetchone()
+        if prior is not None and prior != (route_digest,):
+            raise FailureRecoveryError("durable recovery route ordering conflicts")
         row = connection.execute("SELECT task_id, repository_id, record_digest, binding_json, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest FROM recovery_route_authorizations WHERE route_digest=?", (route_digest,)).fetchone()
         expected = (identity.task_id, identity.repository_id, record_digest, encoded, target_role.value, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest)
         if row is None:

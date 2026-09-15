@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -22,14 +24,16 @@ from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
     ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, SupervisorAccountingDecisionSemantic,
     SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
-    dispatch_ordered_supervisor_attempts, supervisor_request_digest,
+    SupervisorFallbackAuthorization, dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
-from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState
-from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
+from roundwright.provider_recovery import AttemptState, ProviderRole, RecoveryContext, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState, prepare_attempt, record_external_turn, record_session_identity
+from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect, trusted_provider_launch_context
 from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
-from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt
+from roundwright.git_identity import acquire_transition_lease
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend, _consume
 from roundwright.worker_toolbox import CompletionDeadline
@@ -53,16 +57,105 @@ def digest(value: object) -> str:
 
 
 def qualify_supervisor_sequence(adapters, requests, advisory_executions, *args, **kwargs):
-    """Supply wrapper-owned exact hosts and an ephemeral durable budget path."""
+    """Supply a verified durable task/attempt fixture for sequence tests."""
 
     with TemporaryDirectory() as temporary:
+        readiness, binding, policy = args[:3]
+        context = requests[0].context
+        repository = object.__new__(RepositoryIdentity)
+        object.__setattr__(repository, "root", Path(temporary).resolve())
+        identity = TaskIdentity(
+            context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright",
+            "codex/supervisor-sequence", "C:/private/supervisor-sequence", context.base_sha,
+        )
+        initialize(repository)
+        lease = acquire_transition_lease(
+            repository, repository_id=identity.repository_id,
+            owner="supervisor-sequence-tests", ttl_seconds=1000,
+        )
+        admit_task(
+            repository, identity,
+            (SourceSnapshot(identity.source_id, identity.repository_id, hashlib.sha256(identity.source_id.encode()).hexdigest()),),
+            lease=lease,
+        )
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute(
+                "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                (identity.task_id, identity.base_sha, context.candidate_sha, lease.state_identity),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        recoveries = {}
+        for request, adapter in zip(requests, adapters, strict=True):
+            audit = adapter._audit
+            health = ProviderHealthObservation(
+                ProviderRole.SUPERVISOR, audit.profile_identity,
+                CodexHealthContract(audit.audit.sdk_version, audit.audit.runtime_version, identity.base_sha).fingerprint,
+                audit.audit.fingerprint, HealthState.READY, None, 0, 2_000_000_000, 1,
+            )
+            receipt = ProviderHealthReceipt(
+                identity.base_sha, context.candidate_sha, binding.case_id, 2,
+                policy.runtime, ProviderRole.SUPERVISOR, audit.profile_identity,
+                health, audit,
+            )
+            recovery = RecoveryContext.for_task(
+                identity, candidate_sha=context.candidate_sha,
+                policy_fingerprint=context.policy_digest.removeprefix("sha256:"),
+                deployment_fingerprint="d" * 64, runtime_binding=policy.runtime,
+                health_contract_commit=identity.base_sha, shadow_case_id=binding.case_id,
+                health_receipt=receipt,
+            )
+            recoveries[request.provider_attempt_id] = recovery
+            prepare_attempt(
+                repository, identity, recovery, attempt_id=request.provider_attempt_id,
+                role=ProviderRole.SUPERVISOR,
+                process_lease_id="lease-" + request.provider_attempt_id,
+                process_lease_expires_at=int(time.time()) + 100,
+                input_fingerprint=request.input_digest,
+                selected_profile_identity=request.selected_profile_identity,
+                logical_profile_position=request.within_round_attempt,
+                physical_format_output_ordinal=request.physical_format_output_ordinal,
+                review_epoch=context.review_epoch, review_round=context.review_round,
+                lease=lease,
+            )
+
+        supplied_session = kwargs.pop("checkpoint_session")
+        supplied_turn = kwargs.pop("checkpoint_turn")
+        session_requests = {
+            "session-" + adapter._backend.identity: request
+            for request, adapter in zip(requests, adapters, strict=True)
+        }
+
+        def checkpoint_session(session_identity):
+            request = session_requests[session_identity]
+            record_session_identity(
+                repository, identity, recoveries[request.provider_attempt_id],
+                attempt_id=request.provider_attempt_id, session_identity=session_identity, lease=lease,
+            )
+            supplied_session(session_identity)
+
+        def checkpoint_turn(session_identity, turn_identity):
+            request = session_requests[session_identity]
+            record_external_turn(
+                repository, identity, recoveries[request.provider_attempt_id],
+                attempt_id=request.provider_attempt_id, session_identity=session_identity,
+                external_turn_identity=turn_identity, lease=lease,
+            )
+            supplied_turn(session_identity, turn_identity)
+
         return _qualify_supervisor_sequence(
             adapters, requests, advisory_executions, *args,
+            repository=repository, task_identity=identity,
+            recovery_context=recoveries[requests[0].provider_attempt_id],
             execution_hosts=tuple(
                 trusted_execution_host(AdvisoryRole.SUPERVISOR, adapter._profile)
                 for adapter in adapters
             ),
             budget_ledger_path=Path(temporary) / "role-budget.sqlite",
+            checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
             **kwargs,
         )
 
@@ -140,9 +233,16 @@ class SupervisorTests(unittest.TestCase):
 
     def dispatch_ordered(self, requests, adapters, **kwargs):
         ledger_path = self.next_budget_path()
-        kwargs.setdefault("authorize_fallback", lambda _source, _result, _target: None)
+        executions = self.admissions(adapters, requests)
+        def verified_route(source, _result, target):
+            def consume(reservation):
+                # Direct dispatcher tests use the real sealed reservation;
+                # qualifier tests exercise the durable route ledger itself.
+                reservation.require_recovery_route(executions[requests.index(target)])
+            return SupervisorFallbackAuthorization(source.input_digest, target.input_digest, consume)
+        kwargs.setdefault("authorize_fallback", verified_route)
         return dispatch_ordered_supervisor_attempts(
-            requests, adapters, self.admissions(adapters, requests),
+            requests, adapters, executions,
             self.execution_hosts(adapters),
             tuple(ledger_path for _ in adapters), **kwargs,
         )

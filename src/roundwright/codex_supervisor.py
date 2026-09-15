@@ -409,7 +409,29 @@ class SupervisorFailoverResult:
     exhausted: bool
 
 
-def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None, authorize_fallback: Callable[[CodexSupervisorRequest, CodexSupervisorResult, CodexSupervisorRequest], None] | None = None) -> SupervisorFailoverResult:
+@dataclass(frozen=True)
+class SupervisorFallbackAuthorization:
+    """One already-issued route whose target effect still must be consumed.
+
+    The dispatcher deliberately knows nothing about the durable recovery
+    ledger.  It does, however, own the ordering boundary: an authorizer is
+    invoked after a source INVALID result and before the next reservation;
+    the returned object is consumed with that exact reservation before the
+    native adapter can be invoked.
+    """
+
+    source_request_identity: str
+    target_request_identity: str
+    consume: Callable[[TrustedRoleEffectReservation], None]
+
+    def __post_init__(self) -> None:
+        if (not _DIGEST.fullmatch(self.source_request_identity)
+                or not _DIGEST.fullmatch(self.target_request_identity)
+                or not callable(self.consume)):
+            raise CodexSupervisorError("Supervisor fallback authorization is invalid")
+
+
+def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None, authorize_fallback: Callable[[CodexSupervisorRequest, CodexSupervisorResult, CodexSupervisorRequest], SupervisorFallbackAuthorization] | None = None) -> SupervisorFailoverResult:
     """Run a bounded configured sequence without retrying uncertain outcomes.
 
     Only a typed format-invalid result may advance.  A typed ``BLOCKED`` is a
@@ -417,13 +439,14 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     another profile from a local enum would create a second effect without a
     separately admitted recovery route.
     """
-    if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(budget_ledger_paths) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or len(execution_hosts) != len(budget_ledger_paths) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or any(not isinstance(item, Path) for item in budget_ledger_paths) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)) or (authorize_fallback is not None and not callable(authorize_fallback)):
+    if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(budget_ledger_paths) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or len(execution_hosts) != len(budget_ledger_paths) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or any(not isinstance(item, Path) for item in budget_ledger_paths) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)) or (authorize_fallback is not None and not callable(authorize_fallback)) or (len(requests) > 1 and authorize_fallback is None):
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
     attempted: list[str] = []
     first = requests[0].context
     expected_logical = 1
     expected_physical = 0
     current_profile: str | None = None
+    pending_authorization: SupervisorFallbackAuthorization | None = None
     for ordinal, (request, adapter, advisory_execution, execution_host, budget_ledger_path) in enumerate(zip(requests, adapters, advisory_executions, execution_hosts, budget_ledger_paths), start=1):
         if type(request) is not CodexSupervisorRequest or type(adapter) is not CodexSupervisorAdapter or request.within_round_attempt != expected_logical or request.physical_format_output_ordinal != expected_physical or request.selected_profile_identity != adapter.profile_identity or request.context != first or (current_profile is not None and expected_physical and request.selected_profile_identity != current_profile):
             raise CodexSupervisorError("Supervisor failover profile mapping is invalid")
@@ -439,6 +462,15 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
             )
         except RoleCapabilityError as error:
             raise CodexSupervisorError("Supervisor budget admission is denied") from error
+        if pending_authorization is not None:
+            if (pending_authorization.target_request_identity != request.input_digest
+                    or pending_authorization.source_request_identity == request.input_digest):
+                raise CodexSupervisorError("Supervisor fallback route has drifted")
+            try:
+                pending_authorization.consume(effect_reservation)
+            except Exception as error:
+                raise CodexSupervisorError("Supervisor fallback route consumption is denied") from error
+            pending_authorization = None
         result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution, effect_reservation=effect_reservation)
         if checkpoint_result is not None:
             checkpoint_result(ordinal, request, result)
@@ -449,9 +481,12 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
         if result.kind is not SupervisorResultKind.INVALID:
             return SupervisorFailoverResult(result, tuple(attempted), False)
         if ordinal < len(requests):
-            if authorize_fallback is None:
-                return SupervisorFailoverResult(result, tuple(attempted), False)
-            authorize_fallback(request, result, requests[ordinal])
+            assert authorize_fallback is not None
+            pending_authorization = authorize_fallback(request, result, requests[ordinal])
+            if (type(pending_authorization) is not SupervisorFallbackAuthorization
+                    or pending_authorization.source_request_identity != request.input_digest
+                    or pending_authorization.target_request_identity != requests[ordinal].input_digest):
+                raise CodexSupervisorError("Supervisor fallback route is invalid")
         if expected_physical == 2:
             expected_logical += 1
             expected_physical = 0

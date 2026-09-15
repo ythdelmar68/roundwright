@@ -865,6 +865,17 @@ MIGRATIONS = (
             ("provider_failure_admissions", "CREATE TABLE provider_failure_admissions (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role IN ('planning', 'worker', 'supervisor', 'aggregation')), profile_identity TEXT NOT NULL, session_identity TEXT NOT NULL, attempt_identity TEXT NOT NULL, UNIQUE(task_id, provider_role, session_identity, attempt_identity))"),
         ),
     ),
+    Migration(
+        70,
+        (
+            "CREATE TABLE failure_recovery_clearances (clearance_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_records(record_digest), clearance_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))",
+            "CREATE TABLE failure_recovery_clearance_revocations (revocation_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), clearance_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_clearances(clearance_digest), revocation_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))",
+        ),
+        (
+            ("failure_recovery_clearances", "CREATE TABLE failure_recovery_clearances (clearance_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_records(record_digest), clearance_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))"),
+            ("failure_recovery_clearance_revocations", "CREATE TABLE failure_recovery_clearance_revocations (revocation_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), clearance_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_clearances(clearance_digest), revocation_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))"),
+        ),
+    ),
 )
 
 

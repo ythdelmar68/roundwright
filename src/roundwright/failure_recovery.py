@@ -146,6 +146,25 @@ class Clearance:
         if not self.record_digest.startswith("sha256:") or len(self.record_digest) != 71 or type(self.binding) is not FailureBinding or self.evidence is not EvidenceSource.VERIFIED_HOST:
             raise FailureRecoveryError("clearance is invalid")
 
+    @property
+    def digest(self) -> str:
+        return "sha256:" + _digest_json(_clearance_payload(self))
+
+
+@dataclass(frozen=True)
+class ClearanceRevocation:
+    clearance_digest: str
+    binding: FailureBinding
+    evidence: EvidenceSource
+
+    def __post_init__(self) -> None:
+        if not _DIGEST.fullmatch(self.clearance_digest) or type(self.binding) is not FailureBinding or self.evidence is not EvidenceSource.VERIFIED_HOST:
+            raise FailureRecoveryError("clearance revocation is invalid")
+
+    @property
+    def digest(self) -> str:
+        return "sha256:" + _digest_json(_revocation_payload(self))
+
 
 @dataclass(frozen=True)
 class RecoveryRouteAdmission:
@@ -174,6 +193,22 @@ class RecoveryAdvice:
 
 def _payload(record: FailureRecord) -> dict[str, object]:
     return {"schema": "roundwright-failure-recovery/v1", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
+
+
+def _binding_payload(binding: FailureBinding) -> dict[str, object]:
+    return {**binding.__dict__, "role": binding.role.value}
+
+
+def _clearance_payload(clearance: Clearance) -> dict[str, object]:
+    return {"schema": "roundwright-failure-clearance/v1", "record_digest": clearance.record_digest, "binding": _binding_payload(clearance.binding), "evidence": clearance.evidence.value}
+
+
+def _revocation_payload(revocation: ClearanceRevocation) -> dict[str, object]:
+    return {"schema": "roundwright-failure-clearance-revocation/v1", "clearance_digest": revocation.clearance_digest, "binding": _binding_payload(revocation.binding), "evidence": revocation.evidence.value}
+
+
+def _digest_json(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def parse_failure_record(value: object) -> FailureRecord:
@@ -274,16 +309,101 @@ def read_durable_failure(repository, identity, record_digest: str) -> FailureRec
     return record
 
 
+def record_durable_clearance(repository, identity, clearance: Clearance, *, now: int | None = None) -> str:
+    """Append an exact clearance for one admitted STOP_SCOPE denial."""
+    from .state import _open_writable_connection, _require_matching_task
+    if type(clearance) is not Clearance:
+        raise FailureRecoveryError("durable clearance is invalid")
+    observed = int(time.time()) if now is None else now
+    if type(observed) is not int or observed <= 0: raise FailureRecoveryError("clearance time is invalid")
+    encoded = json.dumps(_clearance_payload(clearance), sort_keys=True, separators=(",", ":"))
+    connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity); _require_attempt_admission(connection, identity, clearance.binding)
+        original = connection.execute("SELECT record_json FROM failure_recovery_records WHERE task_id=? AND record_digest=?", (identity.task_id, clearance.record_digest)).fetchone()
+        if original is None: raise FailureRecoveryError("durable clearance denial is unavailable")
+        record = parse_failure_record(json.loads(original[0]))
+        if record.digest != clearance.record_digest or record.binding != clearance.binding or record.action is not RecoveryAction.STOP_SCOPE or not record.clearance_required: raise FailureRecoveryError("durable clearance denial has drifted")
+        existing = connection.execute("SELECT task_id,record_digest,clearance_json FROM failure_recovery_clearances WHERE clearance_digest=?", (clearance.digest,)).fetchone()
+        expected = (identity.task_id, clearance.record_digest, encoded)
+        if existing is None:
+            sequence = connection.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM failure_recovery_clearances WHERE task_id=?", (identity.task_id,)).fetchone()[0]
+            connection.execute("INSERT INTO failure_recovery_clearances(clearance_digest,task_id,record_digest,clearance_json,sequence,recorded_at) VALUES (?,?,?,?,?,?)", (clearance.digest, *expected, sequence, observed))
+        elif existing != expected: raise FailureRecoveryError("durable clearance conflicts")
+        connection.commit()
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+    return clearance.digest
+
+
+def record_durable_clearance_revocation(repository, identity, revocation: ClearanceRevocation, *, now: int | None = None) -> str:
+    """Append a revocation without deleting its clearance or original denial."""
+    from .state import _open_writable_connection, _require_matching_task
+    if type(revocation) is not ClearanceRevocation: raise FailureRecoveryError("clearance revocation is invalid")
+    observed = int(time.time()) if now is None else now
+    if type(observed) is not int or observed <= 0: raise FailureRecoveryError("clearance revocation time is invalid")
+    encoded = json.dumps(_revocation_payload(revocation), sort_keys=True, separators=(",", ":")); connection = _open_writable_connection(repository)
+    try:
+        _require_matching_task(connection, identity); _require_attempt_admission(connection, identity, revocation.binding)
+        row = connection.execute("SELECT task_id,record_digest,clearance_json FROM failure_recovery_clearances WHERE clearance_digest=?", (revocation.clearance_digest,)).fetchone()
+        if row is None or row[0] != identity.task_id: raise FailureRecoveryError("clearance revocation clearance is unavailable")
+        clearance = _parse_clearance(json.loads(row[2]))
+        if clearance.digest != revocation.clearance_digest or clearance.binding != revocation.binding: raise FailureRecoveryError("clearance revocation clearance has drifted")
+        existing = connection.execute("SELECT task_id,clearance_digest,revocation_json FROM failure_recovery_clearance_revocations WHERE revocation_digest=?", (revocation.digest,)).fetchone(); expected=(identity.task_id,revocation.clearance_digest,encoded)
+        if existing is None:
+            sequence=connection.execute("SELECT COALESCE(MAX(sequence),0)+1 FROM failure_recovery_clearance_revocations WHERE task_id=?",(identity.task_id,)).fetchone()[0]
+            connection.execute("INSERT INTO failure_recovery_clearance_revocations(revocation_digest,task_id,clearance_digest,revocation_json,sequence,recorded_at) VALUES (?,?,?,?,?,?)",(revocation.digest,*expected,sequence,observed))
+        elif existing != expected: raise FailureRecoveryError("clearance revocation conflicts")
+        connection.commit()
+    except Exception:
+        connection.rollback(); raise
+    finally: connection.close()
+    return revocation.digest
+
+
+def _parse_binding(value: object) -> FailureBinding:
+    if type(value) is not dict or set(value) != {"candidate_sha","policy_digest","configuration_digest","authority_scope","role","profile_identity","session_identity","attempt_identity"}: raise FailureRecoveryError("durable clearance is malformed")
+    try: return FailureBinding(value["candidate_sha"],value["policy_digest"],value["configuration_digest"],value["authority_scope"],FailureRole(value["role"]),value["profile_identity"],value["session_identity"],value["attempt_identity"])
+    except (KeyError, TypeError, ValueError) as error: raise FailureRecoveryError("durable clearance is malformed") from error
+
+
+def _parse_clearance(value: object) -> Clearance:
+    if type(value) is not dict or set(value) != {"schema","record_digest","binding","evidence"} or value.get("schema") != "roundwright-failure-clearance/v1": raise FailureRecoveryError("durable clearance is malformed")
+    try: clearance=Clearance(value["record_digest"],_parse_binding(value["binding"]),EvidenceSource(value["evidence"]))
+    except (KeyError,TypeError,ValueError) as error: raise FailureRecoveryError("durable clearance is malformed") from error
+    if _clearance_payload(clearance) != value: raise FailureRecoveryError("durable clearance is non-canonical")
+    return clearance
+
+
+def _parse_revocation(value: object) -> ClearanceRevocation:
+    if type(value) is not dict or set(value) != {"schema","clearance_digest","binding","evidence"} or value.get("schema") != "roundwright-failure-clearance-revocation/v1": raise FailureRecoveryError("clearance revocation is malformed")
+    try: revocation=ClearanceRevocation(value["clearance_digest"],_parse_binding(value["binding"]),EvidenceSource(value["evidence"]))
+    except (KeyError,TypeError,ValueError) as error: raise FailureRecoveryError("clearance revocation is malformed") from error
+    if _revocation_payload(revocation) != value: raise FailureRecoveryError("clearance revocation is non-canonical")
+    return revocation
+
+
 def require_scope_open(connection, task_id: str, scope: str) -> None:
     """Fail before an effect when an exact durable scope has an uncleared stop."""
     if not isinstance(task_id, str) or not isinstance(scope, str):
         raise FailureRecoveryError("failure scope is invalid")
-    for (encoded,) in connection.execute("SELECT record_json FROM failure_recovery_records WHERE task_id=?", (task_id,)):
+    for digest, encoded in connection.execute("SELECT record_digest, record_json FROM failure_recovery_records WHERE task_id=?", (task_id,)):
         try:
             value = json.loads(encoded)
         except (TypeError, json.JSONDecodeError) as error:
             raise FailureRecoveryError("durable failure record is malformed") from error
-        if value.get("action") == RecoveryAction.STOP_SCOPE.value and value.get("binding", {}).get("authority_scope") == scope:
+        record = parse_failure_record(value)
+        if record.digest != digest: raise FailureRecoveryError("durable failure record digest has drifted")
+        if record.action is not RecoveryAction.STOP_SCOPE or record.binding.authority_scope != scope: continue
+        row = connection.execute("SELECT clearance_digest,clearance_json FROM failure_recovery_clearances WHERE task_id=? AND record_digest=?", (task_id,digest)).fetchone()
+        if row is None: raise FailureRecoveryError("failure scope remains stopped")
+        clearance = _parse_clearance(json.loads(row[1]))
+        if clearance.digest != row[0] or clearance.record_digest != digest or clearance.binding != record.binding: raise FailureRecoveryError("durable clearance has drifted")
+        revocation = connection.execute("SELECT revocation_digest,revocation_json FROM failure_recovery_clearance_revocations WHERE task_id=? AND clearance_digest=?", (task_id,row[0])).fetchone()
+        if revocation is not None:
+            value = _parse_revocation(json.loads(revocation[1]))
+            if value.digest != revocation[0] or value.clearance_digest != row[0] or value.binding != record.binding: raise FailureRecoveryError("clearance revocation has drifted")
             raise FailureRecoveryError("failure scope remains stopped")
 
 

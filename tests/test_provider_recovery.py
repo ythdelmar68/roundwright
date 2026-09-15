@@ -41,7 +41,7 @@ from roundwright.provider_recovery import (
 from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
-from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+from roundwright.failure_recovery import Clearance, ClearanceRevocation, EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, require_scope_open
 
 
 class ProviderRecoveryTests(unittest.TestCase):
@@ -742,6 +742,32 @@ class ProviderRecoveryTests(unittest.TestCase):
             replacement = self.context(identity, candidate="d" * 40, role=ProviderRole.SUPERVISOR)
             with self.assertRaisesRegex(ProviderRecoveryError, "drifted"):
                 record_supervisor_terminal_failure(repository, identity, replacement, attempt_id="tamper-attempt", failure_class=SupervisorTerminalFailureClass.SANDBOX_OR_APPROVAL_DENIED, outcome_source=SupervisorTerminalFailureSource.SDK_TURN_FAILED, sdk_error_category=SupervisorTerminalFailureSdkCategory.SANDBOX, lease=lease)
+
+    def test_durable_clearance_and_revocation_are_append_only_and_restart_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("clearance"); self.admit(repository, identity, lease)
+            candidate = "c" * 40; context = self.context(identity, candidate=candidate, role=ProviderRole.WORKER)
+            prepare_attempt(repository, identity, context, attempt_id="clearance-attempt", role=ProviderRole.WORKER, process_lease_id="lease-clearance", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="clearance-attempt", session_identity="clearance-session", lease=lease)
+            binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "worker:" + identity.task_id, FailureRole.WORKER, context.runtime_binding.worker_profile_identity, "clearance-session", "clearance-attempt")
+            record = classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST); record_durable_failure(repository, identity, record)
+            clearance = Clearance(record.digest, binding, EvidenceSource.VERIFIED_HOST)
+            self.assertEqual(record_durable_clearance(repository, identity, clearance), clearance.digest)
+            self.assertEqual(record_durable_clearance(repository, identity, clearance), clearance.digest)
+            connection = sqlite3.connect(database_path(repository))
+            try: require_scope_open(connection, identity.task_id, binding.authority_scope)
+            finally: connection.close()
+            with self.assertRaisesRegex(Exception, "denial"):
+                record_durable_clearance(repository, identity, Clearance("sha256:" + "d" * 64, binding, EvidenceSource.VERIFIED_HOST))
+            revocation = ClearanceRevocation(clearance.digest, binding, EvidenceSource.VERIFIED_HOST)
+            self.assertEqual(record_durable_clearance_revocation(repository, identity, revocation), revocation.digest)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                with self.assertRaisesRegex(Exception, "stopped"): require_scope_open(connection, identity.task_id, binding.authority_scope)
+                connection.execute("UPDATE failure_recovery_clearance_revocations SET revocation_json = '{}' WHERE revocation_digest = ?", (revocation.digest,)); connection.commit()
+                with self.assertRaisesRegex(Exception, "malformed"): require_scope_open(connection, identity.task_id, binding.authority_scope)
+            finally: connection.close()
 
 
 if __name__ == "__main__":

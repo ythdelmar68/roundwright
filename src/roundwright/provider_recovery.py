@@ -379,12 +379,10 @@ def _coordinate_transition_is_valid(
     if epoch < 0 or round_number < 1 or logical < 1 or not 0 <= physical <= 2:
         return False
     if previous is None:
-        # A dispatcher can checkpoint a later configured logical profile as
-        # its first durable Supervisor attempt (for example when it resumes
-        # an already-selected in-round profile).  There is no predecessor to
-        # establish an ordinal chain yet, but a correction format still may
-        # not appear without the original format checkpoint.
-        return physical == 0
+        # Production history has one unambiguous origin.  Compatibility with
+        # older migrations is handled by their explicit migration reader; a
+        # new production ledger must never begin by naming a later profile.
+        return epoch >= 0 and round_number >= 1 and logical == 1 and physical == 0
     prior_epoch, prior_round, prior_logical, prior_physical = previous
     if epoch == prior_epoch and round_number == prior_round:
         return (

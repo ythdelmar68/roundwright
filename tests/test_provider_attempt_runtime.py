@@ -618,9 +618,15 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             checkpoint_failure = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
             self.assertIsNotNone(checkpoint_failure)
+            self.assertEqual(
+                (first.attempt_id, checkpoint_failure.attempt_id, first_backend.calls, second_backend.calls),
+                (runner.selection.provider_attempt_id, runner.selection.provider_attempt_id, 1, 0),
+            )
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
             # A restart resumes only the already-selected successor profile.
-            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
+            restarted_attempts = runner.execute()
+            self.assertEqual(restarted_attempts, (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
+            self.assertEqual((len(restarted_attempts), len(set(restarted_attempts))), (2, 2))
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             terminal = read_supervisor_terminal_failure(repository, identity, first.attempt_id)

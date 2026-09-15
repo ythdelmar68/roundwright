@@ -18,12 +18,12 @@
       {"identity":"advisory-worker-seam-v1","path":"src/roundwright/codex_worker.py","sha256":"aa4450a93d3a8d1ec33fab6c0cde2d59c282dd4c859325b760aac5ed40a11dc2"},
       {"identity":"advisory-worker-seam-tests-v1","path":"tests/test_codex_worker.py","sha256":"4d31cec09249d07f03a4fa9dd56088fa8a589ea39e7d24fcff1d44287216f9d0"},
       {"identity":"advisory-supervisor-seam-v1","path":"src/roundwright/codex_supervisor.py","sha256":"cf0773ee6e9b920332f2628fac53c60ce1710bbd613c34d8b97ed77581417e88"},
-      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"7bb8b5669a1879ef9d21133156726d0af948e03f5d81af8961055b10e13f08b6"},
+      {"identity":"advisory-dependency-review-seam-v1","path":"src/roundwright/codex_dependency_review.py","sha256":"c76df3b2ca01dd709e5b02e57c72187e33f87a9685d8e895b51f6d41e0d38ed2"},
       {"identity":"advisory-native-supervisor-bridge-v1","path":"src/roundwright/supervisor_toolbox.py","sha256":"d8694e9a2b3097e7d0be1da0abf6227c9a53658a07d3e4696e809d814ca1220b"},
       {"identity":"advisory-native-supervisor-bridge-tests-v1","path":"tests/test_codex_supervisor.py","sha256":"1b966dfdf8fd327e5042b8006c676412689ff8a40fb5dcd9d496629d37f9f881"},
       {"identity":"advisory-native-dependency-review-bridge-v1","path":"src/roundwright/dependency_review_toolbox.py","sha256":"5244f1c88488e8b15c0f4bb1c6101ad87bbef1d08501572306da2e18f3706eea"},
-      {"identity":"advisory-native-dependency-review-bridge-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"44b385053c768d2e11293bb7a88f1084ef47cf92ee995a6884509947efee6dfd"},
-      {"identity":"advisory-provider-attempt-runtime-v1","path":"src/roundwright/provider_attempt_runtime.py","sha256":"c08b24294130fbdc1e5f36841e85302a7af9cdf4c99994d3548ed774ef28f26d"},
+      {"identity":"advisory-native-dependency-review-bridge-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"287616cd582e16169925e3b0dabbc307da534e465ba5cbf0473954801906215b"},
+      {"identity":"advisory-provider-attempt-runtime-v1","path":"src/roundwright/provider_attempt_runtime.py","sha256":"80c66e14b63b2d32ccbe717f044c44f300135ea20f3badc0358a28b7be8061f3"},
       {"identity":"advisory-provider-attempt-runtime-tests-v1","path":"tests/test_provider_attempt_runtime.py","sha256":"e74d4eef47027c837ad2f2096e3e0eea2c673824766c98fa3542d5658ff5d30e"},
       {"identity":"advisory-worker-toolbox-v1","path":"src/roundwright/worker_toolbox.py","sha256":"71df4b4575b71259df499cbea47de30aeac8cb8c501cec8facb7d90b8fbfc59d"},
       {"identity":"advisory-worker-toolbox-tests-v1","path":"tests/test_worker_toolbox.py","sha256":"5b749edcb3837f93928d27de2d407259ee6e7bdc5c76c39226ac26fd41ec9ec7"},
@@ -39,8 +39,8 @@
       {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"9bd568eb38fa438017077c28f43dbc68a044d8ef172fcf17a81e1f5314b6450e"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
       {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"cb878ea55a0a18e6b23d629ffbc0bb10621e0b7b83dadf0d5905bd4ae27d96b4"},
-      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"90b66f7b82504e88a3eaa7c0813ff8b98fffaa5fdf2d08b583704e22b324bd9b"},
-      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"8749f9352c68e008e5801287013d4aa1dc3de2525fbf08364e782733d673af3d"}
+      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"fa0b2320420ee0613997cc776f2fb05a49bcd20ec01ef0c683e47369899b87de"},
+      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"98736db057804664dc15a9ee86bac232d6538eee860aab41ff046686d3a7d781"}
     ]
   },
   "issue_132_requirements": {

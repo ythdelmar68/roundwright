@@ -488,6 +488,24 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_restart_continues_same_profile_at_next_physical_format_ordinal(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner, backend=Backend("runtime-restart-zero", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), []))
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            next_selection = DiffReviewSelection("runtime-restart-one", runner.selection.implementation_attempt_id, "runtime-restart-provider-one", "runtime-restart-message-one", "runtime-restart-lease-one", runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 1, logical_profile_position=1, physical_format_output_ordinal=1)
+            second = self.sequence_entry(runner, selection=next_selection, backend=Backend("runtime-restart-one", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), []))
+            restarted = replace(runner, sequence=(first, second))
+            self.assertEqual(restarted.execute(), (runner.selection.provider_attempt_id, next_selection.provider_attempt_id))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT attempt_id, logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE attempt_id IN (?, ?) ORDER BY attempt_number", (runner.selection.provider_attempt_id, next_selection.provider_attempt_id)).fetchall(), [(runner.selection.provider_attempt_id, 1, 0), (next_selection.provider_attempt_id, 1, 1)])
+            finally:
+                connection.close()
+
     def test_fallback_reserves_its_own_exact_binding_and_reconstructs_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, primary, repository, identity, recovery, _seal = self.durable_runner(

@@ -21,8 +21,15 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_native_failure, record_durable_failure
-from .state import TaskIdentity
+from .failure_recovery import (
+    DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding,
+    FailureClass, FailureRole, FailureRecord, RecoveryAction,
+    classify_native_failure, consume_durable_recovery_route_authorization,
+    issue_durable_recovery_route_authorization, parse_failure_record,
+    read_durable_failure, read_durable_recovery_route_authorization,
+    record_durable_failure,
+)
+from .state import TaskIdentity, _open_writable_connection
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, require_external_production_activation, reserve_role_effect, trusted_provider_launch_context
 
 
@@ -249,6 +256,10 @@ class DependencyReviewService:
         )
         if task_identity is not None:
             store.require_current_authority(repository, task_identity, subset, binding)
+        recovery_route = self._successor_recovery_route(
+            repository, task_identity, binding, request, supersedes_attempt_id,
+            advisory_execution,
+        )
         attempt = store.start_attempt(repository, subset, attempt_id=attempt_id, binding=binding, source_owned_relations=source_owned_relations, supersedes_attempt_id=supersedes_attempt_id)
         if attempt.input_digest != request.input_digest:
             raise DependencyReviewDispatchError("dependency review prepared request has drifted")
@@ -265,6 +276,18 @@ class DependencyReviewService:
                 request_material=request_material,
                 preflight_material=preflight_material,
             )
+            if recovery_route is not None:
+                route, coordinate, remaining, reservation_digest = self._recovery_route_material(
+                    request, binding, supersedes_attempt_id, advisory_execution,
+                )
+                consume_durable_recovery_route_authorization(
+                    repository, task_identity, recovery_route,
+                    reservation_digest=reservation_digest,
+                    target_role=FailureRole.DEPENDENCY_REVIEW,
+                    target_profile_digest=binding.profile_identity,
+                    target_route_digest=route, coordinate_digest=coordinate,
+                    remaining_budget_digest=remaining,
+                )
 
             def admit() -> dict[str, object]:
                 return reservation.require_before_effect(
@@ -321,14 +344,136 @@ class DependencyReviewService:
                     classify_native_failure(FailureRole.DEPENDENCY_REVIEW, failure_binding, result.failure),
                 )
             admit()
-            store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
+            store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="prebound-transient-route")
         elif result.kind is DependencyReviewResultKind.AMBIGUOUS:
             admit()
-            store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
+            # UNKNOWN is a durable reconciliation decision, never an ordinary
+            # blocked predecessor that a successor can consume as a retry.
+            store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="reconcile-required")
         else:
             admit()
             store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
         return result
+
+    @staticmethod
+    def _recovery_route_material(
+        request: DependencyReviewRequest, binding: DependencyReviewBinding,
+        predecessor_attempt_id: str | None, execution: SealedRoleExecution,
+    ) -> tuple[str, str, str, str]:
+        if predecessor_attempt_id is None:
+            raise DependencyReviewDispatchError("dependency review recovery predecessor is unavailable")
+        route = _digest({
+            "schema": "roundwright-dependency-review-recovery-target/v1",
+            "attempt_id": request.attempt_id, "input_digest": request.input_digest,
+            "profile_identity": binding.profile_identity,
+        })
+        coordinate = _digest({
+            "schema": "roundwright-dependency-review-recovery-coordinate/v1",
+            "predecessor_attempt_id": predecessor_attempt_id,
+            "successor_attempt_id": request.attempt_id,
+        })
+        remaining = _digest({
+            "schema": "roundwright-dependency-review-recovery-budget/v1",
+            "execution_binding": execution.execution_binding.digest,
+            "profile_identity": binding.profile_identity,
+        })
+        reservation = _digest({
+            "schema": "roundwright-dependency-review-recovery-reservation/v1",
+            "route": route, "coordinate": coordinate,
+            "remaining_budget": remaining,
+            "execution_binding": execution.execution_binding.digest,
+        })
+        return route, coordinate, remaining, reservation
+
+    def _successor_recovery_route(
+        self, repository: RepositoryIdentity, task_identity: TaskIdentity | None,
+        binding: DependencyReviewBinding, request: DependencyReviewRequest,
+        predecessor_attempt_id: str | None, execution: SealedRoleExecution,
+    ) -> DurableRecoveryRouteAuthorization | None:
+        """Return the one permitted transient successor route, if any.
+
+        A persisted UNKNOWN is deliberately not recoverable here.  It needs a
+        separately completed reconciliation and cannot spend a successor
+        budget, construct a session, or reach a provider merely by naming it
+        as a blocked predecessor.
+        """
+
+        if predecessor_attempt_id is None:
+            return None
+        if task_identity is None:
+            raise DependencyReviewDispatchError("dependency review recovery authority is unavailable")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT attempts.state, outcomes.reason_code, outcomes.owner_route, "
+                "admissions.candidate_sha, admissions.policy_digest, admissions.configuration_digest, "
+                "admissions.authority_scope, admissions.profile_identity, admissions.session_identity "
+                "FROM dependency_review_attempts AS attempts "
+                "LEFT JOIN dependency_review_validation_outcomes AS outcomes "
+                "ON outcomes.attempt_id = attempts.attempt_id "
+                "LEFT JOIN dependency_review_failure_admissions AS admissions "
+                "ON admissions.attempt_id = attempts.attempt_id "
+                "WHERE attempts.attempt_id = ? AND attempts.task_id = ?",
+                (predecessor_attempt_id, task_identity.task_id),
+            ).fetchone()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise DependencyReviewDispatchError("dependency review recovery predecessor is unavailable") from None
+        finally:
+            connection.close()
+        if row is None or row[0] != "blocked":
+            return None
+        if row[1] == "uncertain-provider-turn" or row[2] == "reconcile-required":
+            raise DependencyReviewDispatchError("dependency review reconciliation is incomplete")
+        if row[1] != "sdk-turn-failed" or row[2] != "prebound-transient-route" or any(type(value) is not str for value in row[3:]):
+            raise DependencyReviewDispatchError("dependency review blocked predecessor is not retryable")
+        source_binding = FailureBinding(
+            row[3], row[4], row[5], row[6], FailureRole.DEPENDENCY_REVIEW,
+            row[7], row[8], predecessor_attempt_id,
+        )
+        # Locate only a canonical exact source decision; the durable readback
+        # below revalidates the still-current admission and candidate authority.
+        connection = _open_writable_connection(repository)
+        try:
+            records = connection.execute(
+                "SELECT record_digest, record_json FROM failure_recovery_records WHERE task_id = ?",
+                (task_identity.task_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        source_digest = None
+        for digest, encoded in records:
+            try:
+                record = parse_failure_record(json.loads(encoded))
+            except Exception:
+                continue
+            if record.digest == digest and record.binding == source_binding:
+                source_digest = digest
+                break
+        if source_digest is None:
+            raise DependencyReviewDispatchError("dependency review transient recovery source is unavailable")
+        try:
+            source = read_durable_failure(repository, task_identity, source_digest)
+            if source.action is not RecoveryAction.PREBOUND_FALLBACK or not source.retryable:
+                raise DependencyReviewDispatchError("dependency review transient recovery source is not eligible")
+            route, coordinate, remaining, _reservation = self._recovery_route_material(
+                request, binding, predecessor_attempt_id, execution,
+            )
+            issued = issue_durable_recovery_route_authorization(
+                repository, task_identity, record_digest=source_digest,
+                binding=source_binding, target_role=FailureRole.DEPENDENCY_REVIEW,
+                target_profile_digest=binding.profile_identity, target_route_digest=route,
+                coordinate_digest=coordinate, remaining_budget_digest=remaining,
+            )
+            return read_durable_recovery_route_authorization(
+                repository, task_identity, issued.route_digest,
+            )
+        except DependencyReviewDispatchError:
+            raise
+        except Exception:
+            raise DependencyReviewDispatchError("dependency review transient recovery route is unavailable") from None
 
 
 @dataclass(frozen=True)

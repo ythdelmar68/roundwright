@@ -30,7 +30,13 @@ from .codex_supervisor import (
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
-from .failure_recovery import EvidenceSource, FailureClass, native_failure_class
+from .failure_recovery import (
+    EvidenceSource, FailureBinding, FailureClass, FailureRole,
+    RecoveryAction as FailureRecoveryAction, classify,
+    consume_durable_recovery_route_authorization,
+    issue_durable_recovery_route_authorization,
+    native_failure_class, parse_failure_record, read_durable_failure,
+)
 from .provider_health import CodexFailure
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect, trusted_provider_launch_context
 from .provider_recovery import (
@@ -516,7 +522,13 @@ class DurableDiffReviewRunner:
                     raise ProviderAttemptRuntimeError("provider attempt dispatch claim is already consumed")
         attempt_ids: list[str] = []
         for position, entry in enumerate(entries):
-            attempt_id, accepted = self._execute_selection(entry)
+            route = None
+            if position:
+                # A successor is not merely an ordered list item.  It must be
+                # authorized from the exact terminal source before it can
+                # reserve budget, claim a dispatch, or open a provider session.
+                route = self._authorize_terminal_successor(entries[position - 1], entry)
+            attempt_id, accepted = self._execute_selection(entry, recovery_route=route)
             attempt_ids.append(attempt_id)
             if accepted:
                 return tuple(attempt_ids)
@@ -545,6 +557,114 @@ class DurableDiffReviewRunner:
             if stored.state is not AttemptState.INVALIDATED:
                 raise ProviderAttemptRuntimeError("provider attempt recovery is incomplete")
         return tuple(attempt_ids)
+
+    def _recovery_route_material(self, entry: DiffReviewSequenceEntry) -> tuple[str, str, str, str]:
+        """Derive the immutable successor route, coordinate, and budget facts."""
+
+        selection = entry.selection
+        route = _digest({
+            "schema": "roundwright-supervisor-recovery-target/v1",
+            "attempt_id": selection.provider_attempt_id,
+            "message_identity": selection.message_identity,
+            "profile_identity": entry.audit.profile_identity,
+            "runtime_binding": entry.recovery.runtime_binding.resolved_digest,
+        })
+        coordinate = _digest({
+            "schema": "roundwright-supervisor-recovery-coordinate/v1",
+            "review_epoch": self.review_epoch,
+            "review_round": self.review_round,
+            "logical_profile_position": selection.resolved_logical_profile_position,
+            "physical_format_output_ordinal": selection.physical_format_output_ordinal,
+        })
+        remaining = _digest({
+            "schema": "roundwright-supervisor-recovery-budget/v1",
+            "maximum_profiles": entry.recovery.runtime_binding.review_max_supervisor_attempts_per_round,
+            "successor_position": selection.resolved_logical_profile_position,
+            "physical_format_output_ordinal": selection.physical_format_output_ordinal,
+            "profile_identity": entry.audit.profile_identity,
+        })
+        reservation = _digest({
+            "schema": "roundwright-supervisor-recovery-reservation/v1",
+            "route": route,
+            "coordinate": coordinate,
+            "remaining_budget": remaining,
+            "execution_binding": entry.advisory_execution.execution_binding.digest,
+        })
+        return route, coordinate, remaining, reservation
+
+    def _authorize_terminal_successor(
+        self, source: DiffReviewSequenceEntry, successor: DiffReviewSequenceEntry,
+    ) -> object:
+        """Issue and reread one durable route for a verified transient failure.
+
+        This intentionally runs on every restart.  An already-consumed route
+        remains readable, but its later consumption fails closed before any
+        successor provider effect can be claimed.
+        """
+
+        source_attempt = read_attempt(
+            self.repository, self.identity, source.selection.provider_attempt_id,
+            context=source.recovery, now=self.dispatch_control.now,
+        )
+        terminal = read_supervisor_terminal_failure(
+            self.repository, self.identity, source.selection.provider_attempt_id,
+        )
+        if source_attempt.session_identity is None or terminal is None:
+            raise ProviderAttemptRuntimeError("provider terminal recovery source is unavailable")
+        failure, evidence = native_failure_class(CodexFailure(terminal.failure_class.value))
+        if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
+            raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
+        # Read the immutable source binding from the failure ledger before
+        # deriving its route.  It catches a changed candidate/profile/session
+        # rather than reconstructing an apparently equivalent caller value.
+        from .state import _open_writable_connection
+        connection = _open_writable_connection(self.repository)
+        try:
+            rows = connection.execute(
+                "SELECT record_digest, record_json FROM failure_recovery_records WHERE task_id = ?",
+                (self.identity.task_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        matches = []
+        for digest, encoded in rows:
+            try:
+                record = parse_failure_record(json.loads(encoded))
+            except Exception:
+                continue
+            if (
+                record.digest == digest
+                and record.binding.role is FailureRole.SUPERVISOR
+                and record.binding.attempt_identity == source.selection.provider_attempt_id
+                and record.binding.session_identity == source_attempt.session_identity
+            ):
+                matches.append(record)
+        if len(matches) != 1:
+            raise ProviderAttemptRuntimeError("provider terminal recovery source is unavailable")
+        record = matches[0]
+        binding = record.binding
+        try:
+            durable = read_durable_failure(self.repository, self.identity, record.digest)
+            if durable.action is not FailureRecoveryAction.PREBOUND_FALLBACK or not durable.retryable:
+                raise ProviderAttemptRuntimeError("provider terminal recovery source is not eligible")
+            route, coordinate, remaining, _reservation = self._recovery_route_material(successor)
+            issued = issue_durable_recovery_route_authorization(
+                self.repository, self.identity, record_digest=record.digest, binding=binding,
+                target_role=FailureRole.SUPERVISOR,
+                target_profile_digest=successor.audit.profile_identity,
+                target_route_digest=route, coordinate_digest=coordinate,
+                remaining_budget_digest=remaining, now=self.dispatch_control.now,
+            )
+            # Reread from durable state rather than trusting the freshly
+            # constructed authorization object across a restart boundary.
+            from .failure_recovery import read_durable_recovery_route_authorization
+            return read_durable_recovery_route_authorization(
+                self.repository, self.identity, issued.route_digest,
+            )
+        except Exception as error:
+            if isinstance(error, ProviderAttemptRuntimeError):
+                raise
+            raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
 
     def materialize_prepared_snapshot(
         self, entries: tuple[DiffReviewSequenceEntry, ...] | None = None,
@@ -654,7 +774,7 @@ class DurableDiffReviewRunner:
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable") from None
 
-    def _execute_selection(self, entry: DiffReviewSequenceEntry) -> tuple[str, bool]:
+    def _execute_selection(self, entry: DiffReviewSequenceEntry, *, recovery_route: object | None = None) -> tuple[str, bool]:
         """Use public durable APIs for exactly one observed native outcome."""
 
         selection, recovery, audit, backend = entry.selection, entry.recovery, entry.audit, entry.backend
@@ -715,6 +835,19 @@ class DurableDiffReviewRunner:
             )
         except RoleCapabilityError as error:
             raise ProviderAttemptRuntimeError("provider attempt budget admission is denied") from error
+        if recovery_route is not None:
+            route, coordinate, remaining, reservation_digest = self._recovery_route_material(entry)
+            try:
+                consume_durable_recovery_route_authorization(
+                    self.repository, self.identity, recovery_route,
+                    reservation_digest=reservation_digest,
+                    target_role=FailureRole.SUPERVISOR,
+                    target_profile_digest=audit.profile_identity,
+                    target_route_digest=route, coordinate_digest=coordinate,
+                    remaining_budget_digest=remaining, now=self.dispatch_control.now,
+                )
+            except Exception as error:
+                raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
         prepared = prepare_attempt(
             self.repository, self.identity, recovery, attempt_id=selection.provider_attempt_id,
             role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,

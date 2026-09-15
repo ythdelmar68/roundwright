@@ -854,7 +854,7 @@ def _denial_authority_digest(*, kind: str, owner: str, task_id: str, repository_
     )).encode("ascii")).hexdigest()
 
 
-def _denial_command_receipt(connection, task_id: str, record_digest: str, binding: FailureBinding, command_id: str, *, kind: str) -> dict[str, str]:
+def _denial_command_receipt(connection, task_id: str, record_digest: str, binding: FailureBinding, command_id: str, *, kind: str, expected_clearance_digest: str | None = None) -> dict[str, str]:
     """Read one exact dedicated denial command and its current host proof.
 
     This deliberately does not look at owner_command_records.  The schemas do
@@ -867,10 +867,15 @@ def _denial_command_receipt(connection, task_id: str, record_digest: str, bindin
         table, grants, expected_kind = "denial_revocation_commands", "denial_revocation_authority_grants", "revoke-denial-clearance"
     else:
         raise FailureRecoveryError("dedicated denial command is invalid")
+    if kind == "clear" and expected_clearance_digest is not None:
+        raise FailureRecoveryError("dedicated denial command clearance is invalid")
+    if kind == "revoke" and (not isinstance(expected_clearance_digest, str) or not _DIGEST.fullmatch(expected_clearance_digest)):
+        raise FailureRecoveryError("dedicated denial command clearance is invalid")
+    clearance_column = "NULL" if kind == "clear" else "commands.clearance_digest"
     row = connection.execute(
         f"SELECT commands.task_id, commands.repository_id, commands.denial_digest, commands.authority_grant_id, "
         f"commands.candidate_sha, commands.candidate_seal, commands.authority_scope, commands.target_digest, "
-        f"commands.command_kind, commands.command_digest, commands.host_result_digest, commands.result_digest, commands.state, "
+        f"commands.command_kind, {clearance_column}, commands.command_digest, commands.host_result_digest, commands.result_digest, commands.state, "
         f"grants.owner_identity, grants.task_id, grants.repository_id, grants.candidate_sha, grants.candidate_seal, "
         f"grants.authority_scope, grants.target_digest, grants.authority_digest, grants.state, seals.candidate_sha, seals.state_identity, tasks.repository_id "
         f"FROM {table} AS commands JOIN {grants} AS grants ON grants.grant_id = commands.authority_grant_id "
@@ -881,7 +886,7 @@ def _denial_command_receipt(connection, task_id: str, record_digest: str, bindin
     if row is None:
         raise FailureRecoveryError("dedicated denial command is unavailable")
     (task, repository, denial, grant_id, candidate, seal, scope, target, command_kind,
-     command_digest, host_result, result_digest, state, owner, grant_task, grant_repository,
+     clearance_digest, command_digest, host_result, result_digest, state, owner, grant_task, grant_repository,
      grant_candidate, grant_seal, grant_scope, grant_target, authority_digest, grant_state,
      sealed_candidate, sealed_state, task_repository) = row
     values = (task, repository, denial, grant_id, candidate, seal, scope, target, command_kind,
@@ -893,6 +898,7 @@ def _denial_command_receipt(connection, task_id: str, record_digest: str, bindin
         or task != task_id or repository != task_repository or denial != record_digest or target != record_digest
         or candidate != binding.candidate_sha or scope != binding.authority_scope
         or command_kind != expected_kind or state != "consumed" or grant_state != "active"
+        or (kind == "revoke" and clearance_digest != expected_clearance_digest)
         or (grant_task, grant_repository, grant_candidate, grant_seal, grant_scope, grant_target) != (task, repository, candidate, seal, scope, target)
         or (sealed_candidate, sealed_state) != (candidate, seal)
         or owner != "ythdelmar68"
@@ -938,7 +944,7 @@ def _decision_history(connection, task_id: str, record_digest: str, binding: Fai
             raise FailureRecoveryError("durable clearance decision has drifted")
         receipt = payload.get("denial_command")
         kind = payload.get("kind")
-        if kind not in {"clear", "revoke"} or type(receipt) is not dict or receipt != _denial_command_receipt(connection, task_id, record_digest, binding, receipt.get("command_id"), kind=kind):
+        if kind not in {"clear", "revoke"} or type(receipt) is not dict or receipt != _denial_command_receipt(connection, task_id, record_digest, binding, receipt.get("command_id"), kind=kind, expected_clearance_digest=predecessor if kind == "revoke" else None):
             raise FailureRecoveryError("durable clearance receipt has drifted")
         if kind not in {"clear", "revoke"} or (kind == "clear" and state != "stopped") or (kind == "revoke" and state != "clear"):
             raise FailureRecoveryError("clearance decision is stale or out of order")
@@ -972,7 +978,10 @@ def _append_clearance_decision(connection, identity, *, kind: str, record_digest
     prior_kind = history[-1][1]["kind"] if history else None
     if (kind == "clear" and prior_kind not in {None, "revoke"}) or (kind == "revoke" and prior_kind != "clear"):
         raise FailureRecoveryError("clearance decision is stale or out of order")
-    receipt = _denial_command_receipt(connection, identity.task_id, record_digest, binding, command_id, kind=kind)
+    receipt = _denial_command_receipt(
+        connection, identity.task_id, record_digest, binding, command_id,
+        kind=kind, expected_clearance_digest=predecessor if kind == "revoke" else None,
+    )
     payload = _decision_payload(kind=kind, record_digest=record_digest, binding=binding, command=receipt, predecessor_digest=predecessor, sequence=len(history) + 1)
     digest = "sha256:" + _digest_json(payload)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))

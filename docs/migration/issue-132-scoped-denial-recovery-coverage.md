@@ -19,6 +19,19 @@ output.
 | E1R2-08 | Duplicate, gapped, regressive, and conflicting attempt coordinates fail closed | `provider_recovery.py` coordinate ledger | `test_provider_recovery.test_supervisor_coordinates_are_unique_and_strictly_monotonic` |
 | E1R3-01 | A security denial can reopen only through a dedicated, single-use clear/revoke authority bound to the exact denial, repository/task, candidate seal, scope, target, and verified-host result; generic review-item commands are inert | `failure_recovery.py` denial ledger | `test_provider_recovery.test_durable_clearance_and_revocation_are_append_only_and_restart_verified` |
 
+## E1R3 stable finding closure
+
+The qualification validator pins every E1R3 review finding by its stable
+identifier. `RW132-PROD-001`, `RW132-RECOVERY-002`, `RW132-BINDING-003`,
+`RW132-DURABLE-004`, `RW132-EVIDENCE-005`, `RW132-TAXONOMY-006`,
+`RW132-ACCOUNTING-007`, and `RW132-QUALIFICATION-008` each name an exact
+production boundary and executable test. In particular, a transient Supervisor
+successor consumes a durable route before dispatch; an UNKNOWN dependency review
+is a reconciliation-required terminal decision; revocation authenticates its
+exact predecessor clearance; and fresh production coordinates begin at logical
+profile 1 / physical ordinal 0. The map and receipt reject omitted, reordered,
+or stale entries.
+
 This extends #112's public-safe coverage destinations with public type names,
 case identities, and record digests only.  It does not rewrite historical
 receipts, publish provider output, or establish live-provider qualification.

@@ -904,6 +904,25 @@ class ProviderRecoveryTests(unittest.TestCase):
             connection = sqlite3.connect(database_path(repository))
             try: require_scope_open(connection, identity.task_id, binding.authority_scope)
             finally: connection.close()
+            # The revocation request names the current clearance, but the
+            # consumed command is independently authenticated against that
+            # same predecessor.  A substituted command column must not revoke
+            # the scope by borrowing this request's digest.
+            self.denial_command(repository, identity, record, "owner-revoke-wrong-clearance", kind="revoke")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute(
+                    "UPDATE denial_revocation_commands SET clearance_digest = ? WHERE command_id = ?",
+                    ("sha256:" + "0" * 64, "owner-revoke-wrong-clearance"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(Exception, "dedicated denial command"):
+                record_durable_clearance_revocation(
+                    repository, identity,
+                    ClearanceRevocation(clearance_digest, binding, "owner-revoke-wrong-clearance"),
+                )
 
     def test_durable_recovery_route_is_exact_single_use_and_restart_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -216,10 +216,15 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
             "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
             "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect",
         )
         self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
         self.assertEqual(tuple(test for test in coverage.SEMANTIC_TESTS if test in required), required)
         self.assertEqual(tuple(coverage.ISSUE_132_FINDING_REQUIREMENTS), tuple(f"E1R2-{number:02d}" for number in range(1, 9)))
+        self.assertEqual(
+            tuple(coverage.ISSUE_132_E1R3_FINDING_REQUIREMENTS),
+            ("RW132-PROD-001", "RW132-RECOVERY-002", "RW132-BINDING-003", "RW132-DURABLE-004", "RW132-EVIDENCE-005", "RW132-TAXONOMY-006", "RW132-ACCOUNTING-007", "RW132-QUALIFICATION-008"),
+        )
 
     def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:
         required = coverage.ISSUE_132_SEMANTIC_TESTS
@@ -242,4 +247,8 @@ class Phase5CoverageTests(unittest.TestCase):
         requirements = dict(coverage.ISSUE_132_FINDING_REQUIREMENTS)
         requirements["E1R2-08"] = ("src/roundwright/missing.py", requirements["E1R2-08"][1])
         with patch.object(coverage, "ISSUE_132_FINDING_REQUIREMENTS", requirements), self.assertRaisesRegex(coverage.CoverageError, "E1R2 finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+        e1r3 = dict(coverage.ISSUE_132_E1R3_FINDING_REQUIREMENTS)
+        e1r3.pop("RW132-QUALIFICATION-008")
+        with patch.object(coverage, "ISSUE_132_E1R3_FINDING_REQUIREMENTS", e1r3), self.assertRaisesRegex(coverage.CoverageError, "E1R3 stable finding mapping"):
             coverage._validate_issue_132_semantic_tests()

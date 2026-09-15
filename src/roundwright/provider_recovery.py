@@ -379,9 +379,11 @@ def _coordinate_transition_is_valid(
     if epoch < 0 or round_number < 1 or logical < 1 or not 0 <= physical <= 2:
         return False
     if previous is None:
-        # A migrated history may begin at a later formal round.  Every new
-        # coordinate is subsequently checked against that durable baseline.
-        return True
+        # Production preparation never imports a historical baseline.  A new
+        # current epoch/round must consume its first logical profile and its
+        # original (not correction) format slot.  Legacy conversion has its
+        # own state migration validator and cannot relax this live boundary.
+        return logical == 1 and physical == 0
     prior_epoch, prior_round, prior_logical, prior_physical = previous
     if epoch == prior_epoch and round_number == prior_round:
         return (
@@ -1034,6 +1036,9 @@ def record_supervisor_terminal_failure(
             raise ProviderRecoveryError("terminal failure conflicts with invalid output")
         connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (AttemptState.INVALIDATED.value, attempt_id))
         row = replace(row, state=AttemptState.INVALIDATED)
+        # provider_health imports this module for ProviderRole, so keep this
+        # trusted enum import at the terminal classification boundary.
+        from .provider_health import CodexFailure
         record_durable_failure(
             repository, identity,
             classify_native_failure(
@@ -1048,7 +1053,11 @@ def record_supervisor_terminal_failure(
                     row.session_identity or "unavailable-session",
                     row.attempt_id,
                 ),
-                failure_class,
+                # SupervisorTerminalFailureClass is a storage projection,
+                # not the trusted native observation enum.  Reconstruct the
+                # exact reviewed enum before classification so a verified
+                # transient is not silently degraded to UNKNOWN.
+                CodexFailure(failure_class.value),
             ),
             now=observed, connection=connection,
         )

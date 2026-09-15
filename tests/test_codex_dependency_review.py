@@ -382,6 +382,34 @@ class DependencyReviewServiceTests(unittest.TestCase):
             self.assertEqual((result.kind, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, 0))
             self.assertFalse(effect["budget_ledger_path"].exists())
 
+    def test_unknown_predecessor_requires_reconciliation_before_successor_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            first_backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            first = CodexDependencyReviewAdapter(first_backend, profile, audit)
+            DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=first,
+                checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity, **self.effect_kwargs(repository, subset, binding, first, attempt_id="attempt-116"),
+            )
+            successor_subset = replace(subset, snapshot_id="subset-117", creation_reason="reconcile-retry")
+            successor_binding = DependencyReviewBinding(
+                successor_subset.candidate_sha, successor_subset.policy_digest,
+                successor_subset.configuration_digest, binding.profile_identity,
+            )
+            successor_backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-117")))
+            successor = CodexDependencyReviewAdapter(successor_backend, profile, audit)
+            effect = self.effect_kwargs(repository, successor_subset, successor_binding, successor, attempt_id="attempt-117")
+            with self.assertRaisesRegex(DependencyReviewDispatchError, "reconciliation is incomplete"):
+                DependencyReviewService().run(
+                    repository, successor_subset, attempt_id="attempt-117", binding=successor_binding, adapter=successor,
+                    checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                    task_identity=identity, supersedes_attempt_id="attempt-116", **effect,
+                )
+            self.assertEqual(successor_backend.sessions, [])
+            self.assertFalse(effect["budget_ledger_path"].exists())
+
     def test_restart_after_persisted_session_claim_blocks_without_a_second_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))

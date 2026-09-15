@@ -256,6 +256,25 @@ class DependencyReviewService:
         )
         if task_identity is not None:
             store.require_current_authority(repository, task_identity, subset, binding)
+        # A previously checkpointed session is already ambiguous.  Detect it
+        # before deriving a recovery route or reserving a successor budget so
+        # restart reconciliation cannot create any later durable effect.
+        recovery_digest = _digest({"attempt_id": attempt_id, "status": "recovered-in-flight-dispatch"})
+        connection = _open_writable_connection(repository)
+        try:
+            existing_attempt = connection.execute(
+                "SELECT 1 FROM dependency_review_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if existing_attempt is not None and store.recover_dispatch_claim(
+            repository, attempt_id=attempt_id, output_digest=recovery_digest,
+        ):
+            return DependencyReviewDispatchResult(
+                DependencyReviewResultKind.AMBIGUOUS, None, None, None,
+                recovery_digest, "uncertain-provider-turn",
+            )
         recovery_route = self._successor_recovery_route(
             repository, task_identity, binding, request, supersedes_attempt_id,
             advisory_execution, execution_host, adapter,

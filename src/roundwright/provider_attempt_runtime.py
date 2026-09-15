@@ -651,6 +651,10 @@ class DurableDiffReviewRunner:
                     self.repository, self.identity, existing.attempt_id,
                 ) is not None:
                     raise ProviderAttemptRuntimeError("provider terminal failure is not format-correctable")
+                if selection.physical_format_output_ordinal == 2:
+                    raise ProviderAttemptFormatCorrectionExhausted(
+                        "Supervisor format correction allowance is exhausted"
+                    )
                 return (existing.attempt_id, False)
             if existing.state is AttemptState.BLOCKED:
                 raise ProviderAttemptRuntimeError("provider attempt session ended before a durable turn checkpoint")

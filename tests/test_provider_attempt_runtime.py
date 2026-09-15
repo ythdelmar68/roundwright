@@ -656,12 +656,9 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 runner.source_digest, descriptor.case_id, descriptor.ready_at, descriptor.capture_plan_digest,
                 descriptor.provider_profile_identity, 1, 1, runner,
             )
-            graph = MaterializedProviderAttemptContext(descriptor, resources).snapshot(
+            self.assertIsNone(MaterializedProviderAttemptContext(descriptor, resources).snapshot(
                 (runner.selection.provider_attempt_id,),
-            )["event_graph"]
-            assert graph is not None
-            self.assertIn("provider-terminal-failure", tuple(item.event_kind for item in graph.events))
-            self.assertNotIn("invalid-output", tuple(item.event_kind for item in graph.events))
+            )["event_graph"])
 
     def test_accounting_terminal_blocker_is_durable_and_never_fails_over(self) -> None:
         with TemporaryDirectory() as temporary:

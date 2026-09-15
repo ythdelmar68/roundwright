@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.failure_recovery import (
-    Clearance, EvidenceSource, FailureBinding, FailureClass, FailureRecoveryError,
+    Clearance, EvidenceConfidence, EvidenceSource, FailureBinding, FailureClass, FailureEvidence, FailureRecoveryError,
     FailureRole, RecoveryAction, admit_recovery, classify,
     RecoveryRouteAdmission, issue_recovery_route_admission,
     parse_failure_record,
@@ -54,7 +54,7 @@ class FailureRecoveryTests(unittest.TestCase):
         binding, route = self.live_route(FailureRole.SUPERVISOR)
         record = classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
         self.assertEqual(admit_recovery(record, binding, route=route), RecoveryAction.STOP_SCOPE)
-        self.assertEqual(admit_recovery(record, binding, route=route, clearance=Clearance(record.digest, binding, EvidenceSource.VERIFIED_HOST)), RecoveryAction.PREBOUND_FALLBACK)
+        self.assertEqual(admit_recovery(record, binding, route=route, clearance=Clearance(record.digest, binding, "command-1")), RecoveryAction.STOP_SCOPE)
         with self.assertRaises(FailureRecoveryError):
             replacement = FailureBinding(
                 binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
@@ -68,6 +68,18 @@ class FailureRecoveryTests(unittest.TestCase):
         self.assertEqual(classify(binding, FailureClass.SESSION_TERMINATED, EvidenceSource.MODEL_SELF_REPORT).action, RecoveryAction.RECONCILE)
         self.assertEqual(classify(binding, FailureClass.MISSING_OUTPUT, EvidenceSource.UNAVAILABLE).action, RecoveryAction.RECONCILE)
         self.assertEqual(classify(binding, FailureClass.PARTIAL_INCREMENT, EvidenceSource.VERIFIED_OUTPUT).action, RecoveryAction.CONTINUE_SAME_SESSION)
+
+    def test_missing_owner_scope_stops_and_persists_confidence_independently(self):
+        record = classify(
+            self.binding(), FailureClass.MISSING_OWNER_SCOPE,
+            FailureEvidence(EvidenceSource.VERIFIED_HOST, EvidenceConfidence.VERIFIED),
+        )
+        self.assertEqual((record.action, record.clearance_required, record.evidence_confidence), (RecoveryAction.STOP_SCOPE, True, EvidenceConfidence.VERIFIED))
+        unverified = classify(
+            self.binding(), FailureClass.HOST_SECURITY_DENIAL,
+            FailureEvidence(EvidenceSource.VERIFIED_HOST, EvidenceConfidence.UNAVAILABLE),
+        )
+        self.assertEqual((unverified.failure, unverified.evidence, unverified.evidence_confidence), (FailureClass.UNKNOWN, EvidenceSource.VERIFIED_HOST, EvidenceConfidence.UNAVAILABLE))
 
     def test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route(self):
         binding, route = self.live_route()
@@ -92,8 +104,12 @@ class FailureRecoveryTests(unittest.TestCase):
 
     def test_closed_record_parser_rejects_tampered_or_unknown_payload(self):
         record = classify(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
-        payload = {"schema": "roundwright-failure-recovery/v1", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
+        payload = {"schema": "roundwright-failure-recovery/v2", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "evidence_confidence": record.evidence_confidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
         self.assertEqual(parse_failure_record(payload), record)
+        legacy = {key: value for key, value in payload.items() if key != "evidence_confidence"}
+        legacy["schema"] = "roundwright-failure-recovery/v1"
+        migrated = parse_failure_record(legacy)
+        self.assertEqual((migrated.record_schema, migrated.evidence_confidence), ("roundwright-failure-recovery/v1", EvidenceConfidence.UNAVAILABLE))
         payload["extra"] = True
         with self.assertRaises(FailureRecoveryError):
             parse_failure_record(payload)

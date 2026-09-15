@@ -38,7 +38,7 @@ from roundwright.provider_recovery import (
     SupervisorTerminalFailureSource,
     SupervisorTerminalFailureSdkCategory,
 )
-from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
+from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult, _owner_authority_digest
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.failure_recovery import Clearance, ClearanceRevocation, EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, require_scope_open
@@ -110,6 +110,23 @@ class ProviderRecoveryTests(unittest.TestCase):
             connection.execute(
                 "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
                 (identity.task_id, identity.base_sha, candidate, lease.state_identity),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def owner_command(self, repository: RepositoryIdentity, identity: TaskIdentity, candidate: str, command_id: str) -> None:
+        """Seed one already-consumed, allowlisted #115 command receipt."""
+        connection = sqlite3.connect(database_path(repository))
+        grant_id = f"grant-{identity.task_id}"
+        try:
+            connection.execute(
+                "INSERT OR IGNORE INTO owner_authority_grants(grant_id, owner_identity, command_scope, task_id, candidate_sha, authority_digest, state) VALUES (?, 'ythdelmar68', 'resolve-review-item', ?, ?, ?, 'active')",
+                (grant_id, identity.task_id, candidate, _owner_authority_digest("ythdelmar68", "resolve-review-item", identity.task_id, candidate)),
+            )
+            connection.execute(
+                "INSERT INTO owner_command_records(command_id, task_id, command_kind, owner_identity, authority_grant_id, target_item_id, candidate_sha, command_digest, scope_digest, idempotency_key, state, result_digest) VALUES (?, ?, 'resolve-review-item', 'ythdelmar68', ?, 'item-clearance', ?, ?, ?, ?, 'consumed', ?)",
+                (command_id, identity.task_id, grant_id, candidate, "a" * 64, "b" * 64, f"key-{command_id}", "c" * 64),
             )
             connection.commit()
         finally:
@@ -798,20 +815,39 @@ class ProviderRecoveryTests(unittest.TestCase):
             record_session_identity(repository, identity, context, attempt_id="clearance-attempt", session_identity="clearance-session", lease=lease)
             binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "worker:" + identity.task_id, FailureRole.WORKER, context.runtime_binding.worker_profile_identity, "clearance-session", "clearance-attempt")
             record = classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST); record_durable_failure(repository, identity, record)
-            clearance = Clearance(record.digest, binding, EvidenceSource.VERIFIED_HOST)
-            self.assertEqual(record_durable_clearance(repository, identity, clearance), clearance.digest)
-            self.assertEqual(record_durable_clearance(repository, identity, clearance), clearance.digest)
+            with self.assertRaisesRegex(Exception, "authenticated owner command"):
+                record_durable_clearance(repository, identity, Clearance(record.digest, binding, "fabricated-host-proof"))
+            other = self.identity("clearance-other"); self.admit(repository, other, lease)
+            self.seal_candidate(repository, other, lease, candidate)
+            self.owner_command(repository, other, candidate, "owner-cross-task")
+            with self.assertRaisesRegex(Exception, "authenticated owner command"):
+                record_durable_clearance(repository, identity, Clearance(record.digest, binding, "owner-cross-task"))
+            self.owner_command(repository, identity, candidate, "owner-clear-1")
+            clearance = Clearance(record.digest, binding, "owner-clear-1")
+            clearance_digest = record_durable_clearance(repository, identity, clearance)
+            with self.assertRaisesRegex(Exception, "stale|out of order"):
+                record_durable_clearance(repository, identity, clearance)
             connection = sqlite3.connect(database_path(repository))
             try: require_scope_open(connection, identity.task_id, binding.authority_scope)
             finally: connection.close()
             with self.assertRaisesRegex(Exception, "denial"):
-                record_durable_clearance(repository, identity, Clearance("sha256:" + "d" * 64, binding, EvidenceSource.VERIFIED_HOST))
-            revocation = ClearanceRevocation(clearance.digest, binding, EvidenceSource.VERIFIED_HOST)
-            self.assertEqual(record_durable_clearance_revocation(repository, identity, revocation), revocation.digest)
+                record_durable_clearance(repository, identity, Clearance("sha256:" + "d" * 64, binding, "owner-clear-1"))
+            self.owner_command(repository, identity, candidate, "owner-revoke-1")
+            revocation = ClearanceRevocation(clearance_digest, binding, "owner-revoke-1")
+            revocation_digest = record_durable_clearance_revocation(repository, identity, revocation)
             connection = sqlite3.connect(database_path(repository))
             try:
                 with self.assertRaisesRegex(Exception, "stopped"): require_scope_open(connection, identity.task_id, binding.authority_scope)
-                connection.execute("UPDATE failure_recovery_clearance_revocations SET revocation_json = '{}' WHERE revocation_digest = ?", (revocation.digest,)); connection.commit()
+            finally: connection.close()
+            self.owner_command(repository, identity, candidate, "owner-clear-2")
+            reclear_digest = record_durable_clearance(repository, identity, Clearance(record.digest, binding, "owner-clear-2"))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                require_scope_open(connection, identity.task_id, binding.authority_scope)
+                connection.execute("UPDATE owner_authority_grants SET authority_digest = ? WHERE grant_id = ?", ("0" * 64, f"grant-{identity.task_id}")); connection.commit()
+                with self.assertRaisesRegex(Exception, "drifted"): require_scope_open(connection, identity.task_id, binding.authority_scope)
+                connection.execute("UPDATE owner_authority_grants SET authority_digest = ? WHERE grant_id = ?", (_owner_authority_digest("ythdelmar68", "resolve-review-item", identity.task_id, candidate), f"grant-{identity.task_id}")); connection.commit()
+                connection.execute("UPDATE failure_recovery_clearance_decisions SET decision_json = '{}' WHERE decision_digest = ?", (reclear_digest,)); connection.commit()
                 with self.assertRaisesRegex(Exception, "malformed"): require_scope_open(connection, identity.task_id, binding.authority_scope)
             finally: connection.close()
 

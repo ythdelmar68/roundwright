@@ -902,6 +902,15 @@ MIGRATIONS = (
             ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0, review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', review_epoch INTEGER NOT NULL DEFAULT 0, logical_profile_position INTEGER NOT NULL DEFAULT 0, physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0)"),
         ),
     ),
+    Migration(
+        72,
+        (
+            "CREATE TABLE failure_recovery_clearance_decisions (decision_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_id TEXT NOT NULL REFERENCES owner_command_records(command_id), decision_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, record_digest, sequence), UNIQUE(task_id, command_id))",
+        ),
+        (
+            ("failure_recovery_clearance_decisions", "CREATE TABLE failure_recovery_clearance_decisions (decision_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_id TEXT NOT NULL REFERENCES owner_command_records(command_id), decision_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, record_digest, sequence), UNIQUE(task_id, command_id))"),
+        ),
+    ),
 )
 
 

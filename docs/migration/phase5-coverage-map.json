@@ -39,7 +39,7 @@
       {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"ff0d8d185c4083c8fe8beaff1c28cb5f066b5cabc57c864f23a1f927934db246"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
       {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"570485e5e1289e761dc20082aa1f47212b8376ae2672cd473d3a819bb812a498"},
-      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"c540c4a66a5507189e09f8529eba3e2828f2b0b0fe2fdc935946a572d6f62261"},
+      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"83ee36f231bcbde5ecdbe481a5fbf427152c08f0f99fafa2534b441da392a909"},
       {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"25131e0ce479beb1f3ee25f5aef5f2639ecf218885ad1bc43bae1a513bc747b0"}
     ]
   },
@@ -47,7 +47,8 @@
     "issue": "132",
     "destinations": ["scoped-denial-classification", "bounded-recovery-eligibility", "public-safe-recovery-qualification"],
     "artifacts": [
-      {"identity":"failure-recovery-contract-v1","path":"src/roundwright/failure_recovery.py","sha256":"73378424bc40114a93b0769cfb28cf3edaaabd20adb76b2d0e6c8f3054d77a38"},
+      {"identity":"failure-recovery-contract-v1","path":"src/roundwright/failure_recovery.py","sha256":"754d03ceb55cfe356360062a2a71a8aebdd9e1183ac55e05118a5c5cda6003c9"},
+      {"identity":"failure-recovery-provider-runtime-v1","path":"src/roundwright/provider_recovery.py","sha256":"d1a88bf8450e327096ef7b47c89c99eced06592d0961707ef3a03162b4151bbf"},
       {"identity":"failure-recovery-tests-v1","path":"tests/test_failure_recovery.py","sha256":"c7418b2ff7e36f4d9f95ae076a2f44e19e42aba2803d4327ab23fb4deea37bbe"},
       {"identity":"failure-recovery-migration-v1","path":"docs/migration/issue-132-scoped-denial-recovery-coverage.md","sha256":"376472a1db20b51f6e1e95b68cbd6b6f5fba460e8affb0b1b343b2e77baaf0a7"},
       {"identity":"failure-recovery-state-v1","path":"src/roundwright/state.py","sha256":"17f4fc5f96eca6bc99f39fda2ab388ae3df2e16a9e6ce4acbb5ac99a8840eef4"},

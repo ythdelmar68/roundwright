@@ -77,6 +77,7 @@ ISSUE_132_REQUIREMENTS = {
 }
 ISSUE_132_ARTIFACTS = {
     "failure-recovery-contract-v1": "src/roundwright/failure_recovery.py",
+    "failure-recovery-provider-runtime-v1": "src/roundwright/provider_recovery.py",
     "failure-recovery-tests-v1": "tests/test_failure_recovery.py",
     "failure-recovery-migration-v1": "docs/migration/issue-132-scoped-denial-recovery-coverage.md",
     "failure-recovery-state-v1": "src/roundwright/state.py",

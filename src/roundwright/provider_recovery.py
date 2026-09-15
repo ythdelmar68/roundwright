@@ -19,6 +19,7 @@ from .configuration import RepositoryIdentity
 from .git_identity import TransitionLease, _require_current_lease
 from .runtime_binding import RuntimeBinding
 from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_runtime_binding, require_runtime_binding
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
 
 
 class ProviderRecoveryError(StateError):
@@ -866,6 +867,9 @@ def record_supervisor_terminal_failure(
             raise ProviderRecoveryError("terminal failure conflicts with invalid output")
         connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (AttemptState.INVALIDATED.value, attempt_id))
         row = replace(row, state=AttemptState.INVALIDATED)
+        failure = FailureClass.HOST_SECURITY_DENIAL if failure_class is SupervisorTerminalFailureClass.SANDBOX_OR_APPROVAL_DENIED else FailureClass.TRANSIENT_SERVICE if failure_class in {SupervisorTerminalFailureClass.PROVIDER_OUTAGE, SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE} else FailureClass.UNKNOWN
+        evidence = EvidenceSource.VERIFIED_HOST if failure is FailureClass.HOST_SECURITY_DENIAL else EvidenceSource.VERIFIED_SERVICE if failure is FailureClass.TRANSIENT_SERVICE else EvidenceSource.UNAVAILABLE
+        record_durable_failure(repository, identity, classify(FailureBinding(context.candidate_sha or identity.base_sha, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, row.selected_profile_identity, row.session_identity or "unavailable-session", row.attempt_id), failure, evidence), now=observed, connection=connection)
         _persist_recovery_outcome(connection, attempt_id, RecoveryAction.FRESH_SUPERVISOR_SESSION, blocker, observed)
         connection.execute(
             "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",

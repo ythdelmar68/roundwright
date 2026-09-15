@@ -163,7 +163,7 @@ def _payload(record: FailureRecord) -> dict[str, object]:
     return {"schema": "roundwright-failure-recovery/v1", "binding": {**record.binding.__dict__, "role": record.binding.role.value}, "failure": record.failure.value, "evidence": record.evidence.value, "retryable": record.retryable, "action": record.action.value, "clearance_required": record.clearance_required}
 
 
-def record_durable_failure(repository, identity, record: FailureRecord, *, now: int | None = None) -> str:
+def record_durable_failure(repository, identity, record: FailureRecord, *, now: int | None = None, connection=None) -> str:
     """Append an idempotent public-safe failure record to the product ledger."""
     from .state import _open_writable_connection, _require_matching_task
     if type(record) is not FailureRecord:
@@ -172,7 +172,8 @@ def record_durable_failure(repository, identity, record: FailureRecord, *, now: 
     if type(observed) is not int or observed <= 0:
         raise FailureRecoveryError("failure record time is invalid")
     encoded = json.dumps(_payload(record), sort_keys=True, separators=(",", ":"))
-    connection = _open_writable_connection(repository)
+    owned_connection = connection is None
+    connection = _open_writable_connection(repository) if owned_connection else connection
     try:
         _require_matching_task(connection, identity)
         current = connection.execute("SELECT task_id, record_json FROM failure_recovery_records WHERE record_digest=?", (record.digest,)).fetchone()
@@ -181,12 +182,15 @@ def record_durable_failure(repository, identity, record: FailureRecord, *, now: 
             connection.execute("INSERT INTO failure_recovery_records(record_digest, task_id, record_json, recorded_at) VALUES (?, ?, ?, ?)", (record.digest, *expected, observed))
         elif current != expected:
             raise FailureRecoveryError("durable failure record conflicts")
-        connection.commit()
+        if owned_connection:
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if owned_connection:
+            connection.rollback()
         raise
     finally:
-        connection.close()
+        if owned_connection:
+            connection.close()
     return record.digest
 
 

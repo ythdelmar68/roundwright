@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,36 @@ ISSUE_136_ARTIFACTS = {
     "advisory-qualification-validator-v1": "ci/validate_phase5_coverage.py",
     "advisory-qualification-validator-tests-v1": "tests/test_phase5_coverage.py",
 }
+ISSUE_132_REQUIREMENTS = {
+    "issue": "132",
+    "destinations": [
+        "scoped-denial-classification", "bounded-recovery-eligibility",
+        "public-safe-recovery-qualification",
+    ],
+}
+ISSUE_132_ARTIFACTS = {
+    "failure-recovery-contract-v1": "src/roundwright/failure_recovery.py",
+    "failure-recovery-provider-runtime-v1": "src/roundwright/provider_recovery.py",
+    "failure-recovery-tests-v1": "tests/test_failure_recovery.py",
+    "failure-recovery-migration-v1": "docs/migration/issue-132-scoped-denial-recovery-coverage.md",
+    "failure-recovery-state-v1": "src/roundwright/state.py",
+    "failure-recovery-roadmap-v1": "docs/operations/dogfood-promotion-roadmap.md",
+    "failure-recovery-supervisor-runtime-v1": "src/roundwright/provider_attempt_runtime.py",
+    "failure-recovery-supervisor-boundary-v1": "src/roundwright/codex_supervisor.py",
+    "failure-recovery-worker-boundary-v1": "src/roundwright/codex_worker.py",
+    "failure-recovery-dependency-boundary-v1": "src/roundwright/codex_dependency_review.py",
+    "failure-recovery-candidate-review-v1": "src/roundwright/candidate_review.py",
+    "failure-recovery-supervisor-runtime-tests-v1": "tests/test_provider_attempt_runtime.py",
+    "failure-recovery-runtime-tests-v1": "tests/test_provider_recovery.py",
+    "failure-recovery-supervisor-tests-v1": "tests/test_codex_supervisor.py",
+    "failure-recovery-worker-tests-v1": "tests/test_codex_worker.py",
+    "failure-recovery-dependency-tests-v1": "tests/test_codex_dependency_review.py",
+    "failure-recovery-candidate-review-tests-v1": "tests/test_candidate_review.py",
+    "failure-recovery-state-tests-v1": "tests/test_state.py",
+    "failure-recovery-semantic-receipt-v1": "ci/phase5_semantic_receipt.py",
+    "failure-recovery-qualification-validator-v1": "ci/validate_phase5_coverage.py",
+    "failure-recovery-qualification-tests-v1": "tests/test_phase5_coverage.py",
+}
 
 # Hashes establish candidate inventory, but do not by themselves establish
 # that the listed artifacts still enforce the Phase 5 boundary.  These named
@@ -77,6 +108,8 @@ SEMANTIC_CONTRACTS = {
     "src/roundwright/worker_toolbox.py": (
         "require_external_production_activation()",
         "class ProductionCodingWorkerRuntime",
+        "class ProductionWorkerFailureLifecycle",
+        "record_terminal_failure",
         "production coding activation is unavailable",
     ),
     "src/roundwright/coding_tools.py": (
@@ -93,12 +126,71 @@ SEMANTIC_CONTRACTS = {
     "tests/test_production_coding_runtime.py": (
         "test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
         "test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
+        "test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
     ),
     "tests/test_coding_tools.py": (
         "test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
     ),
     "tests/test_worker_toolbox.py": (
         "test_sealed_launch_context_rejects_coherent_public_instruction_mutation",
+    ),
+    "src/roundwright/failure_recovery.py": (
+        "class FailureRecord",
+        "def record_durable_clearance",
+        "def record_durable_clearance_revocation",
+        "def admit_recovery",
+    ),
+    "src/roundwright/provider_recovery.py": (
+        "class ProviderAttempt",
+        "def read_supervisor_accounting_snapshot",
+        "def record_supervisor_terminal_failure",
+        "def read_supervisor_terminal_failure",
+        "def prepare_attempt",
+    ),
+    "src/roundwright/provider_attempt_runtime.py": (
+        "class ProviderAttemptFormatCorrectionExhausted",
+        "physical_format_output_ordinal",
+        "provider terminal failure cannot use a format correction route",
+    ),
+    "src/roundwright/codex_supervisor.py": (
+        "roundwright-provider-attempt-accounting-material/v3",
+        "physical_format_output_ordinal",
+        "_eligible_prebound_failover",
+    ),
+    "src/roundwright/codex_worker.py": (
+        "class CodexWorkerAdapter",
+        "SANDBOX_OR_APPROVAL_DENIED",
+    ),
+    "src/roundwright/codex_dependency_review.py": (
+        "record_durable_failure(",
+        "DependencyReviewResultKind.BLOCKED",
+    ),
+    "tests/test_failure_recovery.py": (
+        "test_denial_blocks_same_scope_across_restart_until_exact_clearance",
+    ),
+    "tests/test_provider_recovery.py": (
+        "test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
+        "test_durable_failure_readback_revalidates_current_admission_authority",
+        "test_supervisor_coordinates_are_unique_and_strictly_monotonic",
+    ),
+    "tests/test_codex_worker.py": (
+        "test_typed_denial_and_transport_failure_remain_typed",
+    ),
+    "tests/test_codex_dependency_review.py": (
+        "test_restart_scope_denial_blocks_before_dependency_provider_session",
+        "test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
+        "test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
+    ),
+    "tests/test_codex_supervisor.py": (
+        "test_ambiguous_and_incomplete_results_stop_before_fallback",
+        "test_sequence_advances_invalid_primary_to_valid_fallback",
+    ),
+    "tests/test_provider_attempt_runtime.py": (
+        "test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output",
+        "test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
+        "test_restart_continues_same_profile_at_next_physical_format_ordinal",
+        "test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
+        "test_later_accounting_request_reads_prior_invalid_recovery_without_disclosure",
     ),
 }
 
@@ -279,7 +371,7 @@ def _require_current_candidate(candidate: str) -> None:
 
 def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     document = _read_json(source)
-    if set(document) != {"schema", "implementation_requirements", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
+    if set(document) != {"schema", "implementation_requirements", "issue_132_requirements", "sources", "items"} or document["schema"] != "roundwright-phase5-coverage/v1":
         raise CoverageError("coverage map schema is invalid")
     requirements = document["implementation_requirements"]
     if type(requirements) is not dict or {key: requirements.get(key) for key in ("issue", "destinations")} != ISSUE_136_REQUIREMENTS:
@@ -292,6 +384,10 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
             raise CoverageError("issue 136 artifact digest is invalid")
         if _git_blob_sha256(artifact["path"]) != artifact["sha256"]:
             raise CoverageError("issue 136 artifact digest has drifted")
+    _validate_implementation_requirements(
+        document["issue_132_requirements"], ISSUE_132_REQUIREMENTS,
+        ISSUE_132_ARTIFACTS, "issue 132",
+    )
     _validate_semantic_contracts()
     if type(document["sources"]) is not dict or set(document["sources"]) != {"ledger_sha256", "test_disposition_sha256"}:
         raise CoverageError("coverage source bindings are invalid")
@@ -350,6 +446,21 @@ def validate(source: Path, ledger: Path, tests: Path) -> dict[str, Any]:
     return document
 
 
+def _validate_implementation_requirements(
+    requirements: object, expected: dict[str, object], artifacts_expected: dict[str, str], label: str,
+) -> None:
+    if type(requirements) is not dict or {key: requirements.get(key) for key in ("issue", "destinations")} != expected:
+        raise CoverageError(f"{label} implementation coverage has drifted")
+    artifacts = requirements.get("artifacts")
+    if type(artifacts) is not list or {item.get("identity"): item.get("path") for item in artifacts if type(item) is dict} != artifacts_expected or len(artifacts) != len(artifacts_expected):
+        raise CoverageError(f"{label} artifact identities have drifted")
+    for artifact in artifacts:
+        if type(artifact) is not dict or set(artifact) != {"identity", "path", "sha256"} or type(artifact["sha256"]) is not str or not SHA256.fullmatch(artifact["sha256"]):
+            raise CoverageError(f"{label} artifact digest is invalid")
+        if _git_blob_sha256(artifact["path"]) != artifact["sha256"]:
+            raise CoverageError(f"{label} artifact digest has drifted")
+
+
 def _validate_semantic_contracts() -> None:
     """Fail closed if candidate code or its adversarial tests lose a boundary."""
     for relative_path, markers in SEMANTIC_CONTRACTS.items():
@@ -373,20 +484,101 @@ def _semantic_contract_digest() -> str:
     return _digest(_canonical(payload))
 
 
-_SEMANTIC_TESTS = (
+SEMANTIC_TESTS = (
     "tests.test_production_coding_runtime.ProductionRuntimeTests.test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
     "tests.test_production_coding_runtime.ProductionRuntimeTests.test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
     "tests.test_worker_toolbox.WorkerToolboxTests.test_sealed_launch_context_rejects_coherent_public_instruction_mutation",
     "tests.test_coding_tools.BoundedCodingToolsTests.test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
     "tests.test_role_capability_policy.RoleCapabilityPolicyTests.test_scope_traversal_unknown_descriptors_and_capability_expansion_fail_closed",
+    "tests.test_codex_worker.CodexWorkerAdapterTests.test_typed_denial_and_transport_failure_remain_typed",
+    "tests.test_codex_supervisor.SupervisorTests.test_security_denial_stops_before_a_prebound_profile_fallback",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_scope_denial_blocks_before_dependency_provider_session",
+    "tests.test_failure_recovery.FailureRecoveryTests.test_denial_blocks_same_scope_across_restart_until_exact_clearance",
+    "tests.test_failure_recovery.FailureRecoveryTests.test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route",
+    "tests.test_failure_recovery.FailureRecoveryTests.test_closed_matrix_allows_only_canonical_evidence_and_recovery_categories",
+    "tests.test_failure_recovery.FailureRecoveryTests.test_closed_record_parser_rejects_tampered_or_unknown_payload",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic",
+    "tests.test_candidate_review.CandidateReviewTests.test_diff_dispatch_requires_the_exact_within_round_profile",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
+    "tests.test_codex_supervisor.SupervisorTests.test_ambiguous_and_incomplete_results_stop_before_fallback",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_later_accounting_request_reads_prior_invalid_recovery_without_disclosure",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
+    "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect",
 )
+WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
+ISSUE_132_FINDING_REQUIREMENTS = {
+    "E1R2-01": ("src/roundwright/codex_worker.py", "tests.test_codex_worker.CodexWorkerAdapterTests.test_typed_denial_and_transport_failure_remain_typed"),
+    "E1R2-02": ("src/roundwright/codex_supervisor.py", "tests.test_codex_supervisor.SupervisorTests.test_security_denial_stops_before_a_prebound_profile_fallback"),
+    "E1R2-03": ("src/roundwright/codex_dependency_review.py", "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_scope_denial_blocks_before_dependency_provider_session"),
+    "E1R2-04": ("src/roundwright/failure_recovery.py", "tests.test_failure_recovery.FailureRecoveryTests.test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route"),
+    "E1R2-05": ("src/roundwright/failure_recovery.py", "tests.test_failure_recovery.FailureRecoveryTests.test_closed_matrix_allows_only_canonical_evidence_and_recovery_categories"),
+    "E1R2-06": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority"),
+    "E1R2-07": ("src/roundwright/failure_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified"),
+    "E1R2-08": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic"),
+}
+ISSUE_132_AFFECTED_MODULE_TESTS = {
+    "src/roundwright/candidate_review.py": "tests.test_candidate_review.CandidateReviewTests.test_diff_dispatch_requires_the_exact_within_round_profile",
+}
+ISSUE_132_E1R3_TESTS = (
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
+    "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect",
+)
+ISSUE_132_E1R3_FINDING_REQUIREMENTS = {
+    "RW132-PROD-001": ("src/roundwright/codex_dependency_review.py", "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect"),
+    "RW132-RECOVERY-002": ("src/roundwright/provider_attempt_runtime.py", "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output"),
+    "RW132-BINDING-003": ("src/roundwright/failure_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority"),
+    "RW132-DURABLE-004": ("src/roundwright/failure_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified"),
+    "RW132-EVIDENCE-005": ("src/roundwright/failure_recovery.py", "tests.test_failure_recovery.FailureRecoveryTests.test_closed_matrix_allows_only_canonical_evidence_and_recovery_categories"),
+    "RW132-TAXONOMY-006": ("src/roundwright/failure_recovery.py", "tests.test_failure_recovery.FailureRecoveryTests.test_closed_record_parser_rejects_tampered_or_unknown_payload"),
+    "RW132-ACCOUNTING-007": ("src/roundwright/provider_recovery.py", "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic"),
+    "RW132-QUALIFICATION-008": ("ci/phase5_semantic_receipt.py", "tests.test_phase5_coverage.Phase5CoverageTests.test_issue_132_semantic_inventory_is_independently_pinned_and_ordered"),
+}
+ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + tuple(ISSUE_132_AFFECTED_MODULE_TESTS.values()) + (
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
+) + ISSUE_132_E1R3_TESTS
+def _validate_issue_132_semantic_tests() -> None:
+    """Keep the independently maintained E1R2/E1R3 inventory closed and ordered."""
+    if len(ISSUE_132_FINDING_REQUIREMENTS) != 8 or len(set(ISSUE_132_FINDING_REQUIREMENTS)) != 8:
+        raise CoverageError("Issue 132 E1R2 finding inventory is incomplete")
+    if any(not (ROOT / path).is_file() for path, _test in ISSUE_132_FINDING_REQUIREMENTS.values()):
+        raise CoverageError("Issue 132 E1R2 finding mapping has drifted")
+    if ISSUE_132_AFFECTED_MODULE_TESTS != {
+        "src/roundwright/candidate_review.py": "tests.test_candidate_review.CandidateReviewTests.test_diff_dispatch_requires_the_exact_within_round_profile",
+    } or any(not (ROOT / path).is_file() for path in ISSUE_132_AFFECTED_MODULE_TESTS):
+        raise CoverageError("Issue 132 affected-module regression inventory is incomplete")
+    if len(ISSUE_132_E1R3_TESTS) != 5:
+        raise CoverageError("Issue 132 E1R3 finding inventory is incomplete")
+    if set(ISSUE_132_E1R3_FINDING_REQUIREMENTS) != {
+        "RW132-PROD-001", "RW132-RECOVERY-002", "RW132-BINDING-003",
+        "RW132-DURABLE-004", "RW132-EVIDENCE-005", "RW132-TAXONOMY-006",
+        "RW132-ACCOUNTING-007", "RW132-QUALIFICATION-008",
+    } or any(not (ROOT / path).is_file() for path, _test in ISSUE_132_E1R3_FINDING_REQUIREMENTS.values()):
+        raise CoverageError("Issue 132 E1R3 stable finding mapping is incomplete")
+    if tuple(test for test in SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
+        raise CoverageError("Issue 132 semantic test inventory is omitted, reordered, or drifted")
 
 def _semantic_execution(path: Path, candidate: str) -> str:
+    _validate_issue_132_semantic_tests()
     try:
         actual = _read_json(path)
     except CoverageError as error:
         raise CoverageError("Phase 5 semantic execution receipt is unavailable") from error
-    payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": list(_SEMANTIC_TESTS), "status": "passed"}
+    payload = {"schema": "roundwright-phase5-semantic-execution/v3", "candidate_sha": candidate, "tests": list(SEMANTIC_TESTS), "executed_tests": list(SEMANTIC_TESTS), "skipped_tests": list(WINDOWS_DECLARED_SKIPS if sys.platform == "win32" else ()), "windows_declared_skips": list(WINDOWS_DECLARED_SKIPS), "status": "passed"}
     if actual != {**payload, "receipt_digest": "sha256:" + _digest(_canonical(payload))}:
         raise CoverageError("Phase 5 semantic execution receipt is stale or forged")
     return actual["receipt_digest"]

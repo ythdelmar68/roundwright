@@ -958,6 +958,44 @@ class DurableRoleBudgetLedger:
             if connection is not None:
                 connection.close()
 
+    def release_exact_reservation(self, *, exposure: RoleBudget) -> None:
+        """Undo an unconsumed successor reservation after route rejection.
+
+        The ledger key includes the exact execution binding, so this removes
+        only the reservation being rejected; it cannot refund a different
+        provider effect or a partially consumed budget.
+        """
+
+        if type(exposure) is not RoleBudget:
+            raise RoleCapabilityError("role budget exposure is invalid")
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self._path, timeout=5, isolation_level=None)
+            with self._lock:
+                connection.execute("PRAGMA busy_timeout=5000")
+                connection.execute("BEGIN IMMEDIATE")
+                expected = (self._schema, self._grant, self._binding,
+                            exposure.max_calls, exposure.max_duration_seconds,
+                            exposure.max_tokens)
+                row = connection.execute(
+                    "SELECT schema, grant_digest, binding_digest, calls, duration_seconds, tokens "
+                    "FROM role_budget_usage WHERE ledger_key=?", (self.key,),
+                ).fetchone()
+                if row != expected:
+                    raise RoleCapabilityError("role budget reservation cannot be released")
+                if connection.execute(
+                    "DELETE FROM role_budget_usage WHERE ledger_key=?", (self.key,),
+                ).rowcount != 1:
+                    raise RoleCapabilityError("role budget reservation cannot be released")
+                connection.execute("COMMIT")
+        except RoleCapabilityError:
+            raise
+        except (OSError, sqlite3.DatabaseError, sqlite3.OperationalError) as error:
+            raise RoleCapabilityError("role budget reservation cannot be released") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
 
 _EFFECT_RESERVATION_SEAL = object()
 
@@ -1007,6 +1045,17 @@ class TrustedRoleEffectReservation:
     def execution_binding(self) -> ExecutionInstanceBinding:
         return self._binding
 
+    @property
+    def recovery_digest(self) -> str:
+        """A sealed identity for this exact reserved successor effect."""
+
+        if self._seal is not _EFFECT_RESERVATION_SEAL:
+            raise RoleCapabilityError("trusted role effect reservation is invalid")
+        return _recovery_reservation_digest(
+            self._binding, self._exposure, self._profile,
+            self._request_identity, self._request_digest, self._preflight_digest,
+        )
+
     def require_before_effect(
         self, execution: "SealedRoleExecution", *, profile: ProviderProfile,
         request_or_attempt_identity: str, request_material: Mapping[str, object],
@@ -1030,6 +1079,66 @@ class TrustedRoleEffectReservation:
             raise RoleCapabilityError("trusted role effect binding has drifted")
         self._ledger.require_reserved(exposure=self._exposure)
         return receipt
+
+    def require_recovery_route(self, execution: "SealedRoleExecution") -> ExecutionInstanceBinding:
+        """Revalidate the exact reservation before it can authorize a retry route.
+
+        Recovery must not treat a previously returned admission receipt as a
+        transferable fallback grant.  The target effect remains tied to this
+        reservation's sealed execution binding and its already-reserved
+        worst-case budget.
+        """
+
+        if self._seal is not _EFFECT_RESERVATION_SEAL or type(execution) is not SealedRoleExecution:
+            raise RoleCapabilityError("trusted recovery route reservation is invalid")
+        execution.require_before_effect(expected_execution=self._binding)
+        self._ledger.require_reserved(exposure=self._exposure)
+        return self._binding
+
+    def reject_recovery_route(self) -> None:
+        """Remove a reservation that never acquired its durable route."""
+
+        if self._seal is not _EFFECT_RESERVATION_SEAL:
+            raise RoleCapabilityError("trusted role effect reservation is invalid")
+        self._ledger.release_exact_reservation(exposure=self._exposure)
+
+
+def _recovery_reservation_digest(
+    binding: ExecutionInstanceBinding, exposure: RoleBudget, profile: ProviderProfile,
+    request_identity: str, request_digest: str, preflight_digest: str,
+) -> str:
+    return _digest({
+        "schema": "roundwright-recovery-effect-reservation/v1",
+        "execution_binding": binding.digest,
+        "budget": exposure.__dict__, "profile": profile.__dict__,
+        "request_identity": request_identity, "request_digest": request_digest,
+        "preflight_digest": preflight_digest,
+    })
+
+
+def recovery_reservation_digest(
+    execution: "SealedRoleExecution", *, host_inputs: TrustedExecutionHostInputs,
+    profile: ProviderProfile, request_or_attempt_identity: str,
+    request_material: Mapping[str, object], preflight_material: Mapping[str, object],
+) -> str:
+    """Derive the future sealed reservation identity without reserving it.
+
+    A recovery route can name this value before a successor is admitted, but
+    route consumption later accepts only a real reservation that re-derives
+    exactly this digest.
+    """
+
+    _receipt, binding = derive_and_require_execution_for_effect(
+        execution, host_inputs=host_inputs, profile=profile,
+        request_or_attempt_identity=request_or_attempt_identity,
+        request_material=request_material, preflight_material=preflight_material,
+    )
+    return _recovery_reservation_digest(
+        binding, execution.contract.profile.budget, profile,
+        request_or_attempt_identity,
+        _digest({"schema": "roundwright-reserved-effect-request/v1", "material": dict(request_material)}),
+        _digest({"schema": "roundwright-reserved-effect-preflight/v1", "material": dict(preflight_material)}),
+    )
 
 
 def reserve_role_effect(

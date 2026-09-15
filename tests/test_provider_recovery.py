@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import sys
 import tempfile
@@ -33,10 +34,15 @@ from roundwright.provider_recovery import (
     record_invalid_output,
     record_session_identity,
     recover_attempt,
+    record_supervisor_terminal_failure,
+    SupervisorTerminalFailureClass,
+    SupervisorTerminalFailureSource,
+    SupervisorTerminalFailureSdkCategory,
 )
-from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult
+from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult, _owner_authority_digest
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
+from roundwright.failure_recovery import Clearance, ClearanceRevocation, DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, classify, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_recovery_route_authorization, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, require_scope_open
 
 
 class ProviderRecoveryTests(unittest.TestCase):
@@ -98,6 +104,49 @@ class ProviderRecoveryTests(unittest.TestCase):
             owner="recovery-tests",
             ttl_seconds=1000,
         )
+
+    def seal_candidate(self, repository: RepositoryIdentity, identity: TaskIdentity, lease: object, candidate: str) -> None:
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute(
+                "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                (identity.task_id, identity.base_sha, candidate, lease.state_identity),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def denial_command(self, repository: RepositoryIdentity, identity: TaskIdentity, record, command_id: str, *, kind: str) -> None:
+        """Seed one consumed command in the dedicated denial namespace."""
+        connection = sqlite3.connect(database_path(repository))
+        grant_id = f"{kind}-grant-{identity.task_id}"
+        candidate = record.binding.candidate_sha
+        seal = connection.execute("SELECT state_identity FROM candidate_seals WHERE task_id = ?", (identity.task_id,)).fetchone()[0]
+        scope = record.binding.authority_scope
+        denial = record.digest
+        command_kind = "clear-denial" if kind == "clear" else "revoke-denial-clearance"
+        grants = "denial_clearance_authority_grants" if kind == "clear" else "denial_revocation_authority_grants"
+        commands = "denial_clearance_commands" if kind == "clear" else "denial_revocation_commands"
+        authority = _denial_authority_digest(kind=command_kind, owner="ythdelmar68", task_id=identity.task_id, repository_id=identity.repository_id, candidate_sha=candidate, candidate_seal=seal, authority_scope=scope, target_digest=denial)
+        try:
+            connection.execute(
+                f"INSERT OR IGNORE INTO {grants}(grant_id, owner_identity, task_id, repository_id, candidate_sha, candidate_seal, authority_scope, target_digest, authority_digest, state) VALUES (?, 'ythdelmar68', ?, ?, ?, ?, ?, ?, ?, 'active')",
+                (grant_id, identity.task_id, identity.repository_id, candidate, seal, scope, denial, authority),
+            )
+            if kind == "clear":
+                connection.execute(
+                    f"INSERT INTO {commands}(command_id, task_id, repository_id, denial_digest, authority_grant_id, candidate_sha, candidate_seal, authority_scope, target_digest, command_kind, command_digest, host_result_digest, result_digest, idempotency_key, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'clear-denial', ?, ?, ?, ?, 'consumed')",
+                    (command_id, identity.task_id, identity.repository_id, denial, grant_id, candidate, seal, scope, denial, "a" * 64, "b" * 64, "c" * 64, f"key-{command_id}"),
+                )
+            else:
+                clearance = connection.execute("SELECT decision_digest FROM denial_clearance_decisions WHERE task_id = ? AND record_digest = ? AND command_kind = 'clear-denial' ORDER BY sequence DESC LIMIT 1", (identity.task_id, denial)).fetchone()[0]
+                connection.execute(
+                    f"INSERT INTO {commands}(command_id, task_id, repository_id, denial_digest, clearance_digest, authority_grant_id, candidate_sha, candidate_seal, authority_scope, target_digest, command_kind, command_digest, host_result_digest, result_digest, idempotency_key, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'revoke-denial-clearance', ?, ?, ?, ?, 'consumed')",
+                    (command_id, identity.task_id, identity.repository_id, denial, clearance, grant_id, candidate, seal, scope, denial, "a" * 64, "b" * 64, "c" * 64, f"key-{command_id}"),
+                )
+            connection.commit()
+        finally:
+            connection.close()
 
     def prepare(self, repository: RepositoryIdentity, identity: TaskIdentity, lease: object, *, role: ProviderRole, attempt: str):
         return prepare_attempt(
@@ -678,6 +727,230 @@ class ProviderRecoveryTests(unittest.TestCase):
             self.assertEqual(record_invalid_output(repository, identity, self.context(identity), attempt_id="invalid-replay", output_pointer="invalid-replay-output", output_fingerprint="e" * 64, reason_fingerprint="f" * 64, lease=lease), first_invalid)
             with self.assertRaises(ProviderRecoveryError):
                 record_invalid_output(repository, identity, self.context(identity), attempt_id="invalid-replay", output_pointer="invalid-replay-output", output_fingerprint="e" * 64, reason_fingerprint="a" * 64, lease=lease)
+
+    def test_restart_rejects_changed_worker_attempt_after_durable_scope_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("denied")
+            self.admit(repository, identity, lease)
+            candidate = "c" * 40
+            context = self.context(identity, candidate=candidate, role=ProviderRole.WORKER)
+            self.seal_candidate(repository, identity, lease, candidate)
+            prepare_attempt(repository, identity, context, attempt_id="denial-attempt", role=ProviderRole.WORKER, process_lease_id="lease-denial", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="denial-attempt", session_identity="session-before-denial", lease=lease)
+            binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "worker:" + identity.task_id, FailureRole.WORKER, context.runtime_binding.worker_profile_identity, "session-before-denial", "denial-attempt")
+            record_durable_failure(repository, identity, classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            with self.assertRaisesRegex(ProviderRecoveryError, "scope is stopped"):
+                self.prepare(repository, identity, lease, role=ProviderRole.WORKER, attempt="changed-session-attempt")
+
+    def test_failure_admission_is_raw_bound_and_legacy_contexts_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("admission")
+            self.admit(repository, identity, lease)
+            candidate = "c" * 40
+            context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+            prepare_attempt(repository, identity, context, attempt_id="admitted", role=ProviderRole.SUPERVISOR, process_lease_id="lease-admitted", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="admitted", session_identity="admitted-session", lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity FROM provider_failure_admissions WHERE attempt_id = ?", ("admitted",)).fetchone(), (identity.task_id, candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, "supervisor", context.runtime_binding.supervisor_profile_identities[0], "admitted-session", "admitted"))
+            finally:
+                connection.close()
+            legacy = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, context.runtime_binding.supervisor_profile_identities[0], "legacy-session", "legacy-attempt")
+            with self.assertRaisesRegex(Exception, "admission"):
+                record_durable_failure(repository, identity, classify(legacy, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+
+    def test_failure_admission_rejects_tamper_cross_task_and_stale_candidate_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("tamper")
+            self.admit(repository, identity, lease)
+            candidate = "c" * 40
+            context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+            prepare_attempt(repository, identity, context, attempt_id="tamper-attempt", role=ProviderRole.SUPERVISOR, process_lease_id="lease-tamper", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="tamper-attempt", session_identity="tamper-session", lease=lease)
+            record_external_turn(repository, identity, context, attempt_id="tamper-attempt", session_identity="tamper-session", external_turn_identity="tamper-turn", lease=lease)
+            binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, context.runtime_binding.supervisor_profile_identities[0], "tamper-session", "tamper-attempt")
+            other_identity = self.identity("other-task")
+            self.admit(repository, other_identity, lease)
+            with self.assertRaisesRegex(Exception, "admission"):
+                record_durable_failure(repository, other_identity, classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("UPDATE provider_failure_admissions SET configuration_digest = ? WHERE attempt_id = ?", ("sha256:" + "d" * 64, "tamper-attempt")); connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(Exception, "admission"):
+                record_durable_failure(repository, identity, classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            self.assertEqual(read_attempt(repository, identity, "tamper-attempt").state, AttemptState.DISPATCHED)
+            replacement = self.context(identity, candidate="d" * 40, role=ProviderRole.SUPERVISOR)
+            with self.assertRaisesRegex(ProviderRecoveryError, "drifted"):
+                record_supervisor_terminal_failure(repository, identity, replacement, attempt_id="tamper-attempt", failure_class=SupervisorTerminalFailureClass.SANDBOX_OR_APPROVAL_DENIED, outcome_source=SupervisorTerminalFailureSource.SDK_TURN_FAILED, sdk_error_category=SupervisorTerminalFailureSdkCategory.SANDBOX, lease=lease)
+
+    def test_durable_failure_readback_revalidates_current_admission_authority(self) -> None:
+        mutations = {
+            "missing-admission": "DELETE FROM provider_failure_admissions WHERE attempt_id = 'readback-attempt'",
+            "tampered-admission": "UPDATE provider_failure_admissions SET configuration_digest = 'sha256:" + "d" * 64 + "' WHERE attempt_id = 'readback-attempt'",
+            "moved-candidate": "UPDATE candidate_seals SET candidate_sha = '" + "d" * 40 + "' WHERE task_id = 'task-22-readback'",
+            "superseded-policy": "UPDATE provider_attempt_contexts SET policy_fingerprint = '" + "d" * 64 + "' WHERE attempt_id = 'readback-attempt'",
+            "superseded-runtime": "UPDATE runtime_configuration_bindings SET resolved_digest = 'sha256:" + "d" * 64 + "' WHERE task_id = 'task-22-readback'",
+            "substituted-profile": "UPDATE provider_attempts SET selected_profile_identity = 'sha256:" + "d" * 64 + "' WHERE attempt_id = 'readback-attempt'",
+            "substituted-session": "UPDATE provider_session_checkpoints SET session_identity = 'replacement-session' WHERE attempt_id = 'readback-attempt'",
+        }
+        for name, mutation in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary)); initialize(repository)
+                lease = self.lease(repository); identity = self.identity("readback"); self.admit(repository, identity, lease)
+                candidate = "c" * 40; self.seal_candidate(repository, identity, lease, candidate)
+                context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+                prepare_attempt(repository, identity, context, attempt_id="readback-attempt", role=ProviderRole.SUPERVISOR, process_lease_id="lease-readback", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+                record_session_identity(repository, identity, context, attempt_id="readback-attempt", session_identity="readback-session", lease=lease)
+                binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, context.runtime_binding.supervisor_profile_identities[0], "readback-session", "readback-attempt")
+                record = classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
+                record_durable_failure(repository, identity, record)
+                self.assertEqual(read_durable_failure(repository, identity, record.digest), record)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    canonical = connection.execute("SELECT record_json FROM failure_recovery_records WHERE record_digest = ?", (record.digest,)).fetchone()[0]
+                    tampered = json.loads(canonical); tampered["evidence"] = EvidenceSource.VERIFIED_SERVICE.value
+                    connection.execute("UPDATE failure_recovery_records SET record_json = ? WHERE record_digest = ?", (json.dumps(tampered, sort_keys=True, separators=(",", ":")), record.digest)); connection.commit()
+                    with self.assertRaisesRegex(Exception, "malformed"):
+                        read_durable_failure(repository, identity, record.digest)
+                    connection.execute("UPDATE failure_recovery_records SET record_json = ? WHERE record_digest = ?", (canonical, record.digest))
+                    connection.execute(mutation); connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaisesRegex(Exception, "authority|admission"):
+                    read_durable_failure(repository, identity, record.digest)
+                other = self.identity("readback-other"); self.admit(repository, other, lease)
+                with self.assertRaises(Exception):
+                    read_durable_failure(repository, other, record.digest)
+
+    def test_supervisor_coordinates_are_unique_and_strictly_monotonic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("coordinate")
+            self.admit(repository, identity, lease)
+            context = self.context(identity, role=ProviderRole.SUPERVISOR)
+            profile = context.runtime_binding.supervisor_profile_identities[0]
+            # Coordinate replay is an identity check, not a clock-race test.
+            # Keep the lease input fixed across the adversarial sequence.
+            lease_expires_at = 2_000_000_000
+
+            def reserve(attempt: str, *, epoch: int, review_round: int, physical: int):
+                return prepare_attempt(
+                    repository, identity, context, attempt_id=attempt,
+                    role=ProviderRole.SUPERVISOR, process_lease_id=f"lease-{attempt}",
+                    process_lease_expires_at=lease_expires_at,
+                    input_fingerprint="a" * 64, selected_profile_identity=profile,
+                    logical_profile_position=1, physical_format_output_ordinal=physical,
+                    review_epoch=epoch, review_round=review_round, lease=lease,
+                )
+
+            first = reserve("coordinate-zero", epoch=1, review_round=1, physical=0)
+            self.assertEqual(first, reserve("coordinate-zero", epoch=1, review_round=1, physical=0))
+            reserve("coordinate-one", epoch=1, review_round=1, physical=1)
+            reserve("coordinate-two", epoch=1, review_round=1, physical=2)
+            reserve("coordinate-round-two", epoch=1, review_round=2, physical=0)
+            with self.assertRaisesRegex(ProviderRecoveryError, "conflicts"):
+                reserve("coordinate-duplicate", epoch=1, review_round=2, physical=0)
+            with self.assertRaisesRegex(ProviderRecoveryError, "stale, regressive, or gapped"):
+                reserve("coordinate-gap", epoch=1, review_round=4, physical=0)
+            with self.assertRaisesRegex(ProviderRecoveryError, "stale, regressive, or gapped"):
+                reserve("coordinate-regression", epoch=0, review_round=1, physical=0)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO supervisor_attempt_coordinates("
+                        "attempt_id, task_id, review_epoch, review_round, logical_profile_position, "
+                        "physical_format_output_ordinal, profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        ("database-coordinate-duplicate", identity.task_id, 1, 2, 1, 0, profile),
+                    )
+            finally:
+                connection.close()
+
+    def test_durable_clearance_and_revocation_are_append_only_and_restart_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("clearance"); self.admit(repository, identity, lease)
+            candidate = "c" * 40; context = self.context(identity, candidate=candidate, role=ProviderRole.WORKER)
+            self.seal_candidate(repository, identity, lease, candidate)
+            prepare_attempt(repository, identity, context, attempt_id="clearance-attempt", role=ProviderRole.WORKER, process_lease_id="lease-clearance", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="clearance-attempt", session_identity="clearance-session", lease=lease)
+            binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "worker:" + identity.task_id, FailureRole.WORKER, context.runtime_binding.worker_profile_identity, "clearance-session", "clearance-attempt")
+            record = classify(binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST); record_durable_failure(repository, identity, record)
+            # A consumed generic review command has a deliberately disjoint
+            # namespace.  It cannot become a denial-clearance receipt.
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("INSERT INTO owner_authority_grants(grant_id, owner_identity, command_scope, task_id, candidate_sha, authority_digest, state) VALUES ('generic-denial-grant', 'ythdelmar68', 'resolve-review-item', ?, ?, ?, 'active')", (identity.task_id, candidate, _owner_authority_digest("ythdelmar68", "resolve-review-item", identity.task_id, candidate)))
+                connection.execute("INSERT INTO owner_command_records(command_id, task_id, command_kind, owner_identity, authority_grant_id, target_item_id, candidate_sha, command_digest, scope_digest, idempotency_key, state, result_digest) VALUES ('generic-denial-command', ?, 'resolve-review-item', 'ythdelmar68', 'generic-denial-grant', 'generic-target', ?, ?, ?, 'generic-denial-key', 'consumed', ?)", (identity.task_id, candidate, "a" * 64, "b" * 64, "c" * 64))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(Exception, "dedicated denial command"):
+                record_durable_clearance(repository, identity, Clearance(record.digest, binding, "generic-denial-command"))
+            with self.assertRaisesRegex(Exception, "dedicated denial command"):
+                record_durable_clearance(repository, identity, Clearance(record.digest, binding, "fabricated-host-proof"))
+            other = self.identity("clearance-other"); self.admit(repository, other, lease)
+            self.seal_candidate(repository, other, lease, candidate)
+            self.denial_command(repository, other, record, "owner-cross-task", kind="clear")
+            with self.assertRaisesRegex(Exception, "dedicated denial command"):
+                record_durable_clearance(repository, identity, Clearance(record.digest, binding, "owner-cross-task"))
+            self.denial_command(repository, identity, record, "owner-clear-1", kind="clear")
+            clearance = Clearance(record.digest, binding, "owner-clear-1")
+            clearance_digest = record_durable_clearance(repository, identity, clearance)
+            with self.assertRaisesRegex(Exception, "stale|out of order"):
+                record_durable_clearance(repository, identity, clearance)
+            connection = sqlite3.connect(database_path(repository))
+            try: require_scope_open(connection, identity.task_id, binding.authority_scope)
+            finally: connection.close()
+            # The revocation request names the current clearance, but the
+            # consumed command is independently authenticated against that
+            # same predecessor.  A substituted command column must not revoke
+            # the scope by borrowing this request's digest.
+            self.denial_command(repository, identity, record, "owner-revoke-wrong-clearance", kind="revoke")
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute(
+                    "UPDATE denial_revocation_commands SET clearance_digest = ? WHERE command_id = ?",
+                    ("sha256:" + "0" * 64, "owner-revoke-wrong-clearance"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(Exception, "dedicated denial command"):
+                record_durable_clearance_revocation(
+                    repository, identity,
+                    ClearanceRevocation(clearance_digest, binding, "owner-revoke-wrong-clearance"),
+                )
+
+    def test_durable_recovery_route_is_exact_single_use_and_restart_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("route-ledger"); self.admit(repository, identity, lease)
+            candidate = "c" * 40; self.seal_candidate(repository, identity, lease, candidate)
+            context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+            prepare_attempt(repository, identity, context, attempt_id="route-source", role=ProviderRole.SUPERVISOR, process_lease_id="lease-route", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="a" * 64, lease=lease)
+            record_session_identity(repository, identity, context, attempt_id="route-source", session_identity="route-session", lease=lease)
+            binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest, "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, context.runtime_binding.supervisor_profile_identities[0], "route-session", "route-source")
+            record = classify(binding, FailureClass.SESSION_TERMINATED, EvidenceSource.VERIFIED_LIFECYCLE)
+            record_durable_failure(repository, identity, record)
+            values = dict(record_digest=record.digest, binding=binding, target_role=FailureRole.SUPERVISOR, target_profile_digest=context.runtime_binding.supervisor_profile_identities[1], target_route_digest="sha256:" + "d" * 64, coordinate_digest="sha256:" + "e" * 64, remaining_budget_digest="sha256:" + "f" * 64)
+            issued = issue_durable_recovery_route_authorization(repository, identity, **values)
+            self.assertEqual(read_durable_recovery_route_authorization(repository, identity, issued.route_digest), issued)
+            self.assertEqual(issue_durable_recovery_route_authorization(repository, identity, **values), issued)
+            with self.assertRaises(Exception):
+                issue_durable_recovery_route_authorization(repository, identity, **{**values, "coordinate_digest": "sha256:" + "1" * 64})
+            with self.assertRaises(Exception):
+                consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.WORKER, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
+            consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
+            with self.assertRaises(Exception):
+                consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
+            with self.assertRaises(Exception):
+                issue_durable_recovery_route_authorization(repository, identity, **{**values, "record_digest": "sha256:" + "0" * 64})
 
 
 if __name__ == "__main__":

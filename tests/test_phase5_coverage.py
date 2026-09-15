@@ -19,6 +19,19 @@ coverage = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(coverage)
 
 
+def semantic_payload(candidate, *, tests=None, executed=None, skipped=None, status="passed"):
+    tests = coverage.SEMANTIC_TESTS if tests is None else tests
+    return {
+        "schema": "roundwright-phase5-semantic-execution/v3",
+        "candidate_sha": candidate,
+        "tests": tests,
+        "executed_tests": tests if executed is None else executed,
+        "skipped_tests": () if skipped is None else skipped,
+        "windows_declared_skips": coverage.WINDOWS_DECLARED_SKIPS,
+        "status": status,
+    }
+
+
 class Phase5CoverageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -30,7 +43,7 @@ class Phase5CoverageTests(unittest.TestCase):
         shutil.copy2(ROOT / "docs" / "migration" / "phase5-coverage-map.json", self.source)
         shutil.copy2(ROOT / "docs" / "migration" / "legacy-decision-ledger.md", self.ledger)
         shutil.copy2(ROOT / "docs" / "migration" / "test-disposition.md", self.tests)
-        candidate = coverage.current_candidate(); payload={"schema":"roundwright-phase5-semantic-execution/v1","candidate_sha":candidate,"tests":coverage._SEMANTIC_TESTS,"status":"passed"}
+        candidate = coverage.current_candidate(); payload=semantic_payload(candidate)
         self.semantic.write_text(json.dumps({**payload,"receipt_digest":"sha256:" + coverage._digest(coverage._canonical(payload))}),encoding="utf-8")
 
     def tearDown(self) -> None:
@@ -80,6 +93,19 @@ class Phase5CoverageTests(unittest.TestCase):
     def test_rejects_issue_136_concrete_artifact_digest_drift(self) -> None:
         document = self.document()
         document["implementation_requirements"]["artifacts"][0]["sha256"] = "0" * 64
+        self.write_document(document)
+        with self.assertRaisesRegex(coverage.CoverageError, "artifact digest"):
+            coverage.validate(self.source, self.ledger, self.tests)
+
+    def test_rejects_issue_132_requirement_and_artifact_drift(self) -> None:
+        baseline = self.document()
+        document = json.loads(json.dumps(baseline))
+        document["issue_132_requirements"]["destinations"].pop()
+        self.write_document(document)
+        with self.assertRaisesRegex(coverage.CoverageError, "issue 132"):
+            coverage.validate(self.source, self.ledger, self.tests)
+        document = json.loads(json.dumps(baseline))
+        document["issue_132_requirements"]["artifacts"][0]["sha256"] = "0" * 64
         self.write_document(document)
         with self.assertRaisesRegex(coverage.CoverageError, "artifact digest"):
             coverage.validate(self.source, self.ledger, self.tests)
@@ -161,10 +187,73 @@ class Phase5CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(coverage.CoverageError, "semantic execution receipt is unavailable"):
             coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
         for payload in (
-            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": "0" * 40, "tests": coverage._SEMANTIC_TESTS, "status": "passed"},
-            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": coverage._SEMANTIC_TESTS[:-1], "status": "passed"},
-            {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": coverage._SEMANTIC_TESTS, "status": "failed"},
+            semantic_payload("0" * 40),
+            semantic_payload(candidate, tests=coverage.SEMANTIC_TESTS[:-1]),
+            semantic_payload(candidate, executed=coverage.SEMANTIC_TESTS[:-1]),
+            semantic_payload(candidate, executed=(*coverage.SEMANTIC_TESTS, coverage.SEMANTIC_TESTS[0])),
+            semantic_payload(candidate, skipped=(coverage.SEMANTIC_TESTS[0],)),
+            semantic_payload(candidate, status="failed"),
         ):
             self.semantic.write_text(json.dumps({**payload, "receipt_digest": "sha256:" + coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
             with self.subTest(payload=payload), self.assertRaisesRegex(coverage.CoverageError, "stale or forged"):
                 coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)
+
+    def test_issue_132_semantic_inventory_is_independently_pinned_and_ordered(self) -> None:
+        required = (
+            "tests.test_codex_worker.CodexWorkerAdapterTests.test_typed_denial_and_transport_failure_remain_typed",
+            "tests.test_codex_supervisor.SupervisorTests.test_security_denial_stops_before_a_prebound_profile_fallback",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_scope_denial_blocks_before_dependency_provider_session",
+            "tests.test_failure_recovery.FailureRecoveryTests.test_only_verified_terminal_or_transient_fault_uses_prebound_equivalent_route",
+            "tests.test_failure_recovery.FailureRecoveryTests.test_closed_matrix_allows_only_canonical_evidence_and_recovery_categories",
+            "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_failure_readback_revalidates_current_admission_authority",
+            "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
+            "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_coordinates_are_unique_and_strictly_monotonic",
+            "tests.test_candidate_review.CandidateReviewTests.test_diff_dispatch_requires_the_exact_within_round_profile",
+            "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
+            "tests.test_production_coding_runtime.ProductionRuntimeTests.test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
+            "tests.test_codex_supervisor.SupervisorTests.test_sequence_advances_invalid_primary_to_valid_fallback",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect",
+        )
+        self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
+        self.assertEqual(tuple(test for test in coverage.SEMANTIC_TESTS if test in required), required)
+        self.assertEqual(tuple(coverage.ISSUE_132_FINDING_REQUIREMENTS), tuple(f"E1R2-{number:02d}" for number in range(1, 9)))
+        self.assertEqual(
+            tuple(coverage.ISSUE_132_E1R3_FINDING_REQUIREMENTS),
+            ("RW132-PROD-001", "RW132-RECOVERY-002", "RW132-BINDING-003", "RW132-DURABLE-004", "RW132-EVIDENCE-005", "RW132-TAXONOMY-006", "RW132-ACCOUNTING-007", "RW132-QUALIFICATION-008"),
+        )
+
+    def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:
+        required = coverage.ISSUE_132_SEMANTIC_TESTS
+        variants = (
+            tuple(test for test in coverage.SEMANTIC_TESTS if test != required[-1]),
+            (*coverage.SEMANTIC_TESTS[:5], required[4], required[3], *coverage.SEMANTIC_TESTS[6:]),
+        )
+        candidate = coverage.current_candidate()
+        payload = semantic_payload(candidate)
+        self.semantic.write_text(json.dumps({**payload, "receipt_digest": "sha256:" + coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
+        for semantic_tests in variants:
+            with self.subTest(semantic_tests=semantic_tests), patch.object(coverage, "SEMANTIC_TESTS", semantic_tests), self.assertRaisesRegex(coverage.CoverageError, "Issue 132 semantic test inventory"):
+                coverage._semantic_execution(self.semantic, candidate)
+
+    def test_issue_132_finding_mapping_rejects_omitted_code_or_test(self) -> None:
+        requirements = dict(coverage.ISSUE_132_FINDING_REQUIREMENTS)
+        requirements.pop("E1R2-08")
+        with patch.object(coverage, "ISSUE_132_FINDING_REQUIREMENTS", requirements), self.assertRaisesRegex(coverage.CoverageError, "E1R2 finding inventory"):
+            coverage._validate_issue_132_semantic_tests()
+        requirements = dict(coverage.ISSUE_132_FINDING_REQUIREMENTS)
+        requirements["E1R2-08"] = ("src/roundwright/missing.py", requirements["E1R2-08"][1])
+        with patch.object(coverage, "ISSUE_132_FINDING_REQUIREMENTS", requirements), self.assertRaisesRegex(coverage.CoverageError, "E1R2 finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+        e1r3 = dict(coverage.ISSUE_132_E1R3_FINDING_REQUIREMENTS)
+        e1r3.pop("RW132-QUALIFICATION-008")
+        with patch.object(coverage, "ISSUE_132_E1R3_FINDING_REQUIREMENTS", e1r3), self.assertRaisesRegex(coverage.CoverageError, "E1R3 stable finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+
+    def test_issue_132_affected_module_inventory_rejects_candidate_review_omission(self) -> None:
+        with patch.object(coverage, "ISSUE_132_AFFECTED_MODULE_TESTS", {}), self.assertRaisesRegex(coverage.CoverageError, "affected-module regression inventory"):
+            coverage._validate_issue_132_semantic_tests()

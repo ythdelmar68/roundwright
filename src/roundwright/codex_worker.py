@@ -30,6 +30,10 @@ class CodexWorkerError(ValueError):
     """Raised when an adapter request would weaken the Worker boundary."""
 
 
+class _WorkerToolProtocolError(Exception):
+    """A local tool exchange cannot establish a terminal provider outcome."""
+
+
 class WorkerAction(StrEnum):
     PLANNING = "planning"
     IMPLEMENTATION = "implementation"
@@ -90,6 +94,18 @@ class WorkerSdkTurnErrorCategory(StrEnum):
     STREAM = "stream"
     CONNECTION = "connection"
     MISSING_OR_UNKNOWN = "missing-or-unknown"
+
+
+def _sdk_error_category(failure: CodexFailure) -> WorkerSdkTurnErrorCategory:
+    """Retain a closed SDK category when an injected adapter fails a turn."""
+
+    if failure is CodexFailure.SANDBOX_OR_APPROVAL_DENIED:
+        return WorkerSdkTurnErrorCategory.SANDBOX
+    if failure in {CodexFailure.AUTH_MISSING, CodexFailure.AUTH_EXPIRED, CodexFailure.AUTH_REJECTED}:
+        return WorkerSdkTurnErrorCategory.UNAUTHORIZED
+    if failure in {CodexFailure.PROVIDER_OUTAGE, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE}:
+        return WorkerSdkTurnErrorCategory.CONNECTION
+    return WorkerSdkTurnErrorCategory.MISSING_OR_UNKNOWN
 
 
 class WorkerToolRequestKind(StrEnum):
@@ -539,8 +555,21 @@ class CodexWorkerAdapter:
                 # A coding tool result may advance the native handle.  Bind
                 # the returned terminal outcome to that actual final turn.
                 turn_identity = _identity(turn, "turn")
-        except CodexAdapterError:
+        except _WorkerToolProtocolError:
+            # A bad sequence or callback reply leaves the current turn's
+            # submission history uncertain.  It is not authenticated SDK
+            # failure evidence, so abort the exact turn and reconcile it.
             _abort_turn(turn); _close_session(session)
+            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
+        except CodexAdapterError as error:
+            _abort_turn(turn); _close_session(session)
+            if session_identity is not None and turn_identity is not None:
+                return CodexWorkerResult(
+                    WorkerResultKind.BLOCKED, session_identity, turn_identity,
+                    None, None, error.failure, "sdk-turn-failed",
+                    outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED,
+                    sdk_error_category=_sdk_error_category(error.failure),
+                )
             return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
         except Exception:
             _abort_turn(turn); _close_session(session)
@@ -581,10 +610,10 @@ def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRe
             return step.response
         request = step.request
         if request is None or request.sequence != expected:
-            raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+            raise _WorkerToolProtocolError()
         result = execute(request)
         if type(result) is not NativeWorkerToolResult or (result.sequence, result.tool) != (request.sequence, request.tool):
-            raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+            raise _WorkerToolProtocolError()
         if checkpoint_submission is not None:
             # This durable intent is bound to the already checkpointed source
             # turn.  A crash from here through the provider handoff can never
@@ -607,7 +636,7 @@ def _consume_steps(turn: NativeWorkerTurn, execute: Callable[[NativeWorkerToolRe
             authorize_effect()
             checkpoint_submission(request, result, "submitted", next_turn_identity)
         expected += 1
-    raise CodexAdapterError(CodexFailure.MALFORMED_RESPONSE)
+    raise _WorkerToolProtocolError()
 
 
 def worker_request_digest(*, attempt_id: str, action: WorkerAction, context: CodexWorkerContext, objective: str, constraints: tuple[str, ...], acceptance_criteria: tuple[str, ...], resume_session_identity: str | None) -> str:

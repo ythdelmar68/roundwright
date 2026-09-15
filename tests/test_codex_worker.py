@@ -20,7 +20,9 @@ from roundwright.codex_worker import (
     CodexWorkerRequest,
     NativeWorkerResponse,
     WorkerAction,
+    WorkerOutcomeSource,
     WorkerResultKind,
+    WorkerSdkTurnErrorCategory,
     WorkerTool,
     NativeWorkerToolRequest,
     NativeWorkerToolResult,
@@ -196,8 +198,14 @@ class CodexWorkerAdapterTests(unittest.TestCase):
         events: list[str] = []
         turn = FakeTurn("turn-43", CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED), events)
         result = self.dispatch(self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events), self.request(), events)
-        self.assertEqual((result.kind, result.failure, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, None, "thread-43", "turn-43"))
+        self.assertEqual((result.kind, result.failure, result.session_identity, result.turn_identity), (WorkerResultKind.BLOCKED, CodexFailure.SANDBOX_OR_APPROVAL_DENIED, "thread-43", "turn-43"))
         self.assertEqual(events, ["session:thread-43", "start:implementation:workspace-read,workspace-write,validation-execute", "turn:thread-43:turn-43", "read", "abort", "close"])
+        events = []; request = self.request()
+        turn = FakeTurn("turn-43", None, events, (NativeWorkerTurnStep(request=NativeWorkerToolRequest(2, WorkerTool.WORKSPACE_READ, path="a")),))
+        adapter = self.adapter(FakeBackend(FakeSession("thread-43", turn, events)), events); execution, reservation = self.admission(adapter, request)
+        result = adapter.dispatch(request, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, execute_tool_request=lambda _: self.fail("callback"), advisory_execution=execution, effect_reservation=reservation)
+        self.assertEqual(result.kind, WorkerResultKind.AMBIGUOUS)
+        self.assertEqual((events.count("abort"), events.count("close")), (1, 1))
 
     def test_generic_read_failure_aborts_then_closes_once_without_a_second_turn(self) -> None:
         events: list[str] = []
@@ -272,12 +280,18 @@ class CodexWorkerAdapterTests(unittest.TestCase):
     def test_out_of_order_step_is_ambiguous_without_callback(self) -> None:
         events=[]; request=self.request(); turn=FakeTurn("turn-43", None, events, (NativeWorkerTurnStep(request=NativeWorkerToolRequest(2, WorkerTool.WORKSPACE_READ, path="a")),))
         adapter=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events); execution,reservation=self.admission(adapter,request); result=adapter.dispatch(request, checkpoint_session=lambda _:None, checkpoint_turn=lambda *_:None, execute_tool_request=lambda _: self.fail("callback"), advisory_execution=execution, effect_reservation=reservation)
-        self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertIn("abort",events); self.assertIn("close",events); self.assertNotIn("submit:2",events)
+        self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertEqual(events.count("abort"),1); self.assertEqual(events.count("close"),1); self.assertNotIn("submit:2",events)
 
     def test_mismatched_tool_reply_is_ambiguous_without_submission(self) -> None:
         events=[]; request=self.request(); item=NativeWorkerToolRequest(1,WorkerTool.WORKSPACE_READ,path="a"); turn=FakeTurn("turn-43",None,events,(NativeWorkerTurnStep(request=item),))
         adapter=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events); execution,reservation=self.admission(adapter,request); result=adapter.dispatch(request,checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None,execute_tool_request=lambda _:NativeWorkerToolResult(2,WorkerTool.WORKSPACE_READ,"allowed"), advisory_execution=execution, effect_reservation=reservation)
-        self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertNotIn("submit:2",events)
+        self.assertEqual(result.kind,WorkerResultKind.AMBIGUOUS); self.assertEqual(events.count("abort"),1); self.assertEqual(events.count("close"),1); self.assertNotIn("submit:2",events)
+
+    def test_checkpointed_terminal_provider_failure_remains_blocked_after_tool_mode_selection(self) -> None:
+        events=[]; request=self.request(); terminal=NativeWorkerResponse(WorkerResultKind.BLOCKED, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED, blocker="provider-failed", outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED, sdk_error_category=WorkerSdkTurnErrorCategory.SANDBOX)
+        turn=FakeTurn("turn-43",None,events,(NativeWorkerTurnStep(response=terminal),))
+        adapter=self.adapter(FakeBackend(FakeSession("thread-43",turn,events)),events); execution,reservation=self.admission(adapter,request); result=adapter.dispatch(request,checkpoint_session=lambda _:None,checkpoint_turn=lambda *_:None,execute_tool_request=lambda _: self.fail("callback"), advisory_execution=execution, effect_reservation=reservation)
+        self.assertEqual((result.kind,result.failure,result.outcome_source,result.sdk_error_category),(WorkerResultKind.BLOCKED,CodexFailure.SANDBOX_OR_APPROVAL_DENIED,WorkerOutcomeSource.SDK_TURN_FAILED,WorkerSdkTurnErrorCategory.SANDBOX)); self.assertEqual(events,["start:implementation:workspace-read,workspace-write,validation-execute","step"])
 
     def test_legacy_path_uses_terminal_response_only(self) -> None:
         events=[]; turn=FakeTurn("turn-43",NativeWorkerResponse(WorkerResultKind.ACCEPTED,{"status":"done"}),events)

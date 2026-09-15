@@ -38,7 +38,7 @@ from roundwright.provider_health import CodexFailure
 from roundwright.role_capability_policy import AdvisoryRole, DurableRoleBudgetLedger, RoleBudget, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.provider_recovery import (
     AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, SupervisorAccountingSnapshot,
-    SupervisorTerminalFailure, claim_supervisor_dispatch, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
+    SupervisorTerminalFailure, claim_supervisor_dispatch, prepare_attempt, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
     record_supervisor_terminal_failure,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
 )
@@ -458,6 +458,66 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(accepted.execute(), ("runtime-provider-one", "runtime-provider-two"))
             self.assertEqual(read_attempt(repository, identity, "runtime-provider-two", context=recovery).state, AttemptState.ACCEPTED)
 
+    def test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            entries = []
+            for ordinal in range(3):
+                selection = runner.selection if ordinal == 0 else DiffReviewSelection(
+                    f"runtime-format-review-{ordinal}", runner.selection.implementation_attempt_id,
+                    f"runtime-format-provider-{ordinal}", f"runtime-format-message-{ordinal}",
+                    f"runtime-format-lease-{ordinal}", runner.selection.process_lease_expires_at,
+                    "Review the immutable candidate.", ("Return a strict verdict.",), 1,
+                    logical_profile_position=1, physical_format_output_ordinal=ordinal,
+                )
+                backend = Backend(f"runtime-format-{ordinal}", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), [])
+                entries.append(self.sequence_entry(runner, selection=selection, backend=backend))
+            exhausted = replace(runner, sequence=tuple(entries))
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "format correction allowance is exhausted"):
+                exhausted.execute()
+            calls = tuple(entry.backend.calls for entry in entries)
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "format correction allowance is exhausted"):
+                exhausted.execute()
+            self.assertEqual(tuple(entry.backend.calls for entry in entries), calls)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE task_id = ? AND (attempt_id = ? OR attempt_id LIKE 'runtime-format-provider-%') ORDER BY attempt_number", (identity.task_id, runner.selection.provider_attempt_id)).fetchall(), [(1, 0), (1, 1), (1, 2)])
+                self.assertEqual(connection.execute("SELECT review_epoch, review_round, logical_profile_position, physical_format_output_ordinal FROM supervisor_attempt_coordinates WHERE task_id = ? ORDER BY logical_profile_position, physical_format_output_ordinal", (identity.task_id,)).fetchall(), [(1, 1, 1, 0), (1, 1, 1, 1), (1, 1, 1, 2)])
+            finally:
+                connection.close()
+
+    def test_restart_continues_same_profile_at_next_physical_format_ordinal(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner, backend=Backend("runtime-restart-zero", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), []))
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            next_selection = DiffReviewSelection("runtime-restart-one", runner.selection.implementation_attempt_id, "runtime-restart-provider-one", "runtime-restart-message-one", "runtime-restart-lease-one", runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 1, logical_profile_position=1, physical_format_output_ordinal=1)
+            second = self.sequence_entry(runner, selection=next_selection, backend=Backend("runtime-restart-one", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), []))
+            restarted = replace(runner, sequence=(first, second))
+            self.assertEqual(restarted.execute(), (runner.selection.provider_attempt_id, next_selection.provider_attempt_id))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT attempt_id, logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE attempt_id IN (?, ?) ORDER BY attempt_number", (runner.selection.provider_attempt_id, next_selection.provider_attempt_id)).fetchall(), [(runner.selection.provider_attempt_id, 1, 0), (next_selection.provider_attempt_id, 1, 1)])
+                self.assertEqual(connection.execute("SELECT attempt_id, review_epoch, review_round, logical_profile_position, physical_format_output_ordinal FROM supervisor_attempt_coordinates WHERE attempt_id IN (?, ?) ORDER BY logical_profile_position, physical_format_output_ordinal", (runner.selection.provider_attempt_id, next_selection.provider_attempt_id)).fetchall(), [(runner.selection.provider_attempt_id, 1, 1, 1, 0), (next_selection.provider_attempt_id, 1, 1, 1, 1)])
+            finally:
+                connection.close()
+
+    def test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, _ = self.durable_runner(Path(temporary) / "repository", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE))
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            self.assertEqual(backend.calls, 1)
+            with self.assertRaisesRegex(ProviderRecoveryError, "replay conflicts"):
+                prepare_attempt(repository, identity, recovery, attempt_id=runner.selection.provider_attempt_id, role=ProviderRole.SUPERVISOR, process_lease_id=runner.selection.process_lease_id, process_lease_expires_at=runner.selection.process_lease_expires_at, input_fingerprint="c" * 64, selected_profile_identity=runner.audit.profile_identity, logical_profile_position=1, physical_format_output_ordinal=0, lease=runner.lease, now=runner.dispatch_control.now)
+            self.assertEqual(backend.calls, 1)
+
     def test_fallback_reserves_its_own_exact_binding_and_reconstructs_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, primary, repository, identity, recovery, _seal = self.durable_runner(
@@ -523,7 +583,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 self.assertEqual(sum(pool.map(reserve, ledgers)), 1)
 
-    def test_terminal_supervisor_failure_is_durable_and_fails_over_without_invalid_output(self) -> None:
+    def test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary) / "repository"
             runner, first_backend, repository, identity, recovery, seal = self.durable_runner(
@@ -552,16 +612,21 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
             ))
             first_only = replace(runner, sequence=(runner.sequence[0],))
-            self.assertEqual(first_only.execute(), (runner.selection.provider_attempt_id,))
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "no pre-bound fallback"):
+                first_only.execute()
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             checkpoint_failure = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
             self.assertIsNotNone(checkpoint_failure)
+            self.assertEqual(
+                (first.attempt_id, checkpoint_failure.failure_class, first_backend.calls, second_backend.calls),
+                (runner.selection.provider_attempt_id, SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE, 1, 0),
+            )
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
-            # Restart from the durable terminal-failure checkpoint may dispatch
-            # only the still-unseen configured secondary; it must not replay
-            # the first turn, failure record, or failover transition.
-            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
+            # A restart resumes only the already-selected successor profile.
+            restarted_attempts = runner.execute()
+            self.assertEqual(restarted_attempts, (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
+            self.assertEqual((len(restarted_attempts), len(set(restarted_attempts))), (2, 2))
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             terminal = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
@@ -571,15 +636,20 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 (terminal.failure_class, terminal.outcome_source, terminal.sdk_error_category),
                 (SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorTerminalFailureSource.SDK_TURN_FAILED, SupervisorTerminalFailureSdkCategory.OVERLOAD),
             )
-            self.assertEqual(read_attempt(repository, identity, second_selection.provider_attempt_id, context=recovery).state, AttemptState.ACCEPTED)
+            self.assertEqual(
+                read_attempt(repository, identity, second_selection.provider_attempt_id, context=second_recovery).state,
+                AttemptState.ACCEPTED,
+            )
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute(
                     "SELECT COUNT(*) FROM provider_invalid_outputs WHERE attempt_id = ?", (first.attempt_id,),
                 ).fetchone()[0], 0)
+                self.assertEqual(connection.execute(
+                    "SELECT logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE attempt_id = ?", (first.attempt_id,),
+                ).fetchone(), (1, 0))
             finally:
                 connection.close()
-            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 1))
             descriptor = ProviderAttemptRuntimeDescriptor.parse({
                 "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-terminal-45",
@@ -594,12 +664,9 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 runner.source_digest, descriptor.case_id, descriptor.ready_at, descriptor.capture_plan_digest,
                 descriptor.provider_profile_identity, 1, 1, runner,
             )
-            graph = MaterializedProviderAttemptContext(descriptor, resources).snapshot(
-                (runner.selection.provider_attempt_id, second_selection.provider_attempt_id),
-            )["event_graph"]
-            assert graph is not None
-            self.assertIn("provider-terminal-failure", tuple(item.event_kind for item in graph.events))
-            self.assertNotIn("invalid-output", tuple(item.event_kind for item in graph.events))
+            self.assertIsNone(MaterializedProviderAttemptContext(descriptor, resources).snapshot(
+                (runner.selection.provider_attempt_id,),
+            )["event_graph"])
 
     def test_accounting_terminal_blocker_is_durable_and_never_fails_over(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -732,7 +799,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertNotIn("C:/", json.dumps(material, sort_keys=True))
             self.assertNotIn("findings", json.dumps(material, sort_keys=True))
             native = canonical_supervisor_review_material(request)
-            self.assertEqual(native["schema"], "roundwright-provider-attempt-accounting-material/v2")
+            self.assertEqual(native["schema"], "roundwright-provider-attempt-accounting-material/v3")
             self.assertEqual(native["decision_semantic"], "pre-dispatch-transition-eligibility/v2")
             self.assertIn("pre-dispatch eligibility", native["decision_rule"])
             self.assertIn("does not assert", native["decision_rule"])

@@ -6,16 +6,20 @@ import hashlib
 import json
 import re
 import os
+import sqlite3
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
-from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorFailoverResult, SupervisorResultKind, dispatch_ordered_supervisor_attempts
+from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorFailoverResult, SupervisorFallbackAuthorization, SupervisorResultKind, dispatch_ordered_supervisor_attempts
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
-from .configuration import FileReviewAuthorityStore, ResolvedConfigurationBinding, ReviewAuthorityEvidenceReceipt, ReviewAuthorityExpectation, ReviewPolicy
+from .configuration import FileReviewAuthorityStore, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityEvidenceReceipt, ReviewAuthorityExpectation, ReviewPolicy
 from .runtime_binding import ExternalSupervisorRuntimeStore, FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBinding, SupervisorRuntimeBindingReceipt
-from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs
+from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation
+from .state import TaskIdentity, database_path, require_runtime_binding
+from .provider_recovery import RecoveryContext
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, classify_for_role, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
 
 
 SUPERVISOR_FAILOVER_PROFILE = "roundwright-shadow-profile/supervisor-review-failover/v1"
@@ -33,6 +37,58 @@ def _hash(value: object) -> str: return "sha256:" + hashlib.sha256(json.dumps(va
 def _token(value: object) -> bool: return type(value) is str and bool(_TOKEN.fullmatch(value))
 def _digest(value: object) -> bool: return type(value) is str and bool(_DIGEST.fullmatch(value))
 def _reparse(value: Path) -> bool: return value.is_symlink() or bool(getattr(value, "is_junction", lambda: False)())
+
+
+def _require_durable_sequence_admission(repository: RepositoryIdentity, identity: TaskIdentity, requests: tuple[CodexSupervisorRequest, ...], policy: "ResolvedSupervisorSequencePolicy") -> None:
+    """Re-read the candidate seal and every target checkpoint before a turn.
+
+    A sequence binding contains public-safe digests, not authority to reuse
+    them.  This read-only check connects those digests to the task's current
+    candidate seal and the prepared provider rows that will later receive
+    route authorization.
+    """
+
+    path = database_path(repository)
+    if not path.exists():
+        raise SupervisorShadowError("Supervisor durable candidate admission is unavailable")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise SupervisorShadowError("Supervisor durable candidate admission is unavailable") from error
+    try:
+        seal = connection.execute(
+            "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id=?",
+            (identity.task_id,),
+        ).fetchone()
+        if (type(seal) is not tuple or len(seal) != 3
+                or seal[:2] != (identity.base_sha, requests[0].context.candidate_sha)
+                or type(seal[2]) is not str or not seal[2]):
+            raise SupervisorShadowError("Supervisor durable candidate admission has drifted")
+        candidate_fingerprint = hashlib.sha256(requests[0].context.candidate_sha.encode()).hexdigest()
+        policy_fingerprint = requests[0].context.policy_digest.removeprefix("sha256:")
+        for request in requests:
+            row = connection.execute(
+                "SELECT attempts.task_id, attempts.provider_role, attempts.state, attempts.selected_profile_identity, "
+                "attempts.logical_profile_position, attempts.physical_format_output_ordinal, "
+                "contexts.candidate_fingerprint, contexts.policy_fingerprint, contexts.configuration_digest "
+                "FROM provider_attempts AS attempts JOIN provider_attempt_contexts AS contexts "
+                "ON contexts.attempt_id=attempts.attempt_id WHERE attempts.attempt_id=?",
+                (request.provider_attempt_id,),
+            ).fetchone()
+            expected = (
+                identity.task_id, FailureRole.SUPERVISOR.value, "prepared",
+                request.selected_profile_identity, request.within_round_attempt,
+                request.physical_format_output_ordinal, candidate_fingerprint,
+                policy_fingerprint, policy.configuration_digest,
+            )
+            if row != expected:
+                raise SupervisorShadowError("Supervisor durable attempt admission has drifted")
+    except SupervisorShadowError:
+        raise
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise SupervisorShadowError("Supervisor durable candidate admission is unavailable") from error
+    finally:
+        connection.close()
 
 
 @dataclass(frozen=True)
@@ -150,7 +206,7 @@ class SupervisorSequenceAttempt:
 class SupervisorSequenceBinding:
     case_id: str; candidate_sha: str; base_sha: str; task_id: str; request_identities: tuple[str, ...]; profile_identities: tuple[str, ...]; runtime_fingerprints: tuple[str, ...]; review_epoch: int; review_round: int; review_mode: str; capture_plan_digest: str
     def __post_init__(self) -> None:
-        if not _token(self.case_id) or not _SHA.fullmatch(self.candidate_sha) or not _SHA.fullmatch(self.base_sha) or not _token(self.task_id) or type(self.request_identities) is not tuple or type(self.profile_identities) is not tuple or type(self.runtime_fingerprints) is not tuple or not self.request_identities or len(self.request_identities) != len(self.profile_identities) or len(self.profile_identities) != len(self.runtime_fingerprints) or any(not _digest(value) for value in (*self.request_identities, *self.profile_identities, *self.runtime_fingerprints, self.capture_plan_digest)) or len(set(self.profile_identities)) != len(self.profile_identities) or type(self.review_epoch) is not int or self.review_epoch < 0 or type(self.review_round) is not int or self.review_round < 1 or self.review_mode not in {"COMPLETE", "CONVERGING"}:
+        if not _token(self.case_id) or not _SHA.fullmatch(self.candidate_sha) or not _SHA.fullmatch(self.base_sha) or not _token(self.task_id) or type(self.request_identities) is not tuple or type(self.profile_identities) is not tuple or type(self.runtime_fingerprints) is not tuple or not self.request_identities or len(self.request_identities) != len(self.profile_identities) or len(self.profile_identities) != len(self.runtime_fingerprints) or any(not _digest(value) for value in (*self.request_identities, *self.profile_identities, *self.runtime_fingerprints, self.capture_plan_digest)) or type(self.review_epoch) is not int or self.review_epoch < 0 or type(self.review_round) is not int or self.review_round < 1 or self.review_mode not in {"COMPLETE", "CONVERGING"}:
             raise SupervisorShadowError("Supervisor sequence binding is invalid")
 
 
@@ -721,13 +777,39 @@ def _durable_sequence_envelope(record: CompleteSupervisorLifecycleRecord) -> Sup
     return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
 
 
-def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], advisory_executions: tuple[SealedRoleExecution, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, resolved_policy: ResolvedSupervisorSequencePolicy, lifecycle: ExternalSupervisorLifecycle, recorder: ExternalSupervisorRecorder, *, execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_path: Path, evidence_time: int, freshness_until: int, runtime_store: ExternalSupervisorRuntimeStore, trusted_policy_receipt: TrustedReviewPolicyReceipt, review_authority_store: FileReviewAuthorityStore, review_authority_evidence: ReviewAuthorityEvidenceReceipt, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], review_authority_expectation: ReviewAuthorityExpectation | None = None) -> SupervisorSequenceQualificationResult:
+def _valid_sequence_coordinates(requests: tuple[CodexSupervisorRequest, ...], runtime: RuntimeBinding, max_attempts: int) -> bool:
+    """Require an exact, bounded physical-format route for each pre-bound turn."""
+
+    if not requests or len(requests) > max_attempts:
+        return False
+    logical, physical = 1, 0
+    for request in requests:
+        if (
+            request.within_round_attempt != logical
+            or request.physical_format_output_ordinal != physical
+            or logical > len(runtime.supervisor_profile_identities)
+            or request.selected_profile_identity != runtime.supervisor_profile_identities[logical - 1]
+        ):
+            return False
+        if physical == 2:
+            logical, physical = logical + 1, 0
+        else:
+            physical += 1
+    return True
+
+
+def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], requests: tuple[CodexSupervisorRequest, ...], advisory_executions: tuple[SealedRoleExecution, ...], readiness: SupervisorShadowReadiness, binding: SupervisorSequenceBinding, resolved_policy: ResolvedSupervisorSequencePolicy, lifecycle: ExternalSupervisorLifecycle, recorder: ExternalSupervisorRecorder, *, repository: RepositoryIdentity, task_identity: TaskIdentity, recovery_context: RecoveryContext, execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_path: Path, evidence_time: int, freshness_until: int, runtime_store: ExternalSupervisorRuntimeStore, trusted_policy_receipt: TrustedReviewPolicyReceipt, review_authority_store: FileReviewAuthorityStore, review_authority_evidence: ReviewAuthorityEvidenceReceipt, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], review_authority_expectation: ReviewAuthorityExpectation | None = None) -> SupervisorSequenceQualificationResult:
     """Capture exactly one terminal product failover sequence under one plan."""
-    if type(adapters) is not tuple or type(requests) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or not isinstance(budget_ledger_path, Path) or not adapters or len(adapters) != len(requests) or len(requests) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or any(type(item) is not CodexSupervisorAdapter for item in adapters) or any(type(item) is not CodexSupervisorRequest for item in requests) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorSequenceBinding or type(resolved_policy) is not ResolvedSupervisorSequencePolicy or type(review_authority_expectation) is not ReviewAuthorityExpectation or type(review_authority_store) is not FileReviewAuthorityStore or type(review_authority_evidence) is not ReviewAuthorityEvidenceReceipt or not all(callable(getattr(lifecycle, name, None)) for name in ("prepare", "append", "finalize", "read_plan", "read")) or not callable(getattr(recorder, "prepare", None)) or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not callable(checkpoint_session) or not callable(checkpoint_turn) or type(evidence_time) is not int or type(freshness_until) is not int or freshness_until < evidence_time:
+    if type(adapters) is not tuple or type(requests) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(repository) is not RepositoryIdentity or type(task_identity) is not TaskIdentity or type(recovery_context) is not RecoveryContext or not isinstance(budget_ledger_path, Path) or not adapters or len(adapters) != len(requests) or len(requests) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or any(type(item) is not CodexSupervisorAdapter for item in adapters) or any(type(item) is not CodexSupervisorRequest for item in requests) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorSequenceBinding or type(resolved_policy) is not ResolvedSupervisorSequencePolicy or type(review_authority_expectation) is not ReviewAuthorityExpectation or type(review_authority_store) is not FileReviewAuthorityStore or type(review_authority_evidence) is not ReviewAuthorityEvidenceReceipt or not all(callable(getattr(lifecycle, name, None)) for name in ("prepare", "append", "finalize", "read_plan", "read")) or not callable(getattr(recorder, "prepare", None)) or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not callable(checkpoint_session) or not callable(checkpoint_turn) or type(evidence_time) is not int or evidence_time <= 0 or type(freshness_until) is not int or freshness_until < evidence_time:
         raise SupervisorShadowError("Supervisor sequence pre-dispatch binding is invalid")
     context = requests[0].context
-    if any(request.context != context or request.within_round_attempt != ordinal for ordinal, request in enumerate(requests, start=1)) or (context.task_id, context.base_sha, context.candidate_sha, context.review_epoch, context.review_round, context.review_mode.value) != (binding.task_id, binding.base_sha, binding.candidate_sha, binding.review_epoch, binding.review_round, binding.review_mode) or tuple(request.input_digest for request in requests) != binding.request_identities or tuple(request.selected_profile_identity for request in requests) != binding.profile_identities or tuple(adapter.profile_identity for adapter in adapters) != binding.profile_identities or tuple(adapter.runtime_fingerprint for adapter in adapters) != binding.runtime_fingerprints or (context.policy_digest, context.configuration_digest, binding.profile_identities, len(requests), context.review_mode) != (resolved_policy.policy_digest, resolved_policy.configuration_digest, resolved_policy.profile_identities, resolved_policy.policy.max_supervisor_attempts_per_round, resolved_policy.policy.mode_for_round(context.review_round)) or (readiness.candidate_sha, readiness.case_id, readiness.capture_plan_digest, readiness.observation_identity) != (binding.candidate_sha, binding.case_id, binding.capture_plan_digest, supervisor_sequence_observation_identity(requests)):
+    if any(request.context != context for request in requests) or not _valid_sequence_coordinates(requests, resolved_policy.runtime, resolved_policy.policy.max_supervisor_attempts_per_round) or (context.task_id, context.base_sha, context.candidate_sha, context.review_epoch, context.review_round, context.review_mode.value) != (binding.task_id, binding.base_sha, binding.candidate_sha, binding.review_epoch, binding.review_round, binding.review_mode) or tuple(request.input_digest for request in requests) != binding.request_identities or tuple(request.selected_profile_identity for request in requests) != binding.profile_identities or tuple(adapter.profile_identity for adapter in adapters) != binding.profile_identities or tuple(adapter.runtime_fingerprint for adapter in adapters) != binding.runtime_fingerprints or (context.policy_digest, context.configuration_digest, context.review_mode) != (resolved_policy.policy_digest, resolved_policy.configuration_digest, resolved_policy.policy.mode_for_round(context.review_round)) or (readiness.candidate_sha, readiness.case_id, readiness.capture_plan_digest, readiness.observation_identity) != (binding.candidate_sha, binding.case_id, binding.capture_plan_digest, supervisor_sequence_observation_identity(requests)) or (task_identity.task_id, task_identity.base_sha, recovery_context.task_id, recovery_context.candidate_sha, recovery_context.runtime_binding) != (binding.task_id, binding.base_sha, binding.task_id, binding.candidate_sha, resolved_policy.runtime):
         raise SupervisorShadowError("Supervisor sequence context has drifted")
+    try:
+        require_runtime_binding(repository, task_identity, resolved_policy.runtime)
+        _require_durable_sequence_admission(repository, task_identity, requests, resolved_policy)
+    except Exception as error:
+        raise SupervisorShadowError("Supervisor durable candidate admission is unavailable") from error
     if type(runtime_store) not in (FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore) or not callable(getattr(runtime_store, "persist", None)) or not callable(getattr(runtime_store, "read", None)):
         raise SupervisorShadowError("Supervisor runtime preflight is invalid")
     try:
@@ -787,17 +869,137 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
     if (prepared.plan_digest, prepared.profile, prepared.case_id, prepared.candidate_sha, prepared.ready_at) != (readiness.capture_plan_digest, SUPERVISOR_FAILOVER_PROFILE, readiness.case_id, readiness.candidate_sha, readiness.ready_at):
         raise SupervisorShadowError("Supervisor sequence capture-plan receipt drifted")
     observed_attempts: list[SupervisorSequenceAttempt] = []; prior = expected_receipt
+    source_decisions: dict[str, tuple[FailureBinding, str]] = {}
+
     def checkpoint_result(ordinal: int, request: CodexSupervisorRequest, result: CodexSupervisorResult) -> None:
         nonlocal prior
         observed = _sequence_attempt(ordinal, request, result); observed_attempts.append(observed)
         event = SupervisorAttemptEvent(expected_receipt.record_identity, expected_receipt.source_identity, expected_receipt.observation_identity, expected_receipt.candidate_sha, expected_receipt.context_identity, expected_receipt.plan_identity, expected_receipt.capture_plan_digest, ordinal, prior.receipt_digest, request.input_digest, request.selected_profile_identity, adapters[ordinal - 1].runtime_fingerprint, result.kind.value, observed.result_identity, observed.result_identity if result.kind is SupervisorResultKind.ACCEPTED else None, observed.verdict, expected_receipt.ready_at, expected_receipt.freshness_until)
         try: prior = lifecycle.append(expected_receipt.record_identity, event, evidence_time=evidence_time)
         except Exception as error: raise SupervisorShadowError("Supervisor durable lifecycle append failed") from error
+        if result.kind is SupervisorResultKind.INVALID:
+            # A malformed response is a completed, checkpointed native turn.
+            # It may only lead to a fresh-session route after the product
+            # ledger classifies that exact lifecycle fact and re-reads it.
+            if result.session_identity is None or result.turn_identity is None:
+                raise SupervisorShadowError("Supervisor invalid source has no durable turn identity")
+            failure_binding = FailureBinding(
+                binding.candidate_sha, resolved_policy.policy_digest,
+                resolved_policy.configuration_digest, "supervisor:" + binding.task_id,
+                FailureRole.SUPERVISOR, request.selected_profile_identity,
+                result.session_identity, request.provider_attempt_id,
+            )
+            try:
+                decision = classify_for_role(
+                    FailureRole.SUPERVISOR, failure_binding,
+                    FailureClass.SESSION_TERMINATED, EvidenceSource.VERIFIED_LIFECYCLE,
+                )
+                decision_digest = record_durable_failure(
+                    repository, task_identity, decision, now=evidence_time,
+                )
+                durable = read_durable_failure(repository, task_identity, decision_digest)
+            except Exception as error:
+                raise SupervisorShadowError("Supervisor invalid source decision is unavailable") from error
+            if durable != decision or durable.binding != failure_binding or durable.action is not RecoveryAction.PREBOUND_FALLBACK or not durable.retryable:
+                raise SupervisorShadowError("Supervisor invalid source decision has drifted")
+            source_decisions[request.input_digest] = (failure_binding, decision_digest)
+
+    def authorize_fallback(source: CodexSupervisorRequest, result: CodexSupervisorResult, target: CodexSupervisorRequest) -> SupervisorFallbackAuthorization:
+        """Issue/read one source-bound route before target reservation.
+
+        The nested consume closure is intentionally the only value handed
+        back to the generic dispatcher.  It rechecks the sealed reservation
+        and atomically consumes the durable route before native invocation.
+        """
+
+        if (type(source) is not CodexSupervisorRequest or type(target) is not CodexSupervisorRequest
+                or type(result) is not CodexSupervisorResult
+                or result.kind is not SupervisorResultKind.INVALID
+                or source.context != context or target.context != context
+                or target.input_digest == source.input_digest):
+            raise SupervisorShadowError("Supervisor fallback source is invalid")
+        source_pair = source_decisions.get(source.input_digest)
+        if source_pair is None:
+            raise SupervisorShadowError("Supervisor fallback source decision is unavailable")
+        source_binding, source_digest = source_pair
+        target_ordinal = requests.index(target)
+        target_execution = advisory_executions[target_ordinal]
+        target_route_digest = _hash({
+            "schema": "roundwright-supervisor-fallback-target/v1",
+            "source_request": source.input_digest, "target_request": target.input_digest,
+            "target_attempt": target.provider_attempt_id,
+            "candidate_sha": binding.candidate_sha,
+            "target_execution": target_execution.execution_binding.digest,
+        })
+        coordinate_digest = _hash({
+            "schema": "roundwright-supervisor-fallback-coordinate/v1",
+            "review_epoch": target.context.review_epoch, "review_round": target.context.review_round,
+            "logical_profile_position": target.within_round_attempt,
+            "physical_format_output_ordinal": target.physical_format_output_ordinal,
+        })
+        remaining_budget_digest = _hash({
+            "schema": "roundwright-supervisor-fallback-budget/v1",
+            "target_execution": target_execution.execution_binding.digest,
+            "target_profile": target.selected_profile_identity,
+            "target_request": target.input_digest,
+        })
+        try:
+            issued = issue_durable_recovery_route_authorization(
+                repository, task_identity, record_digest=source_digest,
+                binding=source_binding, target_role=FailureRole.SUPERVISOR,
+                target_profile_digest=target.selected_profile_identity,
+                target_route_digest=target_route_digest,
+                coordinate_digest=coordinate_digest,
+                remaining_budget_digest=remaining_budget_digest,
+                now=evidence_time,
+            )
+            authorization = read_durable_recovery_route_authorization(
+                repository, task_identity, issued.route_digest,
+            )
+        except Exception as error:
+            raise SupervisorShadowError("Supervisor fallback route is unavailable") from error
+        if authorization != issued or authorization.binding != source_binding:
+            raise SupervisorShadowError("Supervisor fallback route has drifted")
+
+        def consume(reservation: TrustedRoleEffectReservation) -> None:
+            if type(reservation) is not TrustedRoleEffectReservation:
+                raise SupervisorShadowError("Supervisor fallback reservation is invalid")
+            try:
+                reserved_execution = reservation.require_recovery_route(target_execution)
+                if reserved_execution.digest != target_execution.execution_binding.digest:
+                    raise SupervisorShadowError("Supervisor fallback reservation has drifted")
+                reservation_digest = _hash({
+                    "schema": "roundwright-supervisor-fallback-reservation/v1",
+                    "route": authorization.route_digest,
+                    "target_execution": reserved_execution.digest,
+                    "target_request": target.input_digest,
+                    "target_profile": target.selected_profile_identity,
+                })
+                consume_durable_recovery_route_authorization(
+                    repository, task_identity, authorization,
+                    reservation_digest=reservation_digest,
+                    target_role=FailureRole.SUPERVISOR,
+                    target_profile_digest=target.selected_profile_identity,
+                    target_route_digest=target_route_digest,
+                    coordinate_digest=coordinate_digest,
+                    remaining_budget_digest=remaining_budget_digest,
+                    now=evidence_time,
+                )
+                if read_durable_recovery_route_authorization(repository, task_identity, authorization.route_digest) != authorization:
+                    raise SupervisorShadowError("Supervisor fallback route read-back drifted")
+            except SupervisorShadowError:
+                raise
+            except Exception as error:
+                raise SupervisorShadowError("Supervisor fallback route consumption is unavailable") from error
+
+        return SupervisorFallbackAuthorization(source.input_digest, target.input_digest, consume)
+
     failover = dispatch_ordered_supervisor_attempts(
         requests, adapters, advisory_executions, execution_hosts,
         tuple(budget_ledger_path for _ in adapters),
         checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
         checkpoint_result=checkpoint_result,
+        authorize_fallback=authorize_fallback,
     )
     attempts = tuple(observed_attempts)
     try:

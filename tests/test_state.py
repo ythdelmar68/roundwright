@@ -457,6 +457,55 @@ class StateTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_v73_rejects_duplicate_historical_supervisor_coordinates(self) -> None:
+        """A populated review ledger cannot upgrade by choosing a duplicate winner."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            path = database_path(repository)
+            path.parent.mkdir()
+            connection = sqlite3.connect(path)
+            try:
+                _apply_migrations(connection, MIGRATIONS[:72])
+                connection.execute(
+                    "INSERT INTO source_snapshots(source_id, repository_id, source_digest) VALUES (?, ?, ?)",
+                    ("coordinate-source", "ythdelmar68/roundwright", "a" * 64),
+                )
+                connection.execute(
+                    "INSERT INTO tasks(task_id, source_id, repository_id, branch, worktree, base_sha, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'queued')",
+                    ("coordinate-task", "coordinate-source", "ythdelmar68/roundwright", "codex/coordinate", str(path.parent / "coordinate"), "b" * 40),
+                )
+                for number, attempt_id in enumerate(("coordinate-provider-one", "coordinate-provider-two"), start=1):
+                    connection.execute(
+                        "INSERT INTO provider_attempts("
+                        "attempt_id, task_id, provider_role, attempt_number, process_lease_id, "
+                        "process_lease_expires_at, session_identity, external_turn_identity, input_fingerprint, "
+                        "state, selected_profile_identity, logical_profile_position, physical_format_output_ordinal) "
+                        "VALUES (?, 'coordinate-task', 'supervisor', ?, ?, 1, ?, ?, ?, 'dispatched', ?, 1, 0)",
+                        (attempt_id, number, f"lease-{number}", f"session-{number}", f"turn-{number}", "c" * 64, "sha256:" + "d" * 64),
+                    )
+                    connection.execute(
+                        "INSERT INTO diff_review_attempts("
+                        "diff_review_attempt_id, task_id, implementation_attempt_id, provider_attempt_id, "
+                        "supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, "
+                        "input_digest, state, created_at, within_round_attempt, selected_profile_identity, review_round, "
+                        "review_epoch, logical_profile_position, physical_format_output_ordinal) "
+                        "VALUES (?, 'coordinate-task', ?, ?, ?, ?, ?, ?, ?, ?, 'recorded', 1, 1, ?, 1, 1, 1, 0)",
+                        (f"coordinate-review-{number}", f"implementation-{number}", attempt_id, f"review-session-{number}", f"review-turn-{number}", f"review-message-{number}", "b" * 40, "c" * 40, "e" * 64, "sha256:" + "d" * 64),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(StateError, "coordinates are duplicated"):
+                initialize(repository)
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone(), (72,))
+                self.assertIsNone(connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'supervisor_attempt_coordinates'").fetchone())
+            finally:
+                connection.close()
+
     def _seed_legacy_worker_objective(
         self,
         path: Path,

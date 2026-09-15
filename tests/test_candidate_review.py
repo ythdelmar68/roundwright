@@ -373,6 +373,25 @@ class CandidateReviewTests(unittest.TestCase):
                     with self.assertRaises(CandidateReviewError):
                         _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
                     continue
+                # A later logical profile is never a valid new ledger origin.
+                # Seed the exact preceding durable Supervisor coordinates so this
+                # fixture exercises CandidateReview's within-round mapping rather
+                # than bypassing the accounting origin invariant.
+                for position in range(1, ordinal):
+                    selected_profile_identity = context.runtime_binding.supervisor_profile_identities[position - 1]
+                    prepare_attempt(
+                        repository, identity,
+                        provider_context(
+                            review_context, identity, ProviderRole.SUPERVISOR,
+                            selected_profile_identity=selected_profile_identity,
+                        ),
+                        attempt_id=f"mapping-prior-supervisor-{position}", role=ProviderRole.SUPERVISOR,
+                        process_lease_id=f"mapping-prior-lease-{position}", process_lease_expires_at=now + 60,
+                        input_fingerprint=f"{position:x}" * 64,
+                        selected_profile_identity=selected_profile_identity,
+                        logical_profile_position=position, physical_format_output_ordinal=0,
+                        review_epoch=0, review_round=4, lease=lease, now=now,
+                    )
                 dispatch = _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
                 self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).selected_profile_identity, arguments["selected_profile_identity"])
                 self.assertEqual((dispatch.within_round_attempt, dispatch.selected_profile_identity), (ordinal, arguments["selected_profile_identity"]))
@@ -987,7 +1006,7 @@ class CandidateReviewTests(unittest.TestCase):
             record_candidate_verification(repository, identity, binding, seal, CandidateVerification("later-targeted-test", VerificationKind.TEST, VerificationOutcome.PASS, "6" * 64), lease=lease)
             with self.assertRaisesRegex(CandidateReviewError, "verification evidence has changed"):
                 record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-25", "diff-supervisor", "diff-session-25", "diff-turn", "diff-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="7" * 64, lease=lease, now=now)
-            dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-26", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor-2", supervisor_session_identity="diff-session-26", external_turn_identity="diff-turn-2", message_identity="diff-message-2", process_lease_id="diff-lease-2", process_lease_expires_at=now + 60, lease=lease, now=now)
+            dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-26", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor-2", supervisor_session_identity="diff-session-26", external_turn_identity="diff-turn-2", message_identity="diff-message-2", process_lease_id="diff-lease-2", process_lease_expires_at=now + 60, review_epoch=1, lease=lease, now=now)
             result = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS, pass_follow_ups=("owner-note",)), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
             self.assertTrue(result.accepted)
             self.assertEqual(result.accepted_review_identity, dispatch.diff_review_attempt_id)
@@ -1044,7 +1063,7 @@ class CandidateReviewTests(unittest.TestCase):
                 CandidateVerification("repair-build", VerificationKind.BUILD, VerificationOutcome.PASS, "c" * 64),
             ):
                 record_candidate_verification(repository, identity, binding, repaired_seal, verification, lease=lease)
-            fresh = dispatch_diff_review(repository, identity, repaired_context, binding, repaired_seal, diff_review_attempt_id="diff-repaired", implementation_attempt_id=repair.implementation_attempt_id, provider_attempt_id="repair-supervisor", supervisor_session_identity="repair-session", external_turn_identity="repair-review-turn", message_identity="repair-message", process_lease_id="repair-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            fresh = dispatch_diff_review(repository, identity, repaired_context, binding, repaired_seal, diff_review_attempt_id="diff-repaired", implementation_attempt_id=repair.implementation_attempt_id, provider_attempt_id="repair-supervisor", supervisor_session_identity="repair-session", external_turn_identity="repair-review-turn", message_identity="repair-message", process_lease_id="repair-review-lease", process_lease_expires_at=now + 60, review_epoch=1, lease=lease, now=now)
             second_findings = record_diff_review(repository, identity, repaired_context, binding, repaired_seal, diff_review_attempt_id=fresh.diff_review_attempt_id, output=DiffReviewOutput("diff-repaired", "repair-supervisor", "repair-session", "repair-review-turn", "repair-message", repaired_seal.base_sha, repaired_seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("second repair boundary",)), completion_evidence_fingerprint="d" * 64, lease=lease, now=now)
             with self.assertRaisesRegex(CandidateReviewError, "routed diff-review parent"):
                 begin_implementation(repository, identity, context, implementation_attempt_id="repair-26", provider_attempt_id="repair-worker-2", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="repair-turn-2", process_lease_id="repair-lease-2", process_lease_expires_at=now + 60, lease=lease, now=now)
@@ -1064,7 +1083,7 @@ class CandidateReviewTests(unittest.TestCase):
                 CandidateVerification("final-repair-build", VerificationKind.BUILD, VerificationOutcome.PASS, "0" * 64),
             ):
                 record_candidate_verification(repository, identity, binding, final_seal, verification, lease=lease)
-            final_review = dispatch_diff_review(repository, identity, final_context, binding, final_seal, diff_review_attempt_id="diff-final", implementation_attempt_id=repair_two.implementation_attempt_id, provider_attempt_id="final-supervisor", supervisor_session_identity="final-session", external_turn_identity="final-review-turn", message_identity="final-message", process_lease_id="final-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            final_review = dispatch_diff_review(repository, identity, final_context, binding, final_seal, diff_review_attempt_id="diff-final", implementation_attempt_id=repair_two.implementation_attempt_id, provider_attempt_id="final-supervisor", supervisor_session_identity="final-session", external_turn_identity="final-review-turn", message_identity="final-message", process_lease_id="final-review-lease", process_lease_expires_at=now + 60, review_epoch=2, lease=lease, now=now)
             accepted = record_diff_review(repository, identity, final_context, binding, final_seal, diff_review_attempt_id=final_review.diff_review_attempt_id, output=DiffReviewOutput("diff-final", "final-supervisor", "final-session", "final-review-turn", "final-message", final_seal.base_sha, final_seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="1" * 64, lease=lease, now=now)
             self.assertTrue(accepted.accepted)
             self.assertNotEqual(fresh.supervisor_session_identity, dispatch.supervisor_session_identity)

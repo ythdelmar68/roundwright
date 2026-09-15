@@ -31,7 +31,7 @@ class Phase5CoverageTests(unittest.TestCase):
         shutil.copy2(ROOT / "docs" / "migration" / "legacy-decision-ledger.md", self.ledger)
         shutil.copy2(ROOT / "docs" / "migration" / "test-disposition.md", self.tests)
         candidate = coverage.current_candidate(); payload={"schema":"roundwright-phase5-semantic-execution/v1","candidate_sha":candidate,"tests":coverage._SEMANTIC_TESTS,"status":"passed"}
-        self.semantic.write_text(json.dumps({**payload,"receipt_digest":coverage._digest(coverage._canonical(payload))}),encoding="utf-8")
+        self.semantic.write_text(json.dumps({**payload,"receipt_digest":"sha256:" + coverage._digest(coverage._canonical(payload))}),encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -165,6 +165,6 @@ class Phase5CoverageTests(unittest.TestCase):
             {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": coverage._SEMANTIC_TESTS[:-1], "status": "passed"},
             {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": coverage._SEMANTIC_TESTS, "status": "failed"},
         ):
-            self.semantic.write_text(json.dumps({**payload, "receipt_digest": coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
+            self.semantic.write_text(json.dumps({**payload, "receipt_digest": "sha256:" + coverage._digest(coverage._canonical(payload))}), encoding="utf-8")
             with self.subTest(payload=payload), self.assertRaisesRegex(coverage.CoverageError, "stale or forged"):
                 coverage.render(self.source, self.ledger, self.tests, candidate, manifest, self.semantic)

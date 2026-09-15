@@ -387,7 +387,7 @@ def _semantic_execution(path: Path, candidate: str) -> str:
     except CoverageError as error:
         raise CoverageError("Phase 5 semantic execution receipt is unavailable") from error
     payload = {"schema": "roundwright-phase5-semantic-execution/v1", "candidate_sha": candidate, "tests": list(_SEMANTIC_TESTS), "status": "passed"}
-    if actual != {**payload, "receipt_digest": _digest(_canonical(payload))}:
+    if actual != {**payload, "receipt_digest": "sha256:" + _digest(_canonical(payload))}:
         raise CoverageError("Phase 5 semantic execution receipt is stale or forged")
     return actual["receipt_digest"]
 

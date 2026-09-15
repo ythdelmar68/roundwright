@@ -447,6 +447,55 @@ def consume_durable_recovery_route_authorization(repository, identity, authoriza
     finally: connection.close()
 
 
+def release_durable_recovery_route_authorization(
+    repository, identity, authorization: DurableRecoveryRouteAuthorization, *,
+    reservation_digest: str,
+) -> None:
+    """Undo an unadmitted route consumption for its exact reservation.
+
+    A route is consumed before crossing an external effect boundary, but the
+    reservation ledger lives in a separate SQLite file.  If local successor
+    admission fails immediately after consumption, both durable fragments
+    must be restored before control returns so a restart sees no successor.
+    This operation is deliberately narrower than a general route reset: it
+    authenticates the exact consumed reservation and can only restore the
+    single-use route while no provider turn was admitted by the caller.
+    """
+
+    from .state import _open_writable_connection, _require_matching_task
+    if (
+        type(authorization) is not DurableRecoveryRouteAuthorization
+        or not _DIGEST.fullmatch(reservation_digest)
+    ):
+        raise FailureRecoveryError("durable recovery route release is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        row = connection.execute(
+            "SELECT reservation_digest, state FROM recovery_route_authorizations "
+            "WHERE route_digest=? AND task_id=?",
+            (authorization.route_digest, identity.task_id),
+        ).fetchone()
+        if row != (reservation_digest, "consumed"):
+            raise FailureRecoveryError("durable recovery route release has drifted")
+        updated = connection.execute(
+            "UPDATE recovery_route_authorizations "
+            "SET state='issued', reservation_digest=NULL, consumed_at=NULL "
+            "WHERE route_digest=? AND task_id=? AND state='consumed' "
+            "AND reservation_digest=?",
+            (authorization.route_digest, identity.task_id, reservation_digest),
+        ).rowcount
+        if updated != 1:
+            raise FailureRecoveryError("durable recovery route release has drifted")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def issue_recovery_route_admission(
     binding: FailureBinding, *, source_execution: object, target_execution: object,
 ) -> RecoveryRouteAdmission:

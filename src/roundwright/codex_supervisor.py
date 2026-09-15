@@ -464,6 +464,13 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
             try:
                 pending_authorization.consume(effect_reservation)
             except Exception as error:
+                # A rejected route has not admitted a provider turn.  Do not
+                # leave its exact worst-case reservation behind for a later
+                # retry to mistake as an admitted successor.
+                try:
+                    effect_reservation.reject_recovery_route()
+                except RoleCapabilityError:
+                    pass
                 raise CodexSupervisorError("Supervisor fallback route consumption is denied") from error
             pending_authorization = None
         result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution, effect_reservation=effect_reservation)
@@ -474,6 +481,13 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
         if result.kind is SupervisorResultKind.BLOCKED:
             return SupervisorFailoverResult(result, tuple(attempted), False)
         if result.kind is not SupervisorResultKind.INVALID:
+            return SupervisorFailoverResult(result, tuple(attempted), False)
+        # INVALID is not a generic retry signal.  Only the two parser-format
+        # diagnostics have a bounded same-profile correction route; context,
+        # candidate, non-final, and absent/unknown diagnostics are terminal.
+        if result.diagnostic not in {
+            SupervisorDiagnostic.SYNTAX, SupervisorDiagnostic.SHAPE,
+        }:
             return SupervisorFailoverResult(result, tuple(attempted), False)
         if ordinal < len(requests):
             assert authorize_fallback is not None

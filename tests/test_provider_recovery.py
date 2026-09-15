@@ -42,7 +42,7 @@ from roundwright.provider_recovery import (
 from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult, _owner_authority_digest
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
-from roundwright.failure_recovery import Clearance, ClearanceRevocation, DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, classify, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_recovery_route_authorization, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, require_scope_open
+from roundwright.failure_recovery import Clearance, ClearanceRevocation, DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, classify, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_recovery_route_authorization, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, release_durable_recovery_route_authorization, require_scope_open
 
 
 class ProviderRecoveryTests(unittest.TestCase):
@@ -946,6 +946,13 @@ class ProviderRecoveryTests(unittest.TestCase):
                 issue_durable_recovery_route_authorization(repository, identity, **{**values, "coordinate_digest": "sha256:" + "1" * 64})
             with self.assertRaises(Exception):
                 consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.WORKER, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
+            consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
+            release_durable_recovery_route_authorization(
+                repository, identity, issued, reservation_digest="sha256:" + "2" * 64,
+            )
+            self.assertEqual(
+                read_durable_recovery_route_authorization(repository, identity, issued.route_digest), issued,
+            )
             consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])
             with self.assertRaises(Exception):
                 consume_durable_recovery_route_authorization(repository, identity, issued, reservation_digest="sha256:" + "2" * 64, target_role=FailureRole.SUPERVISOR, target_profile_digest=values["target_profile_digest"], target_route_digest=values["target_route_digest"], coordinate_digest=values["coordinate_digest"], remaining_budget_digest=values["remaining_budget_digest"])

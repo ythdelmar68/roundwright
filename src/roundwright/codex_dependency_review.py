@@ -25,6 +25,7 @@ from .failure_recovery import (
     DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding,
     FailureClass, FailureRole, FailureRecord, RecoveryAction,
     classify_native_failure, consume_durable_recovery_route_authorization,
+    release_durable_recovery_route_authorization,
     issue_durable_recovery_route_authorization, parse_failure_record,
     read_durable_failure, read_durable_recovery_route_authorization,
     record_durable_failure,
@@ -280,6 +281,7 @@ class DependencyReviewService:
             advisory_execution, execution_host, adapter,
         )
         request_material, preflight_material = adapter.effect_material(request)
+        consumed_reservation_digest: str | None = None
         try:
             reservation = reserve_role_effect(
                 advisory_execution, host_inputs=execution_host,
@@ -311,6 +313,7 @@ class DependencyReviewService:
                         target_route_digest=route, coordinate_digest=coordinate,
                         remaining_budget_digest=remaining,
                     )
+                    consumed_reservation_digest = reservation_digest
                 except Exception:
                     try:
                         reservation.reject_recovery_route()
@@ -334,11 +337,23 @@ class DependencyReviewService:
         # route and sealed budget reservation agree.  In particular, a route
         # replay or tamper rejection must leave no prepared successor that a
         # later restart could mistake for an admitted provider turn.
-        attempt = store.start_attempt(
-            repository, subset, attempt_id=attempt_id, binding=binding,
-            source_owned_relations=source_owned_relations,
-            supersedes_attempt_id=supersedes_attempt_id,
-        )
+        try:
+            attempt = store.start_attempt(
+                repository, subset, attempt_id=attempt_id, binding=binding,
+                source_owned_relations=source_owned_relations,
+                supersedes_attempt_id=supersedes_attempt_id,
+            )
+        except Exception:
+            if recovery_route is not None and consumed_reservation_digest is not None:
+                try:
+                    release_durable_recovery_route_authorization(
+                        repository, task_identity, recovery_route,
+                        reservation_digest=consumed_reservation_digest,
+                    )
+                    reservation.reject_recovery_route()
+                except Exception:
+                    pass
+            raise
         if attempt.input_digest != request.input_digest:
             raise DependencyReviewDispatchError("dependency review prepared request has drifted")
         recovery_digest = _digest({"attempt_id": attempt.attempt_id, "status": "recovered-in-flight-dispatch"})

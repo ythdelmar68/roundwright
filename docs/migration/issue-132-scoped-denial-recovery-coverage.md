@@ -59,3 +59,15 @@ continues only the next format ordinal, bounded profile/format retries exhaust
 before a fourth dispatch, and a terminal denial retains its original class
 across restart. Windows has no omitted cases in this hermetic slice; its empty
 skip declaration is sealed in the semantic receipt.
+
+## E1R6 recovery closure
+
+`RW132-RECOVERY-002` now treats route consumption, its sealed exact budget
+reservation, and first successor admission as one recoverable local boundary.
+If local admission fails after consumption but before a provider turn, the
+route is restored only when its exact reservation digest still matches and the
+reservation is released. `RW132-PROD-001` separately permits successor
+dispatch only for durable `SYNTAX` and `SHAPE` invalid outcomes; `CONTEXT`,
+`CANDIDATE`, `NON_FINAL`, and every unclassified invalid outcome remain
+terminal with zero successor effects. The qualification inventory pins both
+the exact route-release replay and every non-format-invalid denial case.

@@ -342,6 +342,31 @@ class SupervisorTests(unittest.TestCase):
                 result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertEqual((result.result.kind, result.exhausted, result.attempted_profile_identities, fallback._backend.calls), (kind, False, (primary.profile_identity,), 0))
 
+    def test_every_non_format_invalid_stops_before_successor(self):
+        for diagnostic in (
+            SupervisorDiagnostic.CONTEXT,
+            SupervisorDiagnostic.CANDIDATE,
+            SupervisorDiagnostic.NON_FINAL,
+        ):
+            with self.subTest(diagnostic=diagnostic.value):
+                primary = self.adapter(
+                    self.profiles[0], f"{diagnostic.value}-primary",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=diagnostic),
+                )
+                fallback = self.adapter(
+                    self.profiles[1], f"{diagnostic.value}-fallback",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                )
+                result = self.dispatch_ordered(
+                    (self.request(1, primary), self.request(2, fallback)),
+                    (primary, fallback), checkpoint_session=lambda _identity: None,
+                    checkpoint_turn=lambda _session, _turn: None,
+                )
+                self.assertEqual(
+                    (result.result.kind, result.result.diagnostic, result.attempted_profile_identities, fallback._backend.calls),
+                    (SupervisorResultKind.INVALID, diagnostic, (primary.profile_identity,), 0),
+                )
+
     def test_injected_supervisor_factory_cannot_bypass_not_activated(self):
         events = []
         class Codex:
@@ -520,8 +545,8 @@ class SupervisorTests(unittest.TestCase):
             ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None, 0),
             ("interrupted", {"completed": "interrupted"}, SupervisorResultKind.AMBIGUOUS, None, 0),
             ("unknown", {"completed": "unknown"}, SupervisorResultKind.AMBIGUOUS, None, 0),
-            ("invalid-context", {"binding": "wrong-turn"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CONTEXT),
-            ("stale-candidate", {"text": "__stale_candidate__"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CANDIDATE),
+            ("invalid-context", {"binding": "wrong-turn"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CONTEXT, 0),
+            ("stale-candidate", {"text": "__stale_candidate__"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CANDIDATE, 0),
             ("malformed-output", {"text": "not-json"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SYNTAX),
             ("missing-result", {}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SHAPE),
         )
@@ -536,7 +561,7 @@ class SupervisorTests(unittest.TestCase):
                 fallback = self.adapter(self.profiles[1], "native-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
                 ordered = self.dispatch_ordered((first, self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 expected_profiles = (primary.profile_identity, fallback.profile_identity) if fallback_calls else (primary.profile_identity,)
-                expected_kind = SupervisorResultKind.ACCEPTED if fallback_calls else SupervisorResultKind.AMBIGUOUS
+                expected_kind = SupervisorResultKind.ACCEPTED if fallback_calls else kind
                 self.assertEqual((ordered.attempted_profile_identities, ordered.result.kind, fallback._backend.calls, first.context.review_epoch, first.context.review_round, first.context.review_mode), (expected_profiles, expected_kind, fallback_calls, self.context.review_epoch, self.context.review_round, ReviewMode.CONVERGING))
 
     def test_armed_capture_uses_one_plan_for_prepare_seal_and_readback(self):

@@ -34,6 +34,7 @@ from .failure_recovery import (
     EvidenceSource, FailureBinding, FailureClass, FailureRole,
     RecoveryAction as FailureRecoveryAction, classify,
     consume_durable_recovery_route_authorization,
+    release_durable_recovery_route_authorization,
     issue_durable_recovery_route_authorization,
     native_failure_class, parse_failure_record, read_durable_failure,
 )
@@ -895,6 +896,7 @@ class DurableDiffReviewRunner:
             )
         except RoleCapabilityError as error:
             raise ProviderAttemptRuntimeError("provider attempt budget admission is denied") from error
+        consumed_reservation_digest: str | None = None
         if recovery_route is not None:
             route, coordinate, remaining, reservation_digest = self._recovery_route_material(entry)
             try:
@@ -916,6 +918,7 @@ class DurableDiffReviewRunner:
                     target_route_digest=route, coordinate_digest=coordinate,
                     remaining_budget_digest=remaining, now=self.dispatch_control.now,
                 )
+                consumed_reservation_digest = reservation_digest
             except Exception as error:
                 # Consumption rejection happens before any successor attempt
                 # checkpoint.  Refund only this untouched exact reservation;
@@ -925,16 +928,28 @@ class DurableDiffReviewRunner:
                 except RoleCapabilityError:
                     pass
                 raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
-        prepared = prepare_attempt(
-            self.repository, self.identity, recovery, attempt_id=selection.provider_attempt_id,
-            role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
-            process_lease_expires_at=selection.process_lease_expires_at, input_fingerprint=input_fingerprint,
-            selected_profile_identity=selected,
-            logical_profile_position=selection.resolved_logical_profile_position,
-            physical_format_output_ordinal=selection.physical_format_output_ordinal,
-            review_epoch=self.review_epoch, review_round=self.review_round,
-            lease=self.lease, now=self.dispatch_control.now,
-        )
+        try:
+            prepared = prepare_attempt(
+                self.repository, self.identity, recovery, attempt_id=selection.provider_attempt_id,
+                role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
+                process_lease_expires_at=selection.process_lease_expires_at, input_fingerprint=input_fingerprint,
+                selected_profile_identity=selected,
+                logical_profile_position=selection.resolved_logical_profile_position,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                review_epoch=self.review_epoch, review_round=self.review_round,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+        except Exception:
+            if recovery_route is not None and consumed_reservation_digest is not None:
+                try:
+                    release_durable_recovery_route_authorization(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=consumed_reservation_digest,
+                    )
+                    reservation.reject_recovery_route()
+                except Exception:
+                    pass
+            raise
         if prepared.state is not AttemptState.PREPARED:
             raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
         try:

@@ -35,6 +35,8 @@ TESTS = (
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_unknown_predecessor_requires_reconciliation_before_successor_effect",
+    "tests.test_codex_supervisor.SupervisorTests.test_every_non_format_invalid_stops_before_successor",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_recovery_route_is_exact_single_use_and_restart_safe",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

@@ -38,9 +38,9 @@
       {"identity":"advisory-coding-tools-tests-v1","path":"tests/test_coding_tools.py","sha256":"3de5d104f99b399c7b5ab28af8aef9de8ec08dfd058023923590f5a0973423b0"},
       {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"9bd568eb38fa438017077c28f43dbc68a044d8ef172fcf17a81e1f5314b6450e"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
-      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"bda7c12c112bd0e29bec8db56f9b6e90c78e03d17fc1b319602a744f84671990"},
-      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"ca95a478d2fef9346b325e94295c64c681c1a0648061571c4b951a06b1773731"},
-      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"98736db057804664dc15a9ee86bac232d6538eee860aab41ff046686d3a7d781"}
+      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"2c115abb83364ea580b7ec3f36f56b135d82c043aeb55cc5c84e77c8ba7b297a"},
+      {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"fd648d82c08c072a2c122ebf63700d1b7cd789ee9b4aff65a14a225e4f66d465"},
+      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"fdbe8e4026726fab895fc0cdac0011fcaaf980da1b6356a34b1fbd069923ceb2"}
     ]
   },
   "issue_132_requirements": {

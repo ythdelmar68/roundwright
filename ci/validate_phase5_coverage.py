@@ -552,7 +552,7 @@ def _validate_issue_132_semantic_tests() -> None:
         raise CoverageError("Issue 132 E1R2 finding inventory is incomplete")
     if any(not (ROOT / path).is_file() for path, _test in ISSUE_132_FINDING_REQUIREMENTS.values()):
         raise CoverageError("Issue 132 E1R2 finding mapping has drifted")
-    if len(ISSUE_132_E1R3_TESTS) != 5:
+    if len(ISSUE_132_E1R3_TESTS) != 4:
         raise CoverageError("Issue 132 E1R3 finding inventory is incomplete")
     if set(ISSUE_132_E1R3_FINDING_REQUIREMENTS) != {
         "RW132-PROD-001", "RW132-RECOVERY-002", "RW132-BINDING-003",

@@ -13,9 +13,6 @@ from roundwright.failure_recovery import (
     failure_compatibility_matrix, native_failure_class, parse_failure_record,
 )
 from roundwright.provider_health import CodexFailure
-from roundwright.codex_worker import classify_worker_failure
-from roundwright.codex_supervisor import classify_supervisor_failure
-from roundwright.codex_dependency_review import classify_dependency_review_failure
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect
 from tests.role_admission_fixture import sealed_execution_for_effect, trusted_execution_host
@@ -120,11 +117,10 @@ class FailureRecoveryTests(unittest.TestCase):
                 "sha256:" + "1" * 64, "sha256:" + "2" * 64,
             )
 
-    def test_all_production_role_seams_reject_cross_role_fallback(self):
-        for role, seam in ((FailureRole.WORKER, classify_worker_failure), (FailureRole.SUPERVISOR, classify_supervisor_failure), (FailureRole.DEPENDENCY_REVIEW, classify_dependency_review_failure)):
-            self.assertEqual(seam(self.binding(role=role), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST).action, RecoveryAction.STOP_SCOPE)
-        with self.assertRaises(FailureRecoveryError):
-            classify_supervisor_failure(self.binding(), FailureClass.TRANSIENT_SERVICE, EvidenceSource.VERIFIED_SERVICE)
+    def test_role_bound_records_preserve_terminal_stop_without_adapter_classifiers(self):
+        for role in FailureRole:
+            record = classify(self.binding(role=role), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
+            self.assertEqual((record.binding.role, record.action), (role, RecoveryAction.STOP_SCOPE))
 
     def test_closed_record_parser_rejects_tampered_or_unknown_payload(self):
         record = classify(self.binding(), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)

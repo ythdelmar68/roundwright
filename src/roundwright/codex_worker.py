@@ -23,7 +23,6 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import ProviderRole
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_for_role
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedRoleEffectReservation, require_worker_tool_capability
 
 
@@ -33,11 +32,6 @@ class CodexWorkerError(ValueError):
 
 class _WorkerToolProtocolError(Exception):
     """A local tool exchange cannot establish a terminal provider outcome."""
-
-
-def classify_worker_failure(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource) -> FailureRecord:
-    """Typed pre-recovery seam; it never interprets native/provider prose."""
-    return classify_for_role(FailureRole.WORKER, binding, failure, evidence)
 
 
 class WorkerAction(StrEnum):

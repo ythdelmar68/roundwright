@@ -21,7 +21,7 @@ from .dependency_review import (
     DependencyReviewError, DependencyReviewStore, SourceOwnedRelation,
 )
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_for_role, classify_native_failure, record_durable_failure
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecord, classify_native_failure, record_durable_failure
 from .state import TaskIdentity
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, require_external_production_activation, reserve_role_effect, trusted_provider_launch_context
 
@@ -32,11 +32,6 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 class DependencyReviewDispatchError(ValueError):
     """A dependency-review dispatch violates the narrow role contract."""
-
-
-def classify_dependency_review_failure(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource) -> FailureRecord:
-    """Dependency review has no implicit session replacement escape hatch."""
-    return classify_for_role(FailureRole.DEPENDENCY_REVIEW, binding, failure, evidence)
 
 
 class DependencyReviewResultKind(StrEnum):

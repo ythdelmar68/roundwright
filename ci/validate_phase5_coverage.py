@@ -537,12 +537,12 @@ def _validate_issue_132_semantic_tests() -> None:
     """Keep the independently maintained E1R2/E1R3 inventory closed and ordered."""
     if len(ISSUE_132_FINDING_REQUIREMENTS) != 8 or len(set(ISSUE_132_FINDING_REQUIREMENTS)) != 8:
         raise CoverageError("Issue 132 E1R2 finding inventory is incomplete")
-    if tuple(test for test in SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
-        raise CoverageError("Issue 132 semantic test inventory is omitted, reordered, or drifted")
     if any(not (ROOT / path).is_file() or test not in SEMANTIC_TESTS for path, test in ISSUE_132_FINDING_REQUIREMENTS.values()):
         raise CoverageError("Issue 132 E1R2 finding mapping has drifted")
     if len(ISSUE_132_E1R3_TESTS) != 4 or any(test not in SEMANTIC_TESTS for test in ISSUE_132_E1R3_TESTS):
         raise CoverageError("Issue 132 E1R3 finding inventory is incomplete")
+    if tuple(test for test in SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
+        raise CoverageError("Issue 132 semantic test inventory is omitted, reordered, or drifted")
 
 def _semantic_execution(path: Path, candidate: str) -> str:
     _validate_issue_132_semantic_tests()

@@ -40,7 +40,7 @@
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
       {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"0666ffe2193858bbf25e385060f69d1f9be7c68b39eeba6713b64e53addc03c6"},
       {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"f73d9728c3a6a64c791e4f525de907cb1a84ec52adb2b3e2da520e15985ad6ba"},
-      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"c3105848719c3fd54179b13ac3f3bce70866b2a06775a6511f3105fdc04676f4"}
+      {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"3addabea238071bf763b1769bd336dc891ff651a169b60bb3dbcb6a12f207fa9"}
     ]
   },
   "issue_132_requirements": {
@@ -72,7 +72,7 @@
       {"identity":"failure-recovery-state-tests-v1","path":"tests/test_state.py","sha256":"72732b1318fff6caca3749052f978b552682aeb85b7816a8bf9f066b1d6634ef"},
       {"identity":"failure-recovery-semantic-receipt-v1","path":"ci/phase5_semantic_receipt.py","sha256":"0666ffe2193858bbf25e385060f69d1f9be7c68b39eeba6713b64e53addc03c6"},
       {"identity":"failure-recovery-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"f73d9728c3a6a64c791e4f525de907cb1a84ec52adb2b3e2da520e15985ad6ba"},
-      {"identity":"failure-recovery-qualification-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"c3105848719c3fd54179b13ac3f3bce70866b2a06775a6511f3105fdc04676f4"},
+      {"identity":"failure-recovery-qualification-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"3addabea238071bf763b1769bd336dc891ff651a169b60bb3dbcb6a12f207fa9"},
       {"identity":"failure-recovery-production-worker-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"6324363fcc215f6092155967873398233774114447cbb0f606657a322d37d701"},
       {"identity":"failure-recovery-roadmap-v1","path":"docs/operations/dogfood-promotion-roadmap.md","sha256":"b6acdaa1d6e1580d13899757ce836b419beb19e4bbc5d1d8424546c56d86be0b"}
     ]

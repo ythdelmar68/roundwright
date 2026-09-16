@@ -38,7 +38,7 @@
       {"identity":"advisory-coding-tools-tests-v1","path":"tests/test_coding_tools.py","sha256":"3de5d104f99b399c7b5ab28af8aef9de8ec08dfd058023923590f5a0973423b0"},
       {"identity":"advisory-production-coding-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"6324363fcc215f6092155967873398233774114447cbb0f606657a322d37d701"},
       {"identity":"advisory-admission-fixture-v1","path":"tests/role_admission_fixture.py","sha256":"958ac321f9946cf204f5afbbc08aa4cdfcabd3eec60be49a0b4da59c3a22a829"},
-      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"0666ffe2193858bbf25e385060f69d1f9be7c68b39eeba6713b64e53addc03c6"},
+      {"identity":"advisory-semantic-receipt-runner-v1","path":"ci/phase5_semantic_receipt.py","sha256":"6fe91e77d8122c1c2733a3e65f99d34682cf09fcd95ed7c3ec6fbd8f3d8de846"},
       {"identity":"advisory-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"ff5c24b083a0aeee19d2c00b4d33b93a3446ec93c166712c8e0bc2d175aa4ab3"},
       {"identity":"advisory-qualification-validator-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"aacd7356bbeb20e4ee3d306ba9ddd25193041b817e4a477f5c51906fe717a730"}
     ]
@@ -70,7 +70,7 @@
       {"identity":"failure-recovery-dependency-tests-v1","path":"tests/test_codex_dependency_review.py","sha256":"abd8611009ef3720b72ecf3a3fdd0e56b8432f4a354287968a7250298695c7c3"},
       {"identity":"failure-recovery-candidate-review-tests-v1","path":"tests/test_candidate_review.py","sha256":"61b473cc838e22d95efaaf7063cacaddba6fb4fe168610a346f2122be173f321"},
       {"identity":"failure-recovery-state-tests-v1","path":"tests/test_state.py","sha256":"72732b1318fff6caca3749052f978b552682aeb85b7816a8bf9f066b1d6634ef"},
-      {"identity":"failure-recovery-semantic-receipt-v1","path":"ci/phase5_semantic_receipt.py","sha256":"0666ffe2193858bbf25e385060f69d1f9be7c68b39eeba6713b64e53addc03c6"},
+      {"identity":"failure-recovery-semantic-receipt-v1","path":"ci/phase5_semantic_receipt.py","sha256":"6fe91e77d8122c1c2733a3e65f99d34682cf09fcd95ed7c3ec6fbd8f3d8de846"},
       {"identity":"failure-recovery-qualification-validator-v1","path":"ci/validate_phase5_coverage.py","sha256":"ff5c24b083a0aeee19d2c00b4d33b93a3446ec93c166712c8e0bc2d175aa4ab3"},
       {"identity":"failure-recovery-qualification-tests-v1","path":"tests/test_phase5_coverage.py","sha256":"aacd7356bbeb20e4ee3d306ba9ddd25193041b817e4a477f5c51906fe717a730"},
       {"identity":"failure-recovery-production-worker-runtime-tests-v1","path":"tests/test_production_coding_runtime.py","sha256":"6324363fcc215f6092155967873398233774114447cbb0f606657a322d37d701"},

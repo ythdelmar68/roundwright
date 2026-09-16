@@ -1815,7 +1815,7 @@ def _migrate_diff_review_digest_versions(connection: sqlite3.Connection) -> None
         versions = []
         for version in (1, 2):
             try:
-                _read_diff_dispatch_connection(connection, SimpleNamespace(task_id=task_id), review_id, digest_version=version)
+                _read_diff_dispatch_connection(connection, SimpleNamespace(task_id=task_id), review_id, digest_version=version, validate_provider_output=True)
             except (CandidateReviewError, TypeError, ValueError):
                 continue
             versions.append(version)

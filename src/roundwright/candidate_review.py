@@ -1302,7 +1302,7 @@ def _read_diff_dispatch(repository, identity, diff_review_attempt_id):
         connection.close()
 
 
-def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id, *, digest_version=None):
+def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id, *, digest_version=None, validate_provider_output=False):
     row = connection.execute("SELECT implementation_attempt_id, provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, base_sha, candidate_sha, verification_digest, input_digest, within_round_attempt, selected_profile_identity, logical_profile_position, physical_format_output_ordinal, review_round, review_epoch, review_mode, review_max_rounds, review_on_final_findings, review_policy_digest, review_complete_rounds, review_max_supervisor_attempts_per_round FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (diff_review_attempt_id, identity.task_id)).fetchone()
     if row is None:
         return None
@@ -1337,13 +1337,13 @@ def _read_diff_dispatch_connection(connection, identity, diff_review_attempt_id,
         raise CandidateReviewError("persisted diff review input digest has drifted")
     provider = connection.execute("SELECT input_fingerprint FROM provider_attempts WHERE attempt_id=? AND task_id=?", (row[1], identity.task_id)).fetchone()
     if provider != (expected_input_digest,):
-        raise CandidateReviewError("persisted diff review provider input has drifted")
+        raise CandidateReviewError("persisted diff review provider attempt input has drifted")
     artifact = connection.execute("SELECT verdict, findings_json, pass_follow_ups_json, content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id=? AND task_id=?", (diff_review_attempt_id, identity.task_id)).fetchone()
     if artifact is not None:
         output = DiffReviewOutput(diff_review_attempt_id, row[1], row[2], row[3], row[4], row[5], row[6], DiffReviewVerdict(artifact[0]), tuple(json.loads(artifact[1])), tuple(json.loads(artifact[2])))
         expected_output = _bound_diff_review_output_digest(output.digest, row[11], row[12], row[10], digest_version)
         provider_output = connection.execute("SELECT output_fingerprint FROM provider_completion_outputs WHERE attempt_id=?", (row[1],)).fetchone()
-        if artifact[3] != expected_output or provider_output != (expected_output,):
+        if artifact[3] != expected_output or (validate_provider_output and provider_output != (expected_output,)):
             raise CandidateReviewError("persisted diff review output digest has drifted")
     return DiffReviewDispatch(diff_review_attempt_id, *row[:11], projection, row[12], digest_version)
 

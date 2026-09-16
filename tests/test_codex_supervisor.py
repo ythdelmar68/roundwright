@@ -301,15 +301,17 @@ class SupervisorTests(unittest.TestCase):
         values = dict(review_attempt_id=f"review-{ordinal}", provider_attempt_id=f"provider-{ordinal}", selected_profile_identity=adapter.profile_identity, within_round_attempt=ordinal if logical is None else logical, physical_format_output_ordinal=physical, context=self.context, objective="Review the immutable candidate.", acceptance_criteria=("Return a strict verdict.",))
         return CodexSupervisorRequest(input_digest=supervisor_request_digest(**values), **values)
 
-    def test_later_schema_valid_fallback_is_accepted_after_invalid_primary(self):
+    def test_format_exhaustion_blocks_even_a_schema_valid_later_profile(self):
         primary = self.adapter(self.profiles[0], "one", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX))
         retry_one = self.adapter(self.profiles[0], "one-retry", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX))
         retry_two = self.adapter(self.profiles[0], "one-retry-two", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX))
         fallback = self.adapter(self.profiles[1], "two", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}))
         result = self.dispatch_ordered((self.request(1, primary, logical=1), self.request(2, retry_one, logical=1, physical=1), self.request(3, retry_two, logical=1, physical=2), self.request(4, fallback, logical=2)), (primary, retry_one, retry_two, fallback), checkpoint_session=lambda identity: self.events.append(("session", identity)), checkpoint_turn=lambda session, turn: self.events.append(("turn", session, turn)))
-        self.assertFalse(result.exhausted)
-        self.assertEqual((result.attempted_profile_identities, result.result.verdict, result.result.findings), ((primary.profile_identity, primary.profile_identity, primary.profile_identity, fallback.profile_identity), "findings", ("missing-evidence",)))
-        self.assertEqual([event[0] for event in self.events if event[0] == "start"], ["start", "start", "start", "start"])
+        self.assertTrue(result.exhausted)
+        self.assertEqual(result.attempted_profile_identities, (primary.profile_identity,) * 3)
+        self.assertEqual(result.result.kind, SupervisorResultKind.INVALID)
+        self.assertEqual(fallback._backend.calls, 0)
+        self.assertEqual([event[0] for event in self.events if event[0] == "start"], ["start"] * 3)
 
     def test_dispatch_rejects_the_removed_expected_execution_argument(self):
         adapter = self.adapter(self.profiles[0], "missing-expectation", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))

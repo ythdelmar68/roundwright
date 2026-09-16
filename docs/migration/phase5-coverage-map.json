@@ -61,7 +61,7 @@
       {"identity":"failure-recovery-dependency-store-v1","path":"src/roundwright/dependency_review.py","sha256":"5960546ef59354eaa0495c456e62f2604e168fa1eb5c217cf0a7c563fe01a44a"},
       {"identity":"failure-recovery-supervisor-lifecycle-v1","path":"src/roundwright/supervisor_shadow.py","sha256":"6dba880db9ce1cad2e4e4953bf4b15d40a2b720eb6e4bf1b784771b69ba18f04"},
       {"identity":"failure-recovery-runtime-store-v1","path":"src/roundwright/runtime_binding.py","sha256":"c5324b73450876083b82e623ef7c2ab611f19ec146d93e9c61a800df08183ae6"},
-      {"identity":"failure-recovery-candidate-review-v1","path":"src/roundwright/candidate_review.py","sha256":"bb023294cb872393b8794a3c09a873eb91dc30e6bb42d10b238b89996e8e4b35"},
+      {"identity":"failure-recovery-candidate-review-v1","path":"src/roundwright/candidate_review.py","sha256":"700e482d1e4fb5f47714e5b3d21eaf01296d182070e5d98c2a1b3ffd518a0d4e"},
       {"identity":"failure-recovery-supervisor-runtime-tests-v1","path":"tests/test_provider_attempt_runtime.py","sha256":"fb91f80fff8e173d2b723849e866578a2a594a2a3b8d898db0ebb38be8a4b29c"},
       {"identity":"failure-recovery-runtime-tests-v1","path":"tests/test_provider_recovery.py","sha256":"27a53923ea6fd682c7b732ecb3740e61caf14623eb8dfc26bd831bcb230bbccc"},
       {"identity":"failure-recovery-supervisor-tests-v1","path":"tests/test_codex_supervisor.py","sha256":"dd416ac0122678206a691bc2cf7e1218e43256975f64698623f1d190d1341616"},

@@ -217,3 +217,28 @@ invalid results, sessions, provider calls, and budget rows byte-for-byte
 unchanged. Readiness accepts the same exact authenticated PREPARED/UNCLAIMED
 correction checkpoint that execution recovers, while changed request/lease/
 coordinate material or a consumed dispatch claim fails closed.
+
+## E1R12 admission atomicity and exact persisted-state replay
+
+Worker and dependency-review reserve an advisory budget only through a single
+product-ledger admission operation.  It retains the product `BEGIN IMMEDIATE`
+lock from authenticated scope verification through the separate budget write,
+in that order, so a durable stop cannot land between the check and a stranded
+one-call/60-second/4,000-token debit.  Later adapter boundaries still reread
+the scope before every native or durable effect.
+
+The generic ordered Supervisor dispatcher now carries the repository-bound
+scope callback into every adapter boundary.  A stop persisted after the
+session checkpoint prevents turn creation, response read, and accepted output.
+The budget deletion primitive independently requires the opaque exclusive
+recovery authorization; public ledgers and reservations cannot refund an
+admitted row.  Only the recovery transaction, after durable no-successor
+read-back, may perform the route-bound reconciliation refund.
+
+Provider-attempt readiness distinguishes a genuinely absent row from invalid
+persisted state.  It shares the exact unclaimed-PREPARED validator used by
+execution: role/profile/input and lease binding, logical and physical
+coordinates, context/health binding, dispatch claim, session/turn/output and
+completion fields, plus accepted identity invariants.  Thus a changed
+coordinate or structurally inconsistent row is rejected at readiness, while
+the exact persisted PREPARED/unclaimed correction remains resumable.

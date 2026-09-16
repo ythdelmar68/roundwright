@@ -440,7 +440,7 @@ class SupervisorFallbackAuthorization:
             raise CodexSupervisorError("Supervisor fallback authorization is invalid")
 
 
-def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None, authorize_fallback: Callable[[CodexSupervisorRequest, CodexSupervisorResult, CodexSupervisorRequest], SupervisorFallbackAuthorization] | None = None, resume_invalid_attempts: int = 0, resume_result: CodexSupervisorResult | None = None, checkpoint_dispatch: Callable[[CodexSupervisorRequest], None] | None = None) -> SupervisorFailoverResult:
+def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None, authorize_fallback: Callable[[CodexSupervisorRequest, CodexSupervisorResult, CodexSupervisorRequest], SupervisorFallbackAuthorization] | None = None, resume_invalid_attempts: int = 0, resume_result: CodexSupervisorResult | None = None, checkpoint_dispatch: Callable[[CodexSupervisorRequest], None] | None = None, scope_admission: Callable[[], None] | None = None) -> SupervisorFailoverResult:
     """Run a bounded configured sequence without retrying uncertain outcomes.
 
     Only a typed format-invalid result may advance.  A typed ``BLOCKED`` is a
@@ -451,6 +451,7 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     if type(requests) is not tuple or type(adapters) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(budget_ledger_paths) is not tuple or not requests or len(requests) != len(adapters) or len(adapters) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or len(execution_hosts) != len(budget_ledger_paths) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or any(not isinstance(item, Path) for item in budget_ledger_paths) or not callable(checkpoint_session) or not callable(checkpoint_turn) or (checkpoint_result is not None and not callable(checkpoint_result)) or (authorize_fallback is not None and not callable(authorize_fallback)) or (len(requests) > 1 and authorize_fallback is None) or type(resume_invalid_attempts) is not int or not 0 <= resume_invalid_attempts < len(requests):
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
     if ((checkpoint_dispatch is not None and not callable(checkpoint_dispatch))
+            or (scope_admission is not None and not callable(scope_admission))
             or (resume_invalid_attempts and (
                 type(resume_result) is not CodexSupervisorResult
                 or resume_result.kind is not SupervisorResultKind.INVALID
@@ -537,7 +538,11 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
             recover_pending = False
         if checkpoint_dispatch is not None:
             checkpoint_dispatch(request)
-        result = adapter.dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution, effect_reservation=effect_reservation)
+        result = adapter.dispatch(
+            request, checkpoint_session=checkpoint_session,
+            checkpoint_turn=checkpoint_turn, advisory_execution=advisory_execution,
+            effect_reservation=effect_reservation, scope_admission=scope_admission,
+        )
         if checkpoint_result is not None:
             checkpoint_result(ordinal, request, result)
         if result.kind is SupervisorResultKind.ACCEPTED:

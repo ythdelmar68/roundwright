@@ -128,6 +128,28 @@ class DurableRoleBudgetLedgerTests(unittest.TestCase):
             with self.assertRaisesRegex(RoleCapabilityError, "drifted"):
                 ledger.require_reserved(exposure=budget)
 
+    def test_public_deletion_primitive_cannot_refund_an_admitted_debit(self) -> None:
+        """Only the product-held recovery transaction may delete a budget row."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "role-budget.sqlite"
+            budget = RoleBudget(1, 60, 4_000)
+            ledger = DurableRoleBudgetLedger(
+                path, grant_receipt_digest=digest("grant"),
+                execution_binding=binding("attempt-admitted"), budget=budget,
+            )
+            ledger.reserve_effect(exposure=budget)
+            for authorization in (None, object()):
+                with self.subTest(authorization=authorization), self.assertRaisesRegex(
+                    RoleCapabilityError, "exclusive authorization",
+                ):
+                    ledger.release_exact_reservation(
+                        exposure=budget, authorization=authorization,
+                    )
+                self.assertEqual(
+                    ledger.require_reserved(exposure=budget).tokens, 4_000,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

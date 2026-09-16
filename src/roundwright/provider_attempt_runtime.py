@@ -43,7 +43,7 @@ from .failure_recovery import (
 from .provider_health import CodexFailure
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, recovery_reservation_digest, recover_role_effect_reservation, reserve_role_effect, trusted_provider_launch_context
 from .provider_recovery import (
-    AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
+    AttemptState, ProviderAttemptAbsentError, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
     read_supervisor_terminal_failure, record_supervisor_terminal_failure,
     claim_supervisor_dispatch, read_supervisor_dispatch_claim, SupervisorDispatchClaimState, read_attempt, record_invalid_output, recover_attempt, prepare_attempt, read_supervisor_accounting_snapshot,
@@ -508,7 +508,7 @@ class DurableDiffReviewRunner:
                 self.repository, self.identity, first.selection.provider_attempt_id,
                 context=first.recovery, now=self.dispatch_control.now,
             )
-        except ProviderRecoveryError:
+        except ProviderAttemptAbsentError:
             self.materialize_prepared_snapshot(entries)
         else:
             if initial.state is AttemptState.PREPARED:
@@ -812,7 +812,7 @@ class DurableDiffReviewRunner:
                 self.repository, self.identity, first.selection.provider_attempt_id,
                 context=first.recovery, now=self.dispatch_control.now,
             )
-        except ProviderRecoveryError:
+        except ProviderAttemptAbsentError:
             return self.materialize_prepared_snapshot(entries)
         try:
             current = None
@@ -824,7 +824,7 @@ class DurableDiffReviewRunner:
                         self.repository, self.identity, entry.selection.provider_attempt_id,
                         context=entry.recovery, now=self.dispatch_control.now,
                     )
-                except ProviderRecoveryError:
+                except ProviderAttemptAbsentError:
                     # A later selection may correctly be absent after a
                     # terminal first attempt, but no existing row may drift.
                     continue
@@ -858,12 +858,7 @@ class DurableDiffReviewRunner:
                     attempt_id=entry.selection.provider_attempt_id,
                 )
                 if stored.state is AttemptState.PREPARED:
-                    if (claim is not SupervisorDispatchClaimState.UNCLAIMED
-                            or stored.session_identity is not None
-                            or stored.external_turn_identity is not None
-                            or stored.output_pointer is not None
-                            or stored.accepted_review_identity is not None):
-                        raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
+                    self._require_exact_unclaimed_prepared(entry, stored, expected_input)
                     if position:
                         predecessor = entries[position - 1].selection
                         if (previous is None or previous.state is not AttemptState.INVALIDATED
@@ -882,6 +877,51 @@ class DurableDiffReviewRunner:
             return current
         except (CandidateReviewError, GitIdentityError, ProviderRecoveryError):
             raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable") from None
+
+    def _require_exact_unclaimed_prepared(
+        self, entry: DiffReviewSequenceEntry, stored: object, expected_input: str,
+    ) -> None:
+        """One shared persisted-state contract for readiness and execution."""
+
+        if not hasattr(stored, "state"):
+            raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+        selection = entry.selection
+        if (
+            stored.state is not AttemptState.PREPARED
+            or stored.role is not ProviderRole.SUPERVISOR
+            or stored.selected_profile_identity != entry.audit.profile_identity
+            or stored.input_fingerprint != expected_input
+            or stored.process_lease_id != selection.process_lease_id
+            or stored.process_lease_expires_at != selection.process_lease_expires_at
+            or stored.logical_profile_position != selection.resolved_logical_profile_position
+            or stored.physical_format_output_ordinal != selection.physical_format_output_ordinal
+            or stored.session_identity is not None
+            or stored.external_turn_identity is not None
+            or stored.output_pointer is not None
+            or stored.completion_evidence_fingerprint is not None
+            or stored.accepted_review_identity is not None
+            or read_supervisor_dispatch_claim(
+                self.repository, self.identity, entry.recovery,
+                attempt_id=selection.provider_attempt_id,
+            ) is not SupervisorDispatchClaimState.UNCLAIMED
+        ):
+            raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+        connection = _open_writable_connection(self.repository)
+        try:
+            coordinate = connection.execute(
+                "SELECT task_id, review_epoch, review_round, logical_profile_position, "
+                "physical_format_output_ordinal, profile_identity "
+                "FROM supervisor_attempt_coordinates WHERE attempt_id=?",
+                (selection.provider_attempt_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if coordinate != (
+            self.identity.task_id, self.review_epoch, self.review_round,
+            selection.resolved_logical_profile_position,
+            selection.physical_format_output_ordinal, entry.audit.profile_identity,
+        ):
+            raise ProviderAttemptRuntimeError("provider prepared correction coordinate has drifted")
 
     def _execute_selection(self, entry: DiffReviewSequenceEntry, *, recovery_route: object | None = None) -> tuple[str, bool]:
         """Use public durable APIs for exactly one observed native outcome."""
@@ -926,7 +966,7 @@ class DurableDiffReviewRunner:
             if existing.state is not AttemptState.PREPARED:
                 raise ProviderAttemptRuntimeError("provider attempt restart requires durable recovery")
             existing_prepared = True
-        except ProviderRecoveryError:
+        except ProviderAttemptAbsentError:
             pass
         context, request_material, preflight_material = provider_attempt_effect_material(
             identity=self.identity, recovery=recovery, seal=self.seal,
@@ -961,22 +1001,7 @@ class DurableDiffReviewRunner:
             if (coordinate_owner is not None and coordinate_owner != (selection.provider_attempt_id, selected)) or (existing_prepared and coordinate_owner is None):
                 raise ProviderAttemptRuntimeError("provider prepared correction coordinate has drifted")
         if existing_prepared:
-            if (
-                existing.role is not ProviderRole.SUPERVISOR
-                or existing.selected_profile_identity != selected
-                or existing.input_fingerprint != input_fingerprint
-                or existing.process_lease_id != selection.process_lease_id
-                or existing.process_lease_expires_at != selection.process_lease_expires_at
-                or existing.logical_profile_position != selection.resolved_logical_profile_position
-                or existing.physical_format_output_ordinal != selection.physical_format_output_ordinal
-                or existing.session_identity is not None
-                or existing.external_turn_identity is not None
-                or read_supervisor_dispatch_claim(
-                    self.repository, self.identity, recovery,
-                    attempt_id=selection.provider_attempt_id,
-                ) is not SupervisorDispatchClaimState.UNCLAIMED
-            ):
-                raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+            self._require_exact_unclaimed_prepared(entry, existing, input_fingerprint)
         route_reserved = False
         if recovery_route is not None:
             route, coordinate, remaining, reservation_digest = self._recovery_route_material(entry)

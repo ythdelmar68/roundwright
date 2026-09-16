@@ -26,6 +26,15 @@ class ProviderRecoveryError(StateError):
     """Raised when a provider turn cannot be persisted or recovered safely."""
 
 
+class ProviderAttemptAbsentError(ProviderRecoveryError):
+    """The exact attempt row has not been materialized yet.
+
+    This is intentionally distinct from a malformed, context-drifted, or
+    otherwise unreadable persisted row.  Readiness may create only genuine
+    absence; every persisted inconsistency is a stop condition.
+    """
+
+
 class ProviderRole(StrEnum):
     PLANNING = "planning"
     WORKER = "worker"
@@ -1338,16 +1347,23 @@ def read_attempt(
     try:
         _require_matching_task(connection, identity)
         row = _attempt_row(connection, identity.task_id, attempt_id)
+        # Every caller that supplies a recovery context is reconstructing an
+        # effect boundary, not merely rendering history.  Validate the exact
+        # persisted binding for *all* states, including PREPARED, so readiness
+        # cannot bless a row that execution will later reject.
+        if context is not None:
+            _validate_context(identity, context)
+            _require_persisted_context(connection, attempt_id, context)
+            _require_persisted_health_authorization(
+                connection, attempt_id, context, row.role,
+                row.selected_profile_identity, _clock(now),
+            )
         kind = _accepted_review_kind(connection, identity, row)
         if kind == "invalid":
             raise ProviderRecoveryError("accepted supervisor review is invalid")
         if kind == "generic" and row.state is AttemptState.ACCEPTED:
             if not isinstance(context, RecoveryContext) or not _context_matches(connection, identity, attempt_id, context):
                 raise ProviderRecoveryError("accepted supervisor review requires exact recovery context")
-            _validate_context(identity, context)
-            _require_persisted_health_authorization(
-                connection, attempt_id, context, row.role, row.selected_profile_identity, _clock(now),
-            )
             _require_accepted_supervisor_review(connection, identity, row, context)
         return row
     finally:
@@ -1553,7 +1569,7 @@ def _attempt_row(connection, task_id: str, attempt_id: str) -> ProviderAttempt:
         (task_id, attempt_id),
     ).fetchone()
     if row is None:
-        raise ProviderRecoveryError("provider attempt is unavailable")
+        raise ProviderAttemptAbsentError("provider attempt is unavailable")
     try:
         return ProviderAttempt(row[0], row[1], ProviderRole(row[2]), *row[3:12], AttemptState(row[12]), row[13], row[14], row[15])
     except (TypeError, ValueError) as error:

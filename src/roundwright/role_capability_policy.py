@@ -958,7 +958,7 @@ class DurableRoleBudgetLedger:
             if connection is not None:
                 connection.close()
 
-    def release_exact_reservation(self, *, exposure: RoleBudget) -> None:
+    def release_exact_reservation(self, *, exposure: RoleBudget, authorization: object | None = None) -> None:
         """Undo an unconsumed successor reservation after route rejection.
 
         The ledger key includes the exact execution binding, so this removes
@@ -966,6 +966,13 @@ class DurableRoleBudgetLedger:
         provider effect or a partially consumed budget.
         """
 
+        # This is the deletion primitive, not merely a convenience wrapper.
+        # A publicly constructible ledger must never turn a recovered receipt
+        # into a refund capability.  The only seal is held by the recovery
+        # transaction after it has proved the route is still reserving and no
+        # successor was admitted.
+        if authorization is not _EXCLUSIVE_RECOVERY_RELEASE_SEAL:
+            raise RoleCapabilityError("role budget reservation release requires durable exclusive authorization")
         if type(exposure) is not RoleBudget:
             raise RoleCapabilityError("role budget exposure is invalid")
         connection: sqlite3.Connection | None = None
@@ -1116,7 +1123,9 @@ class TrustedRoleEffectReservation:
                 or authorization is not _EXCLUSIVE_RECOVERY_RELEASE_SEAL
                 or reservation_digest != self.recovery_digest):
             raise RoleCapabilityError("trusted recovery reservation release is unauthorized")
-        self._ledger.release_exact_reservation(exposure=self._exposure)
+        self._ledger.release_exact_reservation(
+            exposure=self._exposure, authorization=authorization,
+        )
 
 
 _EXCLUSIVE_RECOVERY_RELEASE_SEAL = object()

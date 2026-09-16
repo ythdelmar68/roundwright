@@ -243,6 +243,8 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_worker_toolbox.WorkerToolboxTests.test_completed_worker_reservation_cannot_be_publicly_refunded",
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_stopped_scope_rejects_correction_before_any_state_or_budget_change",
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_readiness_accepts_only_exact_unclaimed_prepared_correction",
+            "tests.test_codex_supervisor.SupervisorTests.test_ordered_dispatch_rechecks_scope_after_session_checkpoint",
+            "tests.test_role_budget_ledger.DurableRoleBudgetLedgerTests.test_public_deletion_primitive_cannot_refund_an_admitted_debit",
         )
         self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
         self.assertEqual(tuple(test for test in coverage.SEMANTIC_TESTS if test in required), required)
@@ -254,6 +256,10 @@ class Phase5CoverageTests(unittest.TestCase):
         self.assertEqual(
             tuple(coverage.ISSUE_132_E1R11_FINDING_REQUIREMENTS),
             ("E1R11-01", "E1R11-02", "E1R11-03", "E1R11-04"),
+        )
+        self.assertEqual(
+            tuple(coverage.ISSUE_132_E1R12_FINDING_REQUIREMENTS),
+            ("E1R12-01", "E1R12-02", "E1R12-03", "E1R12-04"),
         )
 
     def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:
@@ -285,6 +291,10 @@ class Phase5CoverageTests(unittest.TestCase):
         e1r11 = dict(coverage.ISSUE_132_E1R11_FINDING_REQUIREMENTS)
         e1r11.pop("E1R11-04")
         with patch.object(coverage, "ISSUE_132_E1R11_FINDING_REQUIREMENTS", e1r11), self.assertRaisesRegex(coverage.CoverageError, "E1R11 finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+        e1r12 = dict(coverage.ISSUE_132_E1R12_FINDING_REQUIREMENTS)
+        e1r12.pop("E1R12-04")
+        with patch.object(coverage, "ISSUE_132_E1R12_FINDING_REQUIREMENTS", e1r12), self.assertRaisesRegex(coverage.CoverageError, "E1R12 finding mapping"):
             coverage._validate_issue_132_semantic_tests()
 
     def test_issue_132_affected_module_inventory_rejects_candidate_review_omission(self) -> None:

@@ -14,11 +14,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 import re
 import weakref
+from typing import Callable, TypeVar
 
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+_AdmissionValue = TypeVar("_AdmissionValue")
 
 
 class FailureRecoveryError(ValueError):
@@ -1399,6 +1401,37 @@ def require_scope_effect_admission(repository, identity, scope: str) -> None:
         _require_matching_task(connection, identity)
         require_scope_open(connection, identity.task_id, scope)
         connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def admit_scope_effect_reservation(
+    repository, identity, scope: str, reserve: Callable[[], _AdmissionValue],
+) -> _AdmissionValue:
+    """Atomically fence a budget reservation with the product scope ledger.
+
+    The product ledger lock is deliberately acquired first and retained while
+    ``reserve`` writes the independent budget ledger.  A concurrent durable
+    stop is therefore ordered either before this check (and denies it) or
+    after the exact reservation has been admitted.  Callers must not acquire
+    the budget lock before calling this operation: that would invert the only
+    safe cross-ledger lock order.
+    """
+
+    from .state import _open_writable_connection, _require_matching_task
+    if not isinstance(scope, str) or not callable(reserve):
+        raise FailureRecoveryError("failure scope admission is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        require_scope_open(connection, identity.task_id, scope)
+        value = reserve()
+        connection.commit()
+        return value
     except Exception:
         connection.rollback()
         raise

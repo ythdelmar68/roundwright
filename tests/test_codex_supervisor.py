@@ -391,6 +391,35 @@ class SupervisorTests(unittest.TestCase):
         result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result.kind, result.attempted_profile_identities, fallback._backend.calls), (SupervisorResultKind.BLOCKED, (primary.profile_identity,), 0))
 
+    def test_ordered_dispatch_rechecks_scope_after_session_checkpoint(self):
+        """A stop between durable session and turn creation has no turn/read result."""
+
+        adapter = self.adapter(
+            self.profiles[0], "scope-fence", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ),
+        )
+        stopped = False
+        events = adapter._backend.events
+
+        def scope() -> None:
+            if stopped:
+                raise RuntimeError("durable scope stopped")
+
+        def checkpoint(_session: str) -> None:
+            nonlocal stopped
+            stopped = True
+
+        with self.assertRaisesRegex(CodexSupervisorError, "scope admission"):
+            self.dispatch_ordered(
+                (self.request(1, adapter),), (adapter,),
+                checkpoint_session=checkpoint,
+                checkpoint_turn=lambda _session, _turn: None,
+                scope_admission=scope,
+            )
+        self.assertEqual(adapter._backend.calls, 1)
+        self.assertEqual([event for event in events if event[0] in {"start", "read"}], [])
+
     def test_exhaustion_is_only_for_all_retryable_results_and_never_fabricates_a_verdict(self):
         adapters = tuple(self.adapter(self.profiles[0], str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index in range(1, 4))
         requests = tuple(self.request(index, adapter, logical=1, physical=index - 1) for index, adapter in enumerate(adapters, start=1))

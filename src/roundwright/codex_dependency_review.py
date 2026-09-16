@@ -24,7 +24,7 @@ from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAudi
 from .failure_recovery import (
     DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding,
     FailureClass, FailureRole, FailureRecord, RecoveryAction, FailureRecoveryError, require_scope_open,
-    require_scope_effect_admission,
+    require_scope_effect_admission, admit_scope_effect_reservation,
     abandon_durable_recovery_route_reservation,
     begin_durable_recovery_route_reservation,
     commit_durable_recovery_route_reservation,
@@ -368,24 +368,32 @@ class DependencyReviewService:
                 raise DependencyReviewDispatchError("dependency review transient recovery route is unavailable") from error
         reservation = None
         try:
+            def reserve_exact_effect():
+                return (
+                    recover_role_effect_reservation(
+                        advisory_execution, host_inputs=execution_host,
+                        ledger_path=budget_ledger_path,
+                        profile=advisory_execution.execution_binding.provider_profile,
+                        request_or_attempt_identity=attempt_id,
+                        request_material=request_material,
+                        preflight_material=preflight_material,
+                    )
+                    if recovery_route is not None and existing_attempt == ("prepared",)
+                    else reserve_role_effect(
+                        advisory_execution, host_inputs=execution_host,
+                        ledger_path=budget_ledger_path,
+                        profile=advisory_execution.execution_binding.provider_profile,
+                        request_or_attempt_identity=attempt_id,
+                        request_material=request_material,
+                        preflight_material=preflight_material,
+                    )
+                )
             reservation = (
-                recover_role_effect_reservation(
-                    advisory_execution, host_inputs=execution_host,
-                    ledger_path=budget_ledger_path,
-                    profile=advisory_execution.execution_binding.provider_profile,
-                    request_or_attempt_identity=attempt_id,
-                    request_material=request_material,
-                    preflight_material=preflight_material,
-                )
-                if recovery_route is not None and existing_attempt == ("prepared",)
-                else reserve_role_effect(
-                    advisory_execution, host_inputs=execution_host,
-                    ledger_path=budget_ledger_path,
-                    profile=advisory_execution.execution_binding.provider_profile,
-                    request_or_attempt_identity=attempt_id,
-                    request_material=request_material,
-                    preflight_material=preflight_material,
-                )
+                admit_scope_effect_reservation(
+                    repository, task_identity,
+                    "dependency-review:" + task_identity.task_id,
+                    reserve_exact_effect,
+                ) if task_identity is not None else reserve_exact_effect()
             )
             if recovery_route is not None:
                 if reservation.recovery_digest != reservation_digest:

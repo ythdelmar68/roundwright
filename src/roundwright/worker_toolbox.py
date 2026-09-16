@@ -985,15 +985,19 @@ class ProductionCodingWorkerRuntime:
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
         self._failure_lifecycle.require_dispatchable(request, self._dispatch_receipt)
         request_material, preflight_material = self._adapter.effect_material(request)
-        self._failure_lifecycle.require_effect_scope()
         try:
-            reservation = reserve_role_effect(
-                self._advisory_execution, host_inputs=self._execution_host,
-                ledger_path=self._budget_ledger_path,
-                profile=self._adapter._profile,
-                request_or_attempt_identity=request.attempt_id,
-                request_material=request_material,
-                preflight_material=preflight_material,
+            from .failure_recovery import admit_scope_effect_reservation
+            reservation = admit_scope_effect_reservation(
+                self._failure_lifecycle.repository, self._failure_lifecycle.task_identity,
+                "worker:" + self._failure_lifecycle.task_identity.task_id,
+                lambda: reserve_role_effect(
+                    self._advisory_execution, host_inputs=self._execution_host,
+                    ledger_path=self._budget_ledger_path,
+                    profile=self._adapter._profile,
+                    request_or_attempt_identity=request.attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                ),
             )
         except RoleCapabilityError as error:
             raise WorkerShadowError("production coding budget admission is denied") from error

@@ -37,6 +37,7 @@ class FailureClass(StrEnum):
     VALIDATION_RUNNING = "validation-running"
     NO_PROGRESS = "no-progress"
     SESSION_TERMINATED = "session-terminated"
+    FORMAT_INVALID = "format-invalid"
     MISSING_OUTPUT = "missing-output"
     TOPOLOGY_VIOLATION = "topology-violation"
     HOST_SECURITY_DENIAL = "host-security-denial"
@@ -125,6 +126,7 @@ _FAILURE_COMPATIBILITY_MATRIX = {
     FailureClass.VALIDATION_RUNNING: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_LIFECYCLE}), RecoveryAction.CONTINUE_SAME_SESSION, False, False),
     FailureClass.NO_PROGRESS: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_OUTPUT}), RecoveryAction.CONTINUE_SAME_SESSION, False, False),
     FailureClass.SESSION_TERMINATED: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_LIFECYCLE}), RecoveryAction.PREBOUND_FALLBACK, True, False),
+    FailureClass.FORMAT_INVALID: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_OUTPUT}), RecoveryAction.PREBOUND_FALLBACK, True, False),
     FailureClass.MISSING_OUTPUT: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_OUTPUT}), RecoveryAction.RECONCILE, False, False),
     FailureClass.TOPOLOGY_VIOLATION: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_TOPOLOGY}), RecoveryAction.RECONCILE, False, False),
     FailureClass.HOST_SECURITY_DENIAL: FailureCompatibility(frozenset({EvidenceSource.VERIFIED_HOST}), RecoveryAction.STOP_SCOPE, False, True),
@@ -367,6 +369,8 @@ def issue_durable_recovery_route_authorization(repository, identity, *, record_d
         record = _read_route_source(connection, identity, record_digest, binding)
         if record.action is not RecoveryAction.PREBOUND_FALLBACK or not record.retryable or target_role is not binding.role:
             raise FailureRecoveryError("durable recovery route source is not eligible")
+        if record.failure is FailureClass.FORMAT_INVALID and (binding.role is not FailureRole.SUPERVISOR or target_profile_digest != binding.profile_identity):
+            raise FailureRecoveryError("format correction cannot change profiles")
         repository_id = connection.execute("SELECT repository_id FROM tasks WHERE task_id=?", (identity.task_id,)).fetchone()
         if repository_id != (identity.repository_id,):
             raise FailureRecoveryError("durable recovery route authority has drifted")
@@ -614,6 +618,30 @@ def commit_durable_recovery_route_successor_admission(
         connection.close()
 
 
+def _require_no_recovery_successor(connection, identity, authorization) -> None:
+    admission = connection.execute(
+        "SELECT 1 FROM recovery_route_successor_admissions WHERE route_digest=?",
+        (authorization.route_digest,),
+    ).fetchone()
+    if admission is not None:
+        raise FailureRecoveryError("durable recovery route successor is already admitted")
+    # Product successor rows are admission evidence even when their
+    # native session has not opened. Never make that route spendable again.
+    dependency_successor = connection.execute(
+        "SELECT 1 FROM dependency_review_successors WHERE predecessor_attempt_id=?",
+        (authorization.binding.attempt_identity,),
+    ).fetchone()
+    provider_successor = connection.execute(
+        "SELECT 1 FROM provider_attempts AS source JOIN provider_attempts AS target "
+        "ON target.task_id=source.task_id AND target.provider_role=source.provider_role "
+        "AND target.attempt_number>source.attempt_number "
+        "WHERE source.attempt_id=? AND source.task_id=? LIMIT 1",
+        (authorization.binding.attempt_identity, identity.task_id),
+    ).fetchone()
+    if dependency_successor is not None or provider_successor is not None:
+        raise FailureRecoveryError("durable recovery route successor is already admitted")
+
+
 def abandon_durable_recovery_route_reservation(
     repository, identity, authorization: DurableRecoveryRouteAuthorization, *,
     reservation_digest: str,
@@ -627,6 +655,21 @@ def abandon_durable_recovery_route_reservation(
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
+        row = connection.execute(
+            "SELECT reservation_digest, state, repository_id, record_digest, binding_json, "
+            "target_role, target_profile_digest, target_route_digest, coordinate_digest, "
+            "remaining_budget_digest FROM recovery_route_authorizations WHERE route_digest=? AND task_id=?",
+            (authorization.route_digest, identity.task_id),
+        ).fetchone()
+        encoded = json.dumps(_binding_payload(authorization.binding), sort_keys=True, separators=(",", ":"))
+        expected = (reservation_digest, "reserving", identity.repository_id,
+                    authorization.record_digest, encoded, authorization.target_role.value,
+                    authorization.target_profile_digest, authorization.target_route_digest,
+                    authorization.coordinate_digest, authorization.remaining_budget_digest)
+        if row != expected:
+            raise FailureRecoveryError("durable recovery route abandonment has drifted")
+        _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
+        _require_no_recovery_successor(connection, identity, authorization)
         updated = connection.execute(
             "UPDATE recovery_route_authorizations SET state='issued', reservation_digest=NULL "
             "WHERE route_digest=? AND task_id=? AND state='reserving' AND reservation_digest=?",
@@ -682,27 +725,7 @@ def release_durable_recovery_route_authorization(
         if row != expected:
             raise FailureRecoveryError("durable recovery route release has drifted")
         _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
-        admission = connection.execute(
-            "SELECT 1 FROM recovery_route_successor_admissions WHERE route_digest=?",
-            (authorization.route_digest,),
-        ).fetchone()
-        if admission is not None:
-            raise FailureRecoveryError("durable recovery route successor is already admitted")
-        # Product successor rows are admission evidence even when their
-        # native session has not opened. Never make that route spendable again.
-        dependency_successor = connection.execute(
-            "SELECT 1 FROM dependency_review_successors WHERE predecessor_attempt_id=?",
-            (authorization.binding.attempt_identity,),
-        ).fetchone()
-        provider_successor = connection.execute(
-            "SELECT 1 FROM provider_attempts AS source JOIN provider_attempts AS target "
-            "ON target.task_id=source.task_id AND target.provider_role=source.provider_role "
-            "AND target.attempt_number>source.attempt_number "
-            "WHERE source.attempt_id=? AND source.task_id=? LIMIT 1",
-            (authorization.binding.attempt_identity, identity.task_id),
-        ).fetchone()
-        if dependency_successor is not None or provider_successor is not None:
-            raise FailureRecoveryError("durable recovery route successor is already admitted")
+        _require_no_recovery_successor(connection, identity, authorization)
         updated = connection.execute(
             "UPDATE recovery_route_authorizations "
             "SET state='issued', reservation_digest=NULL, consumed_at=NULL "
@@ -1372,6 +1395,8 @@ def admit_recovery(record: FailureRecord, current: FailureBinding, *, route: Rec
     _require_failure_compatibility(record)
     if record.record_schema != "roundwright-failure-recovery/v3":
         raise FailureRecoveryError("legacy failure record cannot admit a recovery route")
+    if record.failure is FailureClass.FORMAT_INVALID:
+        raise FailureRecoveryError("format correction requires durable bounded coordinates")
     if record.clearance_required:
         # Durable scope admission is the only clearance authority.  A caller
         # cannot construct a host enum (or a ``Clearance`` request) and bypass

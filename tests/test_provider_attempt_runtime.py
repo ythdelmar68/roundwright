@@ -9,6 +9,7 @@ import os
 import sqlite3
 import sys
 import unittest
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import replace
@@ -563,6 +564,52 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual({row[1:] for row in rows}, {(1, 60, 4_000)})
             self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
             self.assertEqual((primary.calls, fallback.calls), (1, 1))
+
+    def test_format_correction_then_verified_outage_falls_back_without_stranding(self) -> None:
+        from roundwright.failure_recovery import (
+            FailureRecoveryError, abandon_durable_recovery_route_reservation,
+            read_durable_recovery_route_authorization,
+        )
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted), TemporaryDirectory() as temporary:
+                runner, primary, repository, identity, recovery, _ = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                )
+                correction = replace(runner.selection, diff_review_attempt_id="correction-review", provider_attempt_id="correction-provider", message_identity="correction-message", process_lease_id="correction-lease", physical_format_output_ordinal=1)
+                outage = Backend("correction", NativeSupervisorResponse(SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD), [])
+                successor = replace(runner.selection, diff_review_attempt_id="fallback-review", provider_attempt_id="fallback-provider", message_identity="fallback-message", process_lease_id="fallback-lease", within_round_attempt=2)
+                successor_recovery = provider_context(recovery, identity, ProviderRole.SUPERVISOR, selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1])
+                fallback = Backend("fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), [])
+                sequence = replace(runner, sequence=(
+                    self.sequence_entry(runner, backend=primary),
+                    self.sequence_entry(runner, selection=correction, backend=outage),
+                    self.sequence_entry(runner, selection=successor, recovery=successor_recovery, audit=successor_recovery.health_receipt.audit_identity, backend=fallback),
+                ))
+                if interrupted:
+                    original = provider_attempt_runtime.read_supervisor_accounting_snapshot
+                    def invalid_snapshot(*args, **kwargs):
+                        if kwargs["current_attempt_id"] == successor.provider_attempt_id:
+                            raise ProviderRecoveryError("injected deterministic accounting rejection")
+                        return original(*args, **kwargs)
+                    with patch.object(provider_attempt_runtime, "read_supervisor_accounting_snapshot", side_effect=invalid_snapshot), self.assertRaisesRegex(ProviderAttemptRuntimeError, "accounting snapshot is unavailable"):
+                        sequence.execute()
+                    self.assertEqual((primary.calls, outage.calls, fallback.calls), (1, 1, 0))
+                    with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                        route_id, reservation = connection.execute("SELECT route_digest, reservation_digest FROM recovery_route_authorizations WHERE state='reserving'").fetchone()
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_dispatch_claims WHERE attempt_id=?", (successor.provider_attempt_id,)).fetchone(), (0,))
+                        self.assertEqual(connection.execute("SELECT state FROM provider_attempts WHERE attempt_id=?", (successor.provider_attempt_id,)).fetchone(), ("prepared",))
+                    route = read_durable_recovery_route_authorization(repository, identity, route_id)
+                    with self.assertRaisesRegex(FailureRecoveryError, "successor is already admitted"):
+                        abandon_durable_recovery_route_reservation(repository, identity, route, reservation_digest=reservation)
+                    with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                        self.assertEqual(connection.execute("SELECT state, reservation_digest FROM recovery_route_authorizations WHERE route_digest=?", (route_id,)).fetchone(), ("reserving", reservation))
+                expected = (runner.selection.provider_attempt_id, correction.provider_attempt_id, successor.provider_attempt_id)
+                self.assertEqual(sequence.execute(), expected)
+                self.assertEqual(sequence.execute(), expected)
+                self.assertEqual((primary.calls, outage.calls, fallback.calls), (1, 1, 1))
+                with closing(sqlite3.connect(sequence.budget_ledger_path)) as connection, connection:
+                    self.assertEqual(connection.execute("SELECT sum(calls), sum(duration_seconds), sum(tokens) FROM role_budget_usage").fetchone(), (3, 180, 12000))
 
     def test_format_invalid_cannot_jump_profiles_before_or_after_restart(self) -> None:
         for ordinal in (0, 2):

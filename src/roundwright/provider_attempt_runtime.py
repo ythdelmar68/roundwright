@@ -991,6 +991,24 @@ class DurableDiffReviewRunner:
             raise
         if prepared.state is not AttemptState.PREPARED:
             raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
+        def accounting_snapshot():
+            entries = self.validate_sequence()
+            prior = tuple((item.selection.provider_attempt_id, item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal, item.audit.profile_identity) for item in entries if (item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) < (selection.resolved_logical_profile_position, selection.physical_format_output_ordinal))
+            try:
+                return read_supervisor_accounting_snapshot(
+                    self.repository, self.identity, recovery, source_digest=self.source_digest, base_sha=self.identity.base_sha,
+                    candidate_sha=self.seal.candidate_sha, case_id=self.case_id, ready_at=self.ready_at,
+                    review_epoch=self.review_epoch, review_round=self.review_round, review_mode=context.review_mode.value,
+                    current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.resolved_logical_profile_position,
+                    current_profile_identity=selected, prior_attempts=prior, current_physical_format_output_ordinal=selection.physical_format_output_ordinal, seal_state_identity=self.lease.state_identity,
+                )
+            except ProviderRecoveryError as error:
+                raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from error
+
+        # Deterministic validation must precede route consumption and the claim.
+        decision_material = accounting_snapshot()
+        if decision_material.dispatch_claim is not SupervisorDispatchClaimState.UNCLAIMED:
+            raise ProviderAttemptRuntimeError("provider attempt dispatch claim is already consumed")
         if recovery_route is not None:
             try:
                 commit_durable_recovery_route_reservation(
@@ -1007,18 +1025,7 @@ class DurableDiffReviewRunner:
             )
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider attempt dispatch claim is unavailable") from None
-        entries = self.validate_sequence()
-        prior = tuple((item.selection.provider_attempt_id, item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal, item.audit.profile_identity) for item in entries if (item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) < (selection.resolved_logical_profile_position, selection.physical_format_output_ordinal))
-        try:
-            decision_material = read_supervisor_accounting_snapshot(
-                self.repository, self.identity, recovery, source_digest=self.source_digest, base_sha=self.identity.base_sha,
-                candidate_sha=self.seal.candidate_sha, case_id=self.case_id, ready_at=self.ready_at,
-                review_epoch=self.review_epoch, review_round=self.review_round, review_mode=context.review_mode.value,
-                current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.resolved_logical_profile_position,
-                current_profile_identity=selected, prior_attempts=prior, current_physical_format_output_ordinal=selection.physical_format_output_ordinal, seal_state_identity=self.lease.state_identity,
-            )
-        except ProviderRecoveryError as error:
-            raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from error
+        decision_material = accounting_snapshot()
         if decision_material.dispatch_claim is not SupervisorDispatchClaimState.CLAIMED:
             raise ProviderAttemptRuntimeError("provider accounting dispatch claim has drifted")
         request = CodexSupervisorRequest(

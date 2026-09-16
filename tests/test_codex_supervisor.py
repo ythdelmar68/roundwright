@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -264,21 +265,29 @@ class SupervisorTests(unittest.TestCase):
         self.budget_temporary = TemporaryDirectory()
         self.budget_ledger_path = Path(self.budget_temporary.name) / "role-budget.sqlite"
         self._budget_counter = 0
-        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
-        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
-        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
-        anchor = load_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_review_floor=floor).resolved_digest
-        authority_root = Path(self.authority_temporary.name)
-        self.authority_expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(authority_root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "b" * 40, anchor, 101, 120)
-        self.authority_store = FileReviewAuthorityStore(authority_root, expectation=self.authority_expectation)
-        self.authority_evidence = self.authority_store.persist(authority, candidate_sha="b" * 40, configuration_anchor_digest=anchor, ready_at=101, freshness_until=120)
-        self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_policy_snapshot=snapshot, trusted_review_floor=floor, trusted_review_authority_receipt=authority, review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, candidate_sha="b" * 40, evidence_time=101).pin()
-        self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
+        self.configure_supervisors()
+
+    def configure_supervisors(self, count=3):
         self.profiles = (
             ProviderProfile("gpt-5.6-sol", ReasoningEffort.HIGH, "primary"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback-retry"),
         )
+        if count == 4:
+            self.profiles += (ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fourth"),)
+        cli = {"review.max_supervisor_attempts_per_round": str(len(self.profiles)), "roles.supervisor.attempt_profiles": [{"name": profile.name, "model": profile.model, "reasoning_effort": profile.reasoning_effort.value} for profile in self.profiles]}
+        if count == 3:
+            cli = {}
+        floor = ReviewPolicy(3, 10, len(self.profiles), FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        anchor = load_configuration(cwd=ROOT, environment={}, home=ROOT, cli_values=cli, trusted_review_floor=floor).resolved_digest
+        authority_root = Path(self.authority_temporary.name) / str(count)
+        self.authority_expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(authority_root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "b" * 40, anchor, 101, 120)
+        self.authority_store = FileReviewAuthorityStore(authority_root, expectation=self.authority_expectation)
+        self.authority_evidence = self.authority_store.persist(authority, candidate_sha="b" * 40, configuration_anchor_digest=anchor, ready_at=101, freshness_until=120)
+        self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, cli_values=cli, trusted_policy_snapshot=snapshot, trusted_review_floor=floor, trusted_review_authority_receipt=authority, review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, candidate_sha="b" * 40, evidence_time=101).pin()
+        self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
 
     def tearDown(self):
         self.budget_temporary.cleanup()
@@ -689,6 +698,28 @@ class SupervisorTests(unittest.TestCase):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX) for _profile in self.profiles))
         result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.failover.exhausted, result.envelope.terminal, result.envelope.blocker, result.receipt, recorder.calls), (True, SupervisorSequenceTerminal.EXHAUSTED, "attempt-budget-exhausted", None, ["prepare"]))
+
+    def test_format_exhaustion_never_authorizes_the_next_profile(self):
+        self.configure_supervisors(4)
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(
+            (NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),) * 3
+            + (NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),),
+            coordinates=tuple((self.profiles[0], 1, ordinal) for ordinal in range(3)) + ((self.profiles[1], 2, 0),),
+        )
+        def exercise(run, repository, budget):
+            class ProcessDeath(BaseException): pass
+            with patch.object(lifecycle, "finalize", side_effect=ProcessDeath), self.assertRaises(ProcessDeath):
+                run()
+            self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 1, 1, 0))
+            result = run()
+            self.assertTrue(result.failover.exhausted)
+            self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 1, 1, 0))
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                records = connection.execute("SELECT record_json FROM failure_recovery_records").fetchall()
+                self.assertEqual(len(records), 3)
+                self.assertEqual({json.loads(row[0])["failure"] for row in records}, {"format-invalid"})
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM recovery_route_successor_admissions").fetchone(), (2,))
+        qualify_supervisor_sequence(adapters, requests, self.admissions(adapters, requests), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise)
 
     def test_sequence_rejects_binding_order_and_profile_drift(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))

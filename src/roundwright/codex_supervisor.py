@@ -466,6 +466,8 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
     if resume_invalid_attempts:
         assert authorize_fallback is not None
         source = requests[resume_invalid_attempts - 1]
+        if source.physical_format_output_ordinal == 2:
+            return SupervisorFailoverResult(resume_result, tuple(attempted), True)
         target = requests[resume_invalid_attempts]
         pending_authorization = authorize_fallback(source, resume_result, target)
         if type(pending_authorization) is not SupervisorFallbackAuthorization:
@@ -535,6 +537,8 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
             SupervisorDiagnostic.SYNTAX, SupervisorDiagnostic.SHAPE,
         }:
             return SupervisorFailoverResult(result, tuple(attempted), False)
+        if request.physical_format_output_ordinal == 2:
+            return SupervisorFailoverResult(result if ordinal < len(requests) else None, tuple(attempted), True)
         if ordinal < len(requests):
             assert authorize_fallback is not None
             pending_authorization = authorize_fallback(request, result, requests[ordinal])

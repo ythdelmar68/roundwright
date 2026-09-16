@@ -248,7 +248,7 @@ class SupervisorExpectedLifecycle:
         common = {"schema": self.schema, "binding": self.binding.__dict__.copy(), "policy_digest": self.policy_digest, "configuration_digest": self.configuration_digest, "runtime_identity": self.runtime_identity, "ready_at": self.ready_at, "observation_identity": self.observation_identity}
         if self.schema.endswith("/v1"):
             return {**common, "allowed_terminal": ("accepted", "exhausted"), "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "exhausted_next_action": "retain-terminal-product-block"}
-        return {**common, "allowed_terminal": ("accepted", "exhausted", "ambiguous", "incomplete"), "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "terminal_next_action": "retain-terminal-product-block"}
+        return {**common, "allowed_terminal": ("accepted", "exhausted", "ambiguous", "incomplete", "invalid"), "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "terminal_next_action": "retain-terminal-product-block"}
     @property
     def context_identity(self) -> str: return _hash({"task_id": self.binding.task_id, "base_sha": self.binding.base_sha, "candidate_sha": self.binding.candidate_sha, "requests": self.binding.request_identities, "profiles": self.binding.profile_identities, "runtime": self.binding.runtime_fingerprints, "epoch": self.binding.review_epoch, "round": self.binding.review_round, "mode": self.binding.review_mode, "capture_plan": self.binding.capture_plan_digest})
     @property
@@ -283,8 +283,8 @@ class SupervisorTerminalRecord:
     record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; plan_identity: str; capture_plan_digest: str; prior_digest: str; attempt_count: int; terminal: str; accepted_result_identity: str | None; blocker: str | None; next_action: str; ready_at: int
     def __post_init__(self) -> None:
         accepted = self.terminal == "accepted"
-        expected_blocker = {"exhausted": "attempt-budget-exhausted", "ambiguous": "provider-outcome-ambiguous", "incomplete": "provider-outcome-incomplete"}.get(self.terminal)
-        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.plan_identity, self.capture_plan_digest, self.prior_digest)) or not _SHA.fullmatch(self.candidate_sha) or self.terminal not in {"accepted", "exhausted", "ambiguous", "incomplete"} or type(self.attempt_count) is not int or self.attempt_count < 1 or type(self.ready_at) is not int or self.ready_at < 0 or (accepted and (not _digest(self.accepted_result_identity) or self.blocker is not None or self.next_action != "apply-bound-review-result")) or (not accepted and (self.accepted_result_identity is not None or self.blocker != expected_blocker or self.next_action != "retain-terminal-product-block")): raise SupervisorShadowError("Supervisor terminal record is invalid")
+        expected_blocker = {"exhausted": "attempt-budget-exhausted", "ambiguous": "provider-outcome-ambiguous", "incomplete": "provider-outcome-incomplete", "invalid": "provider-outcome-invalid"}.get(self.terminal)
+        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.plan_identity, self.capture_plan_digest, self.prior_digest)) or not _SHA.fullmatch(self.candidate_sha) or self.terminal not in {"accepted", "exhausted", "ambiguous", "incomplete", "invalid"} or type(self.attempt_count) is not int or self.attempt_count < 1 or type(self.ready_at) is not int or self.ready_at < 0 or (accepted and (not _digest(self.accepted_result_identity) or self.blocker is not None or self.next_action != "apply-bound-review-result")) or (not accepted and (self.accepted_result_identity is not None or self.blocker != expected_blocker or self.next_action != "retain-terminal-product-block")): raise SupervisorShadowError("Supervisor terminal record is invalid")
 
 @dataclass(frozen=True)
 class LifecycleChainReceipt:
@@ -817,7 +817,7 @@ def _durable_sequence_envelope(record: CompleteSupervisorLifecycleRecord) -> Sup
     if record.terminal.terminal == "accepted":
         accepted = attempts[-1]
         return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.ACCEPTED, attempts, accepted.ordinal, record.terminal.accepted_result_identity, accepted.verdict, None, "apply-bound-review-result")
-    if record.terminal.terminal in {"ambiguous", "incomplete"}:
+    if record.terminal.terminal in {"ambiguous", "incomplete", "invalid"}:
         terminal = SupervisorSequenceTerminal(record.terminal.terminal)
         return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, terminal, attempts, None, None, None, record.terminal.blocker, record.terminal.next_action)
     return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
@@ -953,7 +953,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
                 if durable != record or record.digest != record_digest:
                     raise SupervisorShadowError("Supervisor lifecycle source decision has drifted")
                 decisions.append(record)
-        if len(decisions) != 1 or decisions[0] != classify_for_role(FailureRole.SUPERVISOR, source_binding, FailureClass.SESSION_TERMINATED, EvidenceSource.VERIFIED_LIFECYCLE):
+        if len(decisions) != 1 or decisions[0] != classify_for_role(FailureRole.SUPERVISOR, source_binding, FailureClass.FORMAT_INVALID, EvidenceSource.VERIFIED_OUTPUT):
             raise SupervisorShadowError("Supervisor lifecycle source decision is unavailable")
         # The original exact budget must still exist for every completed turn.
         request_material, preflight_material = adapters[ordinal - 1].effect_material(request)
@@ -990,9 +990,8 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         if result.kind is SupervisorResultKind.INVALID and result.diagnostic in {
             SupervisorDiagnostic.SYNTAX, SupervisorDiagnostic.SHAPE,
         }:
-            # A malformed response is a completed, checkpointed native turn.
-            # It may only lead to a fresh-session route after the product
-            # ledger classifies that exact lifecycle fact and re-reads it.
+            # A completed malformed response proves only a format failure.
+            # It cannot authenticate session termination or a profile change.
             if result.session_identity is None or result.turn_identity is None:
                 raise SupervisorShadowError("Supervisor invalid source has no durable turn identity")
             failure_binding = FailureBinding(
@@ -1004,7 +1003,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
             try:
                 decision = classify_for_role(
                     FailureRole.SUPERVISOR, failure_binding,
-                    FailureClass.SESSION_TERMINATED, EvidenceSource.VERIFIED_LIFECYCLE,
+                    FailureClass.FORMAT_INVALID, EvidenceSource.VERIFIED_OUTPUT,
                 )
                 decision_digest = record_durable_failure(
                     repository, task_identity, decision, now=evidence_time,
@@ -1028,7 +1027,11 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
                 or type(result) is not CodexSupervisorResult
                 or result.kind is not SupervisorResultKind.INVALID
                 or source.context != context or target.context != context
-                or target.input_digest == source.input_digest):
+                or target.input_digest == source.input_digest
+                or source.physical_format_output_ordinal >= 2
+                or target.within_round_attempt != source.within_round_attempt
+                or target.selected_profile_identity != source.selected_profile_identity
+                or target.physical_format_output_ordinal != source.physical_format_output_ordinal + 1):
             raise SupervisorShadowError("Supervisor fallback source is invalid")
         source_pair = source_decisions.get(source.input_digest)
         if source_pair is None:
@@ -1116,21 +1119,12 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
                         request_or_attempt_identity=target.provider_attempt_id,
                         request_material=request_material, preflight_material=preflight_material,
                     )
-                    recovered.reject_recovery_route()
+                    return True
                 except RoleCapabilityError:
-                    pass
-                abandon_durable_recovery_route_reservation(
-                    repository, task_identity, authorization, reservation_digest=reservation_digest,
-                )
-                if not begin_durable_recovery_route_reservation(
-                    repository, task_identity, authorization,
-                    reservation_digest=reservation_digest, target_role=FailureRole.SUPERVISOR,
-                    target_profile_digest=target.selected_profile_identity,
-                    target_route_digest=target_route_digest, coordinate_digest=coordinate_digest,
-                    remaining_budget_digest=remaining_budget_digest,
-                ):
-                    raise SupervisorShadowError("Supervisor fallback reservation is unavailable")
-                return False
+                    # Keep the exact fence and prepared successor. A missing
+                    # budget may be reserved once; conflicting budget evidence
+                    # will fail reservation without rearming the route.
+                    return False
             except SupervisorShadowError:
                 raise
             except Exception as error:

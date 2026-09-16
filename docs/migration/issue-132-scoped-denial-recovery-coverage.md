@@ -88,11 +88,28 @@ or turn is opened until the appropriate admission is durable.
 
 ## E1R7 correction closure
 
-The qualification inventory now pins production-path adversarial boundaries:
-an `INVALID` dependency predecessor cannot create a successor budget or native
-session; a one-shot dependency pre-dispatch claim blocks a restart before
-native session creation; and FileSupervisorLifecycle replays only an exact
-authenticated plan after a generic Supervisor restart.  A profile transition
-without a durable terminal route fails before a provider attempt.  The
-single-use route release helper also rejects every route that already has a
-durable successor admission, so an admitted turn cannot be re-armed.
+The qualification inventory pins production-path adversarial boundaries:
+dependency supersession requires a canonical blocked `sdk-turn-failed` outcome,
+the prebound transient owner route, and one exact verified-service decision.
+Invalid, accepted, missing, ambiguous, unverified, and corrupted predecessors
+are rejected before budget reservation or successor lineage creation.
+
+The dependency crash regression kills execution after native session opening
+but before its session identity callback. The earlier durable one-shot claim
+makes restart ambiguous without another session or another budget debit.
+
+`RW132-SUPERVISOR-FENCE-011` runs the full qualification dispatcher with file
+lifecycle and runtime stores. It injects process death after plan creation,
+route fencing, budget reservation, atomic successor admission, and native
+session opening. Exact pre-effect restarts reconstruct the original invalid
+event, source decision, and reservations; they do not repeat the predecessor.
+Admission, budget, and dispatch-claim drift fail closed. This is dispatcher
+recovery evidence, not merely a lifecycle `prepare` replay test.
+
+The provider-runtime regression rejects a format-invalid profile jump on
+fresh execution and restart, including exhaustion at physical ordinal two.
+Only a separately authenticated terminal recovery route can change profiles.
+The release-helper storage tests reject both a generic successor admission
+and existing provider/dependency successor rows, preserving consumed state.
+The map seals the runtime store and all affected shared #136 artifacts as
+well as the #132 implementation and ordered semantic inventory.

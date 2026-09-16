@@ -113,6 +113,7 @@ SEMANTIC_CONTRACTS = {
         "class ProductionCodingWorkerRuntime",
         "class ProductionWorkerFailureLifecycle",
         "record_terminal_failure",
+        "production Worker dispatch scope is stopped",
         "production coding activation is unavailable",
     ),
     "src/roundwright/coding_tools.py": (
@@ -130,6 +131,7 @@ SEMANTIC_CONTRACTS = {
         "test_direct_production_runtime_construction_denies_before_provider_or_local_effect",
         "test_fabricated_direct_runtime_dispatch_denies_before_any_effect",
         "test_hermetic_production_runtime_persists_typed_terminal_failure_and_blocks_restart_before_dispatch",
+        "test_prepared_worker_rechecks_peer_denial_before_any_dispatch_effect",
     ),
     "tests/test_coding_tools.py": (
         "test_scope_root_label_cannot_authorize_a_different_resolved_workspace",
@@ -142,6 +144,7 @@ SEMANTIC_CONTRACTS = {
         "class FailureRecord",
         "def record_durable_clearance",
         "def record_durable_clearance_revocation",
+        "requested_clearance_digest != predecessor",
         "def admit_recovery",
         "def release_durable_recovery_route_authorization",
         "def commit_durable_recovery_route_successor_admission",
@@ -158,6 +161,7 @@ SEMANTIC_CONTRACTS = {
         "physical_format_output_ordinal",
         "provider terminal failure cannot use a format correction route",
         "A prepared successor is itself the durable admission",
+        "provider prepared attempt has drifted or was claimed",
     ),
     "src/roundwright/codex_supervisor.py": (
         "roundwright-provider-attempt-accounting-material/v3",
@@ -174,6 +178,7 @@ SEMANTIC_CONTRACTS = {
         "require_scope_open(connection, task_identity.task_id",
         "classify_native_failure(FailureRole.SUPERVISOR, failure_binding, result.failure)",
         "Supervisor typed blocked source is incomplete",
+        "len(profiles) > max_attempts",
     ),
     "src/roundwright/codex_worker.py": (
         "class CodexWorkerAdapter",
@@ -183,6 +188,7 @@ SEMANTIC_CONTRACTS = {
         "record_durable_failure(",
         "DependencyReviewResultKind.BLOCKED",
         "``prepared`` is the successor admission",
+        "dependency review dispatch scope is stopped",
     ),
     "tests/test_failure_recovery.py": (
         "test_denial_blocks_same_scope_across_restart_until_exact_clearance",
@@ -202,11 +208,14 @@ SEMANTIC_CONTRACTS = {
         "test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim",
         "test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
         "test_recovery_route_fence_interruption_reconciles_before_successor_session",
+        "test_prepared_dependency_retry_denial_is_inert_across_restart",
     ),
     "tests/test_codex_supervisor.py": (
         "test_native_corrections_cross_schema_parser_adapter_and_durable_lifecycle",
         "test_native_denial_persists_scope_stop_before_terminal_and_restart",
         "test_historical_v2_inflight_and_accepted_file_records_retain_exact_identities",
+        "test_one_logical_profile_allows_bounded_physical_corrections_and_replay",
+        "test_generic_sequence_rejects_profile_jump_before_correction_coordinates",
         "test_ambiguous_and_incomplete_results_stop_before_fallback",
         "test_sequence_advances_invalid_primary_to_valid_fallback",
         "test_every_non_format_invalid_stops_before_successor",
@@ -219,6 +228,7 @@ SEMANTIC_CONTRACTS = {
         "test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
         "test_later_accounting_request_reads_prior_invalid_recovery_without_disclosure",
         "test_recovery_route_fence_interruption_reconciles_before_successor_dispatch",
+        "test_prepared_format_correction_reuses_exact_reservation_after_crash",
     ),
 }
 
@@ -556,6 +566,11 @@ SEMANTIC_TESTS = (
     "tests.test_codex_supervisor.SupervisorTests.test_native_denial_persists_scope_stop_before_terminal_and_restart",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_routes_reject_legacy_and_unavailable_sources_before_any_effect",
     "tests.test_codex_supervisor.SupervisorTests.test_historical_v2_inflight_and_accepted_file_records_retain_exact_identities",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_prepared_worker_rechecks_peer_denial_before_any_dispatch_effect",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_prepared_dependency_retry_denial_is_inert_across_restart",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_prepared_format_correction_reuses_exact_reservation_after_crash",
+    "tests.test_codex_supervisor.SupervisorTests.test_one_logical_profile_allows_bounded_physical_corrections_and_replay",
+    "tests.test_codex_supervisor.SupervisorTests.test_generic_sequence_rejects_profile_jump_before_correction_coordinates",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 ISSUE_132_FINDING_REQUIREMENTS = {
@@ -612,6 +627,11 @@ ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUI
     "tests.test_codex_supervisor.SupervisorTests.test_native_denial_persists_scope_stop_before_terminal_and_restart",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_routes_reject_legacy_and_unavailable_sources_before_any_effect",
     "tests.test_codex_supervisor.SupervisorTests.test_historical_v2_inflight_and_accepted_file_records_retain_exact_identities",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_prepared_worker_rechecks_peer_denial_before_any_dispatch_effect",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_prepared_dependency_retry_denial_is_inert_across_restart",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_prepared_format_correction_reuses_exact_reservation_after_crash",
+    "tests.test_codex_supervisor.SupervisorTests.test_one_logical_profile_allows_bounded_physical_corrections_and_replay",
+    "tests.test_codex_supervisor.SupervisorTests.test_generic_sequence_rejects_profile_jump_before_correction_coordinates",
 )
 def _validate_issue_132_semantic_tests() -> None:
     """Keep the independently maintained E1R2/E1R3 inventory closed and ordered."""

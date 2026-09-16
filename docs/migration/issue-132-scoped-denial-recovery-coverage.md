@@ -164,3 +164,32 @@ Historical v2 retains its exact canonical payload, result vocabulary, source,
 plan, and record identities. Literal base-schema in-flight and accepted file
 fixtures are read without rewriting; changing the schema or blessing an
 extended payload under v2 fails closed. Historical v1 tests remain unchanged.
+
+## E1R10 dispatch, restart, and clearance boundaries
+
+Worker dispatch rechecks the authenticated durable scope before reserving any
+budget. A peer denial fences an already prepared attempt across lifecycle
+reconstruction, with no session, route, or budget effect. Exact clearance
+reopens that attempt; exact revocation closes it again. Dependency review
+checks scope before claim recovery, route issuance, and reservation, including
+fresh identities, repeated identities, and already prepared retries.
+
+Same-profile physical correction restart authenticates the persisted attempt,
+input, profile, lease, coordinates, and unclaimed state before recovering its
+exact budget reservation. The injected crash occurs immediately after
+preparation commits and before dispatch claiming. Restart retains cumulative
+cost and opens only the previously undispatched correction; changed bindings
+fail closed. The original output plus two corrections remains the closed limit.
+
+Revocation now compares the requested clearance with the current authenticated
+history predecessor inside the append transaction. A command for a later
+clearance cannot revoke it through a stale request, and substituted or replayed
+commands append nothing. The command still independently binds the denial,
+task, repository, candidate seal, and authority scope.
+
+The generic Supervisor validates distinct logical profiles against the policy
+limit and physical ordinals independently. Native one-profile fixtures accept
+one or two format corrections, exhaust after ordinal two, and reject terminal
+replay without spending or dispatching again. A multi-profile jump that skips
+required physical coordinates is rejected before any provider or budget effect.
+The semantic inventory retains every earlier E1R1–E1R9 and compatibility test.

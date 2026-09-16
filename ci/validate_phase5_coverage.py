@@ -557,7 +557,7 @@ ISSUE_132_E1R3_TESTS = (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_recovery_route_is_exact_single_use_and_restart_safe",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_recovery_route_fence_interruption_reconciles_before_successor_dispatch",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_recovery_route_fence_interruption_reconciles_before_successor_session",
-    "tests.test_codex_supervisor.SupervisorTests.test_fallback_fence_is_abandoned_when_successor_budget_reservation_fails",
+    "tests.test_codex_supervisor.SupervisorTests.test_file_lifecycle_exact_prepare_replay_recovers_the_existing_plan",
 )
 ISSUE_132_E1R3_FINDING_REQUIREMENTS = {
     "RW132-PROD-001": ("src/roundwright/codex_supervisor.py", "tests.test_codex_supervisor.SupervisorTests.test_every_non_format_invalid_stops_before_successor"),

@@ -138,6 +138,7 @@ SEMANTIC_CONTRACTS = {
         "test_sealed_launch_context_rejects_coherent_public_instruction_mutation",
     ),
     "src/roundwright/failure_recovery.py": (
+        "durable recovery route requires current verified evidence",
         "class FailureRecord",
         "def record_durable_clearance",
         "def record_durable_clearance_revocation",
@@ -164,6 +165,16 @@ SEMANTIC_CONTRACTS = {
         "_eligible_prebound_failover",
         "pending_authorization.prepare()",
     ),
+    "src/roundwright/supervisor_toolbox.py": (
+        "logical_profile_position", "physical_format_output_ordinal",
+        "type(binding[key]) is not int",
+    ),
+    "src/roundwright/supervisor_shadow.py": (
+        "roundwright-supervisor-expected-lifecycle/v3",
+        "require_scope_open(connection, task_identity.task_id",
+        "classify_native_failure(FailureRole.SUPERVISOR, failure_binding, result.failure)",
+        "Supervisor typed blocked source is incomplete",
+    ),
     "src/roundwright/codex_worker.py": (
         "class CodexWorkerAdapter",
         "SANDBOX_OR_APPROVAL_DENIED",
@@ -177,6 +188,7 @@ SEMANTIC_CONTRACTS = {
         "test_denial_blocks_same_scope_across_restart_until_exact_clearance",
     ),
     "tests/test_provider_recovery.py": (
+        "test_durable_routes_reject_legacy_and_unavailable_sources_before_any_effect",
         "test_durable_clearance_and_revocation_are_append_only_and_restart_verified",
         "test_durable_failure_readback_revalidates_current_admission_authority",
         "test_supervisor_coordinates_are_unique_and_strictly_monotonic",
@@ -192,6 +204,9 @@ SEMANTIC_CONTRACTS = {
         "test_recovery_route_fence_interruption_reconciles_before_successor_session",
     ),
     "tests/test_codex_supervisor.py": (
+        "test_native_corrections_cross_schema_parser_adapter_and_durable_lifecycle",
+        "test_native_denial_persists_scope_stop_before_terminal_and_restart",
+        "test_historical_v2_inflight_and_accepted_file_records_retain_exact_identities",
         "test_ambiguous_and_incomplete_results_stop_before_fallback",
         "test_sequence_advances_invalid_primary_to_valid_fallback",
         "test_every_non_format_invalid_stops_before_successor",
@@ -537,6 +552,10 @@ SEMANTIC_TESTS = (
     "tests.test_codex_supervisor.SupervisorTests.test_format_exhaustion_never_authorizes_the_next_profile",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_format_correction_then_verified_outage_falls_back_without_stranding",
     "tests.test_candidate_review.CandidateReviewTests.test_legacy_populated_reviews_preserve_authenticated_identity_on_migration",
+    "tests.test_codex_supervisor.SupervisorTests.test_native_corrections_cross_schema_parser_adapter_and_durable_lifecycle",
+    "tests.test_codex_supervisor.SupervisorTests.test_native_denial_persists_scope_stop_before_terminal_and_restart",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_routes_reject_legacy_and_unavailable_sources_before_any_effect",
+    "tests.test_codex_supervisor.SupervisorTests.test_historical_v2_inflight_and_accepted_file_records_retain_exact_identities",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 ISSUE_132_FINDING_REQUIREMENTS = {
@@ -589,6 +608,10 @@ ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUI
     "tests.test_codex_supervisor.SupervisorTests.test_format_exhaustion_never_authorizes_the_next_profile",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_format_correction_then_verified_outage_falls_back_without_stranding",
     "tests.test_candidate_review.CandidateReviewTests.test_legacy_populated_reviews_preserve_authenticated_identity_on_migration",
+    "tests.test_codex_supervisor.SupervisorTests.test_native_corrections_cross_schema_parser_adapter_and_durable_lifecycle",
+    "tests.test_codex_supervisor.SupervisorTests.test_native_denial_persists_scope_stop_before_terminal_and_restart",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_routes_reject_legacy_and_unavailable_sources_before_any_effect",
+    "tests.test_codex_supervisor.SupervisorTests.test_historical_v2_inflight_and_accepted_file_records_retain_exact_identities",
 )
 def _validate_issue_132_semantic_tests() -> None:
     """Keep the independently maintained E1R2/E1R3 inventory closed and ordered."""

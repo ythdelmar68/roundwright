@@ -136,3 +136,31 @@ claiming. Both route-rearming APIs transactionally reject any admitted
 provider, dependency or generic successor. The production regression stops
 after preparing a successor, proves its reservation cannot be abandoned, and
 then completes restart with exactly one budget debit per physical attempt.
+
+## Native correction and retained evidence compatibility
+
+The native verdict schema emits logical profile position and physical format
+ordinal. The stream parser accepts that closed shape and the historical initial
+output shape; the adapter authenticates every value against the host request.
+Legacy bindings cannot authorize corrections, and a substituted request digest,
+coordinate, or boolean ordinal cannot authenticate a result. The production
+session/schema/parser/adapter regression uses injected SDK handles beneath the
+disabled launch gate and exercises durable same-profile correction, acceptance,
+and exhaustion. It performs no live provider observation.
+
+Typed native security denial is recorded in the shared scope ledger before
+lifecycle append/finalization. Scope admission is rechecked before budget and
+dispatch. The regression verifies a blocked lifecycle read-back and zero further
+dispatch or budget change across restart, including a crash after persistence
+and another prepared attempt identity in the same scope. The existing exact
+clearance/revocation regressions remain part of the semantic suite.
+
+Durable route issuance, reconstruction, reservation, and consumption require
+current v3 verified failure evidence. Retained v1 unavailable, v2 historical,
+and unknown evidence cannot authorize a route or successor effect.
+
+Expected-lifecycle v3 owns the extended invalid/blocked terminal vocabulary.
+Historical v2 retains its exact canonical payload, result vocabulary, source,
+plan, and record identities. Literal base-schema in-flight and accepted file
+fixtures are read without rewriting; changing the schema or blessing an
+extended payload under v2 fails closed. Historical v1 tests remain unchanged.

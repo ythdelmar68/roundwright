@@ -668,17 +668,40 @@ def release_durable_recovery_route_authorization(
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
         row = connection.execute(
-            "SELECT reservation_digest, state FROM recovery_route_authorizations "
+            "SELECT reservation_digest, state, repository_id, record_digest, binding_json, "
+            "target_role, target_profile_digest, target_route_digest, coordinate_digest, "
+            "remaining_budget_digest FROM recovery_route_authorizations "
             "WHERE route_digest=? AND task_id=?",
             (authorization.route_digest, identity.task_id),
         ).fetchone()
-        if row != (reservation_digest, "consumed"):
+        encoded = json.dumps(_binding_payload(authorization.binding), sort_keys=True, separators=(",", ":"))
+        expected = (reservation_digest, "consumed", identity.repository_id,
+                    authorization.record_digest, encoded, authorization.target_role.value,
+                    authorization.target_profile_digest, authorization.target_route_digest,
+                    authorization.coordinate_digest, authorization.remaining_budget_digest)
+        if row != expected:
             raise FailureRecoveryError("durable recovery route release has drifted")
+        _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
         admission = connection.execute(
             "SELECT 1 FROM recovery_route_successor_admissions WHERE route_digest=?",
             (authorization.route_digest,),
         ).fetchone()
         if admission is not None:
+            raise FailureRecoveryError("durable recovery route successor is already admitted")
+        # Product successor rows are admission evidence even when their
+        # native session has not opened. Never make that route spendable again.
+        dependency_successor = connection.execute(
+            "SELECT 1 FROM dependency_review_successors WHERE predecessor_attempt_id=?",
+            (authorization.binding.attempt_identity,),
+        ).fetchone()
+        provider_successor = connection.execute(
+            "SELECT 1 FROM provider_attempts AS source JOIN provider_attempts AS target "
+            "ON target.task_id=source.task_id AND target.provider_role=source.provider_role "
+            "AND target.attempt_number>source.attempt_number "
+            "WHERE source.attempt_id=? AND source.task_id=? LIMIT 1",
+            (authorization.binding.attempt_identity, identity.task_id),
+        ).fetchone()
+        if dependency_successor is not None or provider_successor is not None:
             raise FailureRecoveryError("durable recovery route successor is already admitted")
         updated = connection.execute(
             "UPDATE recovery_route_authorizations "

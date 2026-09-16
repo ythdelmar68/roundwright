@@ -17,9 +17,9 @@ from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowP
 from .configuration import FileReviewAuthorityStore, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityEvidenceReceipt, ReviewAuthorityExpectation, ReviewPolicy
 from .runtime_binding import ExternalSupervisorRuntimeStore, FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBinding, SupervisorRuntimeBindingReceipt
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recover_role_effect_reservation, recovery_reservation_digest
-from .state import TaskIdentity, database_path, require_runtime_binding
+from .state import TaskIdentity, _open_writable_connection, _require_matching_task, database_path, require_runtime_binding
 from .provider_recovery import RecoveryContext
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, begin_durable_recovery_route_reservation, classify_for_role, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, begin_durable_recovery_route_reservation, classify_for_role, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, parse_failure_record, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
 
 
 SUPERVISOR_FAILOVER_PROFILE = "roundwright-shadow-profile/supervisor-review-failover/v1"
@@ -39,7 +39,7 @@ def _digest(value: object) -> bool: return type(value) is str and bool(_DIGEST.f
 def _reparse(value: Path) -> bool: return value.is_symlink() or bool(getattr(value, "is_junction", lambda: False)())
 
 
-def _require_durable_sequence_admission(repository: RepositoryIdentity, identity: TaskIdentity, requests: tuple[CodexSupervisorRequest, ...], policy: "ResolvedSupervisorSequencePolicy") -> None:
+def _require_durable_sequence_admission(repository: RepositoryIdentity, identity: TaskIdentity, requests: tuple[CodexSupervisorRequest, ...], policy: "ResolvedSupervisorSequencePolicy", *, completed_count: int = 0) -> None:
     """Re-read the candidate seal and every target checkpoint before a turn.
 
     A sequence binding contains public-safe digests, not authority to reuse
@@ -66,7 +66,7 @@ def _require_durable_sequence_admission(repository: RepositoryIdentity, identity
             raise SupervisorShadowError("Supervisor durable candidate admission has drifted")
         candidate_fingerprint = hashlib.sha256(requests[0].context.candidate_sha.encode()).hexdigest()
         policy_fingerprint = requests[0].context.policy_digest.removeprefix("sha256:")
-        for request in requests:
+        for ordinal, request in enumerate(requests):
             row = connection.execute(
                 "SELECT attempts.task_id, attempts.provider_role, attempts.state, attempts.selected_profile_identity, "
                 "attempts.logical_profile_position, attempts.physical_format_output_ordinal, "
@@ -76,7 +76,7 @@ def _require_durable_sequence_admission(repository: RepositoryIdentity, identity
                 (request.provider_attempt_id,),
             ).fetchone()
             expected = (
-                identity.task_id, FailureRole.SUPERVISOR.value, "prepared",
+                identity.task_id, FailureRole.SUPERVISOR.value, "dispatched" if ordinal < completed_count else "prepared",
                 request.selected_profile_identity, request.within_round_attempt,
                 request.physical_format_output_ordinal, candidate_fingerprint,
                 policy_fingerprint, policy.configuration_digest,
@@ -364,6 +364,7 @@ class ExternalSupervisorLifecycle(Protocol):
     def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt: ...
     def finalize(self, record_identity: str, terminal: SupervisorTerminalRecord, *, evidence_time: int) -> LifecycleChainReceipt: ...
     def read_plan(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt]: ...
+    def read_progress(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt, tuple[SupervisorAttemptEvent, ...], tuple[LifecycleChainReceipt, ...], SupervisorTerminalRecord | None, LifecycleChainReceipt | None]: ...
     def read(self, record_identity: str, *, evidence_time: int) -> CompleteSupervisorLifecycleRecord: ...
 
 
@@ -546,6 +547,9 @@ class FileSupervisorLifecycle:
         plan, receipt, _events, _event_receipts, _terminal, _terminal_receipt = self._chain(record_identity, evidence_time=evidence_time, require_terminal=False)
         return plan, receipt
 
+    def read_progress(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt, tuple[SupervisorAttemptEvent, ...], tuple[LifecycleChainReceipt, ...], SupervisorTerminalRecord | None, LifecycleChainReceipt | None]:
+        return self._chain(record_identity, evidence_time=evidence_time, require_terminal=False)
+
     def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt:
         plan, plan_receipt, events, receipts, terminal, _terminal_receipt = self._chain(record_identity, evidence_time=evidence_time, require_terminal=False)
         if terminal is not None or type(event) is not SupervisorAttemptEvent or event.record_identity != record_identity:
@@ -618,7 +622,11 @@ class InMemorySupervisorLifecycle:
     def prepare(self, plan: SupervisorExpectedLifecycle, *, freshness_until: int) -> LifecycleChainReceipt:
         if type(plan) is not SupervisorExpectedLifecycle or type(freshness_until) is not int or freshness_until < plan.ready_at: raise SupervisorShadowError("Supervisor lifecycle prepare is invalid")
         record_identity = self._binding(plan, freshness_until).record_identity
-        if record_identity in self._records: raise SupervisorShadowError("Supervisor lifecycle prepare is invalid")
+        if record_identity in self._records:
+            existing, receipt = self.read_plan(record_identity, evidence_time=plan.ready_at)
+            if existing != plan or receipt.binding != self._binding(plan, freshness_until):
+                raise SupervisorShadowError("Supervisor lifecycle prepare is invalid")
+            return receipt
         binding = self._binding(plan, freshness_until)
         content = _hash(plan.payload()); receipt = LifecycleChainReceipt(binding, content, _hash({"genesis": binding.binding_digest}), 0)
         self._records[record_identity] = {"plan": self._material(plan.payload()), "receipt": self._material(receipt.payload()), "events": [], "terminal": None}
@@ -631,6 +639,37 @@ class InMemorySupervisorLifecycle:
         receipt = LifecycleChainReceipt(binding, _hash(plan.payload()), _hash({"genesis": binding.binding_digest}), 0)
         if stored_receipt != receipt or binding.record_identity != record_identity: raise SupervisorShadowError("Supervisor lifecycle plan receipt was tampered")
         return plan, receipt
+    def read_progress(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt, tuple[SupervisorAttemptEvent, ...], tuple[LifecycleChainReceipt, ...], SupervisorTerminalRecord | None, LifecycleChainReceipt | None]:
+        record = self._records.get(record_identity)
+        if record is None: raise SupervisorShadowError("Supervisor lifecycle plan is missing")
+        plan, plan_receipt = self.read_plan(record_identity, evidence_time=evidence_time)
+        entries = record["events"]
+        if type(entries) is not list: raise SupervisorShadowError("Supervisor lifecycle read is invalid")
+        events: list[SupervisorAttemptEvent] = []; receipts: list[LifecycleChainReceipt] = []; previous = plan_receipt
+        for ordinal, entry in enumerate(entries, start=1):
+            if type(entry) is not tuple or len(entry) != 2: raise SupervisorShadowError("Supervisor lifecycle read is invalid")
+            try: event = SupervisorAttemptEvent(**json.loads(entry[0]))
+            except (TypeError, ValueError) as error: raise SupervisorShadowError("Supervisor lifecycle event material is invalid") from error
+            receipt = LifecycleChainReceipt(plan_receipt.binding, event.content_digest, event.prior_digest, ordinal)
+            binding = plan_receipt.binding
+            expected = ordinal - 1
+            if expected >= len(plan.binding.request_identities) or (event.record_identity, event.source_identity, event.observation_identity, event.candidate_sha, event.context_identity, event.plan_identity, event.capture_plan_digest, event.request_identity, event.profile_identity, event.runtime_fingerprint, event.ready_at, event.freshness_until) != (binding.record_identity, binding.source_identity, binding.observation_identity, binding.candidate_sha, binding.context_identity, binding.plan_identity, binding.capture_plan_digest, plan.binding.request_identities[expected], plan.binding.profile_identities[expected], plan.binding.runtime_fingerprints[expected], binding.ready_at, binding.freshness_until):
+                raise SupervisorShadowError("Supervisor lifecycle event binding is invalid")
+            if events and events[-1].result_kind != SupervisorResultKind.INVALID.value:
+                raise SupervisorShadowError("Supervisor lifecycle advance is invalid")
+            if event.ordinal != ordinal or event.prior_digest != previous.receipt_digest or self._receipt(entry[1]) != receipt:
+                raise SupervisorShadowError("Supervisor lifecycle event receipt was tampered")
+            events.append(event); receipts.append(receipt); previous = receipt
+        terminal_entry = record["terminal"]
+        if terminal_entry is None:
+            return plan, plan_receipt, tuple(events), tuple(receipts), None, None
+        if type(terminal_entry) is not tuple or len(terminal_entry) != 2: raise SupervisorShadowError("Supervisor lifecycle read is invalid")
+        try: terminal = SupervisorTerminalRecord(**json.loads(terminal_entry[0]))
+        except (TypeError, ValueError) as error: raise SupervisorShadowError("Supervisor lifecycle terminal material is invalid") from error
+        terminal_receipt = LifecycleChainReceipt(plan_receipt.binding, _hash(terminal.__dict__), terminal.prior_digest, len(events) + 1)
+        if terminal.prior_digest != previous.receipt_digest or self._receipt(terminal_entry[1]) != terminal_receipt:
+            raise SupervisorShadowError("Supervisor lifecycle terminal receipt was tampered")
+        return plan, plan_receipt, tuple(events), tuple(receipts), terminal, terminal_receipt
     def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt:
         record = self._records.get(record_identity)
         if record is None or record["terminal"] is not None or type(event) is not SupervisorAttemptEvent or event.record_identity != record_identity: raise SupervisorShadowError("Supervisor lifecycle append is invalid")
@@ -810,11 +849,12 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
     if type(adapters) is not tuple or type(requests) is not tuple or type(advisory_executions) is not tuple or type(execution_hosts) is not tuple or type(repository) is not RepositoryIdentity or type(task_identity) is not TaskIdentity or type(recovery_context) is not RecoveryContext or not isinstance(budget_ledger_path, Path) or not adapters or len(adapters) != len(requests) or len(requests) != len(advisory_executions) or len(advisory_executions) != len(execution_hosts) or any(type(item) is not CodexSupervisorAdapter for item in adapters) or any(type(item) is not CodexSupervisorRequest for item in requests) or any(type(item) is not SealedRoleExecution or item.seam is not RoleExecutionSeam.SUPERVISOR for item in advisory_executions) or any(type(item) is not TrustedExecutionHostInputs for item in execution_hosts) or type(readiness) is not SupervisorShadowReadiness or type(binding) is not SupervisorSequenceBinding or type(resolved_policy) is not ResolvedSupervisorSequencePolicy or type(review_authority_expectation) is not ReviewAuthorityExpectation or type(review_authority_store) is not FileReviewAuthorityStore or type(review_authority_evidence) is not ReviewAuthorityEvidenceReceipt or not all(callable(getattr(lifecycle, name, None)) for name in ("prepare", "append", "finalize", "read_plan", "read")) or not callable(getattr(recorder, "prepare", None)) or not callable(getattr(recorder, "seal", None)) or not callable(getattr(recorder, "verify", None)) or not callable(checkpoint_session) or not callable(checkpoint_turn) or type(evidence_time) is not int or evidence_time <= 0 or type(freshness_until) is not int or freshness_until < evidence_time:
         raise SupervisorShadowError("Supervisor sequence pre-dispatch binding is invalid")
     context = requests[0].context
+    if not callable(getattr(lifecycle, "read_progress", None)):
+        raise SupervisorShadowError("Supervisor lifecycle progress reader is unavailable")
     if any(request.context != context for request in requests) or not _valid_sequence_coordinates(requests, resolved_policy.runtime, resolved_policy.policy.max_supervisor_attempts_per_round) or (context.task_id, context.base_sha, context.candidate_sha, context.review_epoch, context.review_round, context.review_mode.value) != (binding.task_id, binding.base_sha, binding.candidate_sha, binding.review_epoch, binding.review_round, binding.review_mode) or tuple(request.input_digest for request in requests) != binding.request_identities or tuple(request.selected_profile_identity for request in requests) != binding.profile_identities or tuple(adapter.profile_identity for adapter in adapters) != binding.profile_identities or tuple(adapter.runtime_fingerprint for adapter in adapters) != binding.runtime_fingerprints or (context.policy_digest, context.configuration_digest, context.review_mode) != (resolved_policy.policy_digest, resolved_policy.configuration_digest, resolved_policy.policy.mode_for_round(context.review_round)) or (readiness.candidate_sha, readiness.case_id, readiness.capture_plan_digest, readiness.observation_identity) != (binding.candidate_sha, binding.case_id, binding.capture_plan_digest, supervisor_sequence_observation_identity(requests)) or (task_identity.task_id, task_identity.base_sha, recovery_context.task_id, recovery_context.candidate_sha, recovery_context.runtime_binding) != (binding.task_id, binding.base_sha, binding.task_id, binding.candidate_sha, resolved_policy.runtime):
         raise SupervisorShadowError("Supervisor sequence context has drifted")
     try:
         require_runtime_binding(repository, task_identity, resolved_policy.runtime)
-        _require_durable_sequence_admission(repository, task_identity, requests, resolved_policy)
     except Exception as error:
         raise SupervisorShadowError("Supervisor durable candidate admission is unavailable") from error
     if type(runtime_store) not in (FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore) or not callable(getattr(runtime_store, "persist", None)) or not callable(getattr(runtime_store, "read", None)):
@@ -875,8 +915,71 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         raise SupervisorShadowError("Supervisor sequence Recorder pre-dispatch readiness is invalid") from error
     if (prepared.plan_digest, prepared.profile, prepared.case_id, prepared.candidate_sha, prepared.ready_at) != (readiness.capture_plan_digest, SUPERVISOR_FAILOVER_PROFILE, readiness.case_id, readiness.candidate_sha, readiness.ready_at):
         raise SupervisorShadowError("Supervisor sequence capture-plan receipt drifted")
-    observed_attempts: list[SupervisorSequenceAttempt] = []; prior = expected_receipt
+    try:
+        progress_plan, progress_receipt, progress_events, progress_receipts, terminal, _ = lifecycle.read_progress(expected_receipt.record_identity, evidence_time=evidence_time)
+        if progress_plan != expected_plan or progress_receipt != expected_receipt or terminal is not None or len(progress_events) >= len(requests):
+            raise SupervisorShadowError("Supervisor lifecycle is not resumable")
+    except Exception as error:
+        raise SupervisorShadowError("Supervisor lifecycle progress read-back failed") from error
+    _require_durable_sequence_admission(repository, task_identity, requests, resolved_policy, completed_count=len(progress_events))
+    observed_attempts: list[SupervisorSequenceAttempt] = []
+    prior = expected_receipt if not progress_receipts else progress_receipts[-1]
     source_decisions: dict[str, tuple[FailureBinding, str]] = {}
+    # Reconstruct completed INVALID turns from their authenticated event and
+    # repository checkpoints. A result digest is not itself a retry license.
+    for ordinal, event in enumerate(progress_events, start=1):
+        request = requests[ordinal - 1]
+        connection = _open_writable_connection(repository)
+        try:
+            row = connection.execute("SELECT session_identity, external_turn_identity FROM provider_attempts WHERE attempt_id=? AND task_id=?", (request.provider_attempt_id, task_identity.task_id)).fetchone()
+            records = connection.execute("SELECT record_digest, record_json FROM failure_recovery_records WHERE task_id=?", (task_identity.task_id,)).fetchall()
+        finally:
+            connection.close()
+        if row is None or any(type(value) is not str for value in row) or event.result_kind != "invalid":
+            raise SupervisorShadowError("Supervisor lifecycle source is not resumable")
+        matched = [
+            result for diagnostic in (SupervisorDiagnostic.SYNTAX, SupervisorDiagnostic.SHAPE)
+            for result in (CodexSupervisorResult(SupervisorResultKind.INVALID, row[0], row[1], diagnostic=diagnostic),)
+            if _sequence_attempt(ordinal, request, result).result_identity == event.result_identity
+        ]
+        if len(matched) != 1 or (event.request_identity, event.profile_identity, event.runtime_fingerprint) != (request.input_digest, request.selected_profile_identity, adapters[ordinal - 1].runtime_fingerprint):
+            raise SupervisorShadowError("Supervisor lifecycle source has drifted")
+        source_binding = FailureBinding(binding.candidate_sha, policy_digest=resolved_policy.policy_digest, configuration_digest=resolved_policy.configuration_digest, authority_scope="supervisor:" + binding.task_id, role=FailureRole.SUPERVISOR, profile_identity=request.selected_profile_identity, session_identity=row[0], attempt_identity=request.provider_attempt_id)
+        decisions = []
+        for record_digest, encoded in records:
+            record = parse_failure_record(json.loads(encoded))
+            if record.binding == source_binding:
+                durable = read_durable_failure(repository, task_identity, record_digest)
+                if durable != record or record.digest != record_digest:
+                    raise SupervisorShadowError("Supervisor lifecycle source decision has drifted")
+                decisions.append(record)
+        if len(decisions) != 1 or decisions[0] != classify_for_role(FailureRole.SUPERVISOR, source_binding, FailureClass.SESSION_TERMINATED, EvidenceSource.VERIFIED_LIFECYCLE):
+            raise SupervisorShadowError("Supervisor lifecycle source decision is unavailable")
+        # The original exact budget must still exist for every completed turn.
+        request_material, preflight_material = adapters[ordinal - 1].effect_material(request)
+        recover_role_effect_reservation(advisory_executions[ordinal - 1], host_inputs=execution_hosts[ordinal - 1], ledger_path=budget_ledger_path, profile=adapters[ordinal - 1]._profile, request_or_attempt_identity=request.provider_attempt_id, request_material=request_material, preflight_material=preflight_material)
+        observed_attempts.append(_sequence_attempt(ordinal, request, matched[0]))
+        source_decisions[request.input_digest] = (source_binding, decisions[0].digest)
+
+    def checkpoint_dispatch(request: CodexSupervisorRequest) -> None:
+        """One-shot claim after admission but before native session opening."""
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            _require_matching_task(connection, task_identity)
+            seal = connection.execute("SELECT base_sha, candidate_sha FROM candidate_seals WHERE task_id=?", (task_identity.task_id,)).fetchone()
+            if seal != (task_identity.base_sha, request.context.candidate_sha):
+                raise SupervisorShadowError("Supervisor candidate admission has drifted")
+            row = connection.execute("SELECT state, session_identity, external_turn_identity, input_fingerprint FROM provider_attempts WHERE task_id=? AND attempt_id=?", (task_identity.task_id, request.provider_attempt_id)).fetchone()
+            if row != ("prepared", None, None, request.input_digest.removeprefix("sha256:")):
+                raise SupervisorShadowError("Supervisor dispatch is ambiguous or has drifted")
+            connection.execute("INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)", (request.provider_attempt_id, task_identity.task_id, row[3], evidence_time))
+            connection.commit()
+        except Exception as error:
+            connection.rollback()
+            raise SupervisorShadowError("Supervisor dispatch claim is already consumed or unavailable") from error
+        finally:
+            connection.close()
 
     def checkpoint_result(ordinal: int, request: CodexSupervisorRequest, result: CodexSupervisorResult) -> None:
         nonlocal prior
@@ -982,10 +1085,21 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         except RoleCapabilityError as error:
             raise SupervisorShadowError("Supervisor fallback reservation is unavailable") from error
 
-        def prepare() -> None:
+        def prepare() -> bool:
             """Fence before the generic dispatcher touches the budget file."""
 
             try:
+                connection = _open_writable_connection(repository)
+                try:
+                    admission = connection.execute("SELECT task_id, repository_id, reservation_digest, target_attempt_id, target_request_digest FROM recovery_route_successor_admissions WHERE route_digest=?", (authorization.route_digest,)).fetchone()
+                    route_state = connection.execute("SELECT state, reservation_digest FROM recovery_route_authorizations WHERE route_digest=?", (authorization.route_digest,)).fetchone()
+                    claim = connection.execute("SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=?", (target.provider_attempt_id,)).fetchone()
+                finally:
+                    connection.close()
+                if admission is not None:
+                    if admission != (task_identity.task_id, task_identity.repository_id, reservation_digest, target.provider_attempt_id, target.input_digest) or route_state != ("consumed", reservation_digest) or claim is not None:
+                        raise SupervisorShadowError("Supervisor successor admission is ambiguous or has drifted")
+                    return True
                 acquired = begin_durable_recovery_route_reservation(
                     repository, task_identity, authorization,
                     reservation_digest=reservation_digest, target_role=FailureRole.SUPERVISOR,
@@ -994,7 +1108,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
                     remaining_budget_digest=remaining_budget_digest,
                 )
                 if acquired:
-                    return
+                    return False
                 try:
                     recovered = recover_role_effect_reservation(
                         target_execution, host_inputs=target_host, ledger_path=budget_ledger_path,
@@ -1016,6 +1130,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
                     remaining_budget_digest=remaining_budget_digest,
                 ):
                     raise SupervisorShadowError("Supervisor fallback reservation is unavailable")
+                return False
             except SupervisorShadowError:
                 raise
             except Exception as error:
@@ -1060,6 +1175,9 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
         checkpoint_result=checkpoint_result,
         authorize_fallback=authorize_fallback,
+        resume_invalid_attempts=len(progress_events),
+        resume_result=matched[0] if progress_events else None,
+        checkpoint_dispatch=checkpoint_dispatch,
     )
     attempts = tuple(observed_attempts)
     try:

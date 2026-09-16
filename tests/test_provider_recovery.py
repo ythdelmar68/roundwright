@@ -987,6 +987,24 @@ class ProviderRecoveryTests(unittest.TestCase):
                 ).fetchall(), [("route-successor", "sha256:" + "4" * 64)])
             finally:
                 connection.close()
+            # Also reject a product successor row without relying on the
+            # generic qualification admission table.
+            prepare_attempt(repository, identity, context, attempt_id="route-product-successor", role=ProviderRole.SUPERVISOR, process_lease_id="lease-product-successor", process_lease_expires_at=int(time.time()) + 10, input_fingerprint="b" * 64, lease=lease)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                connection.execute("DELETE FROM recovery_route_successor_admissions WHERE route_digest=?", (issued.route_digest,))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(Exception, "already admitted"):
+                release_durable_recovery_route_authorization(repository, identity, issued, reservation_digest=reservation)
+            with self.assertRaisesRegex(Exception, "has drifted"):
+                release_durable_recovery_route_authorization(repository, identity, replace(issued, binding=replace(binding, attempt_identity="unrelated-source")), reservation_digest=reservation)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT state, reservation_digest FROM recovery_route_authorizations WHERE route_digest=?", (issued.route_digest,)).fetchone(), ("consumed", reservation))
+            finally:
+                connection.close()
 
 
 if __name__ == "__main__":

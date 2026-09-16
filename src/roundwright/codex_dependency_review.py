@@ -531,6 +531,8 @@ class DependencyReviewService:
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN")
+            DependencyReviewStore._verify_task_lineage(connection, task_identity.task_id)
+            DependencyReviewStore._read_attempt(connection, predecessor_attempt_id)
             row = connection.execute(
                 "SELECT attempts.state, outcomes.reason_code, outcomes.owner_route, "
                 "admissions.candidate_sha, admissions.policy_digest, admissions.configuration_digest, "
@@ -573,20 +575,22 @@ class DependencyReviewService:
             ).fetchall()
         finally:
             connection.close()
-        source_digest = None
+        source_digests = []
         for digest, encoded in records:
             try:
                 record = parse_failure_record(json.loads(encoded))
             except Exception:
                 continue
             if record.digest == digest and record.binding == source_binding:
-                source_digest = digest
-                break
-        if source_digest is None:
+                source_digests.append(digest)
+        if len(source_digests) != 1:
             raise DependencyReviewDispatchError("dependency review transient recovery source is unavailable")
+        source_digest = source_digests[0]
         try:
             source = read_durable_failure(repository, task_identity, source_digest)
-            if source.action is not RecoveryAction.PREBOUND_FALLBACK or not source.retryable:
+            if (source.binding != source_binding or source.failure is not FailureClass.TRANSIENT_SERVICE
+                    or source.evidence is not EvidenceSource.VERIFIED_SERVICE
+                    or source.action is not RecoveryAction.PREBOUND_FALLBACK or not source.retryable):
                 raise DependencyReviewDispatchError("dependency review transient recovery source is not eligible")
             route, coordinate, remaining, _reservation = self._recovery_route_material(
                 request, binding, predecessor_attempt_id, execution, execution_host, adapter,

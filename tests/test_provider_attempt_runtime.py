@@ -436,17 +436,14 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(runner.execute(), ("runtime-provider-one",))
             self.assertNotEqual(read_attempt(repository, identity, "runtime-provider-one", context=recovery).state, AttemptState.ACCEPTED)
             # Reuse the same actual repository lifecycle with a fresh selected
-            # provider identity; the accepted result is created only by its
+            # same-profile physical ordinal; the accepted result is created only by its
             # observed typed native response.
-            second_recovery = provider_context(
-                recovery, identity, ProviderRole.SUPERVISOR,
-                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
-            )
+            second_recovery = recovery
             second_backend = Backend("runtime-two", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), [])
             second_selection = DiffReviewSelection(
                 "runtime-review-two", runner.selection.implementation_attempt_id,
                 "runtime-provider-two", "runtime-message-two", "runtime-lease-two",
-                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 1, physical_format_output_ordinal=1,
             )
             accepted = replace(runner, sequence=(
                 self.sequence_entry(runner),
@@ -523,7 +520,12 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             runner, primary, repository, identity, recovery, _seal = self.durable_runner(
                 Path(temporary) / "repository",
-                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                NativeSupervisorResponse(
+                    SupervisorResultKind.BLOCKED,
+                    failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+                    outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                    sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
+                ),
             )
             second_recovery = provider_context(
                 recovery, identity, ProviderRole.SUPERVISOR,
@@ -561,6 +563,35 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual({row[1:] for row in rows}, {(1, 60, 4_000)})
             self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
             self.assertEqual((primary.calls, fallback.calls), (1, 1))
+
+    def test_format_invalid_cannot_jump_profiles_before_or_after_restart(self) -> None:
+        for ordinal in (0, 2):
+            with self.subTest(physical_ordinal=ordinal), TemporaryDirectory() as temporary:
+                runner, primary, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                )
+                entries = [self.sequence_entry(runner, backend=primary)]
+                for physical in range(1, ordinal + 1):
+                    selection = replace(runner.selection, diff_review_attempt_id=f"format-review-{physical}", provider_attempt_id=f"format-provider-{physical}", message_identity=f"format-message-{physical}", process_lease_id=f"format-lease-{physical}", physical_format_output_ordinal=physical)
+                    backend = Backend(f"format-{physical}", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), [])
+                    entries.append(self.sequence_entry(runner, selection=selection, backend=backend))
+                next_recovery = provider_context(recovery, identity, ProviderRole.SUPERVISOR, selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1])
+                target = replace(runner.selection, diff_review_attempt_id="jump-review", provider_attempt_id="jump-provider", message_identity="jump-message", process_lease_id="jump-lease", within_round_attempt=2)
+                fallback = Backend("jump-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), [])
+                entries.append(self.sequence_entry(runner, selection=target, recovery=next_recovery, audit=next_recovery.health_receipt.audit_identity, backend=fallback))
+                sequence = replace(runner, sequence=tuple(entries))
+                for restart in (False, True):
+                    expected_error = "profile transition has no terminal recovery route" if ordinal == 0 else "format correction allowance is exhausted"
+                    with self.subTest(restart=restart), self.assertRaisesRegex(ProviderAttemptRuntimeError, expected_error):
+                        sequence.execute()
+                    self.assertEqual(fallback.calls, 0)
+                    self.assertEqual(primary.calls, 1)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertIsNone(connection.execute("SELECT 1 FROM provider_attempts WHERE attempt_id=?", (target.provider_attempt_id,)).fetchone())
+                finally:
+                    connection.close()
 
     def test_recovery_route_fence_interruption_reconciles_before_successor_dispatch(self) -> None:
         """A crash after the route fence cannot strand or duplicate a successor."""
@@ -850,14 +881,11 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     return Session(self)
 
             second_backend = Backend()
-            second_recovery = provider_context(
-                recovery, identity, ProviderRole.SUPERVISOR,
-                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
-            )
+            second_recovery = recovery
             second = DiffReviewSelection(
                 "runtime-material-review-two", runner.selection.implementation_attempt_id,
                 "runtime-material-provider-two", "runtime-material-message-two", "runtime-material-lease-two",
-                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 1, physical_format_output_ordinal=1,
             )
             runner = replace(runner, sequence=(
                 self.sequence_entry(runner, backend=first),

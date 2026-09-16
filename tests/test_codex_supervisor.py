@@ -59,6 +59,7 @@ def digest(value: object) -> str:
 def qualify_supervisor_sequence(adapters, requests, advisory_executions, *args, **kwargs):
     """Supply a verified durable task/attempt fixture for sequence tests."""
 
+    exercise = kwargs.pop("_exercise", None)
     with TemporaryDirectory() as temporary:
         readiness, binding, policy = args[:3]
         context = requests[0].context
@@ -150,18 +151,17 @@ def qualify_supervisor_sequence(adapters, requests, advisory_executions, *args, 
             )
             supplied_turn(session_identity, turn_identity)
 
-        return _qualify_supervisor_sequence(
-            adapters, requests, advisory_executions, *args,
-            repository=repository, task_identity=identity,
-            recovery_context=recoveries[requests[0].provider_attempt_id],
-            execution_hosts=tuple(
-                trusted_execution_host(AdvisoryRole.SUPERVISOR, adapter._profile)
-                for adapter in adapters
-            ),
-            budget_ledger_path=Path(temporary) / "role-budget.sqlite",
-            checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
-            **kwargs,
-        )
+        def run():
+            return _qualify_supervisor_sequence(
+                adapters, requests, advisory_executions, *args,
+                repository=repository, task_identity=identity,
+                recovery_context=recoveries[requests[0].provider_attempt_id],
+                execution_hosts=tuple(trusted_execution_host(AdvisoryRole.SUPERVISOR, adapter._profile) for adapter in adapters),
+                budget_ledger_path=Path(temporary) / "role-budget.sqlite",
+                checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
+                **kwargs,
+            )
+        return run() if exercise is None else exercise(run, repository, Path(temporary) / "role-budget.sqlite")
 
 
 class Turn:
@@ -779,6 +779,78 @@ class SupervisorTests(unittest.TestCase):
             lifecycle = FileSupervisorLifecycle(Path(directory) / "lifecycle", digest("replay-source"))
             first = lifecycle.prepare(plan, freshness_until=20)
             self.assertEqual(lifecycle.prepare(plan, freshness_until=20), first)
+            with self.assertRaises(SupervisorShadowError):
+                lifecycle.prepare(plan, freshness_until=21)
+
+    def test_qualification_restarts_exact_successor_after_each_durable_crash_boundary(self):
+        import roundwright.supervisor_shadow as shadow
+        import roundwright.codex_supervisor as dispatcher
+
+        class ProcessDeath(BaseException): pass
+        for boundary in ("plan", "fence", "budget", "admission", "dispatch", "admission-drift", "budget-drift", "claim-drift"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as directory:
+                adapters, requests, readiness, binding, policy, _, recorder = self.sequence_fixture((
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                ))
+                lifecycle = FileSupervisorLifecycle(Path(directory), digest("crash-lifecycle"))
+                def exercise(run, repository, budget):
+                    if boundary == "plan":
+                        target, method = lifecycle, "prepare"
+                    elif boundary == "fence":
+                        target, method = shadow, "begin_durable_recovery_route_reservation"
+                    elif boundary == "budget":
+                        target, method = dispatcher, "reserve_role_effect"
+                    elif boundary in ("admission", "admission-drift", "budget-drift", "claim-drift"):
+                        target, method = shadow, "commit_durable_recovery_route_successor_admission"
+                    else:
+                        target, method = adapters[1]._backend, "open_fresh_session"
+                    original = getattr(target, method)
+                    def die(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        if boundary != "budget" or kwargs["request_or_attempt_identity"] == requests[1].provider_attempt_id:
+                            raise ProcessDeath()
+                        return result
+                    with patch.object(target, method, side_effect=die), self.assertRaises(ProcessDeath):
+                        run()
+                    calls = tuple(adapter._backend.calls for adapter in adapters)
+                    if boundary.endswith("-drift"):
+                        connection = sqlite3.connect(budget if boundary == "budget-drift" else database_path(repository))
+                        try:
+                            if boundary == "admission-drift":
+                                connection.execute("UPDATE recovery_route_successor_admissions SET target_request_digest=?", (digest("changed-request"),))
+                            elif boundary == "budget-drift":
+                                connection.execute("UPDATE role_budget_usage SET tokens=tokens-1 WHERE rowid=(SELECT max(rowid) FROM role_budget_usage)")
+                            else:
+                                connection.execute("INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)", (requests[1].provider_attempt_id, requests[1].context.task_id, requests[1].input_digest.removeprefix("sha256:"), 101))
+                            connection.commit()
+                        finally:
+                            connection.close()
+                        with self.assertRaises((SupervisorShadowError, CodexSupervisorError, RoleCapabilityError)):
+                            run()
+                        self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), calls)
+                        return
+                    if boundary == "dispatch":
+                        with self.assertRaises(SupervisorShadowError):
+                            run()
+                        self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), calls)
+                        return
+                    self.assertEqual(calls, (0, 0) if boundary == "plan" else (1, 0))
+                    result = run()
+                    self.assertEqual(result.envelope.accepted_ordinal, 2)
+                    self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 1))
+                    connection = sqlite3.connect(budget)
+                    try:
+                        self.assertEqual(connection.execute("SELECT calls, duration_seconds, tokens FROM role_budget_usage").fetchall(), [(1, 60, 4000), (1, 60, 4000)])
+                    finally:
+                        connection.close()
+                    connection = sqlite3.connect(database_path(repository))
+                    try:
+                        self.assertEqual(connection.execute("SELECT state FROM recovery_route_authorizations").fetchall(), [("consumed",)])
+                        self.assertEqual(connection.execute("SELECT target_attempt_id FROM recovery_route_successor_admissions").fetchall(), [(requests[1].provider_attempt_id,)])
+                    finally:
+                        connection.close()
+                qualify_supervisor_sequence(adapters, requests, self.admissions(adapters, requests), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=FileSupervisorRuntimeStore(Path(directory) / "runtime", self.runtime_store().source_identity), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise)
 
     @unittest.skipUnless(
         os.name == "nt" and hasattr(Path(), "is_junction") and shutil.which("cmd.exe"),
@@ -938,7 +1010,7 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual((returned_plan, returned_receipt), (plan, receipt))
             self.assertIsNot(returned_plan, plan)
             self.assertIsNot(returned_receipt, receipt)
-            with self.assertRaises(SupervisorShadowError): lifecycle.prepare(plan, freshness_until=20)
+            self.assertEqual(lifecycle.prepare(plan, freshness_until=20), receipt)
             record = root / ("record-" + receipt.record_identity.removeprefix("sha256:"))
             for filename, replacement in (("plan.json", "{}"), ("plan-receipt.json", "{}")):
                 original = (record / filename).read_text(encoding="utf-8")
@@ -1159,7 +1231,7 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(value, runtime); self.assertIsNot(value, runtime)
             material = json.dumps(receipt.payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
             self.assertEqual(SupervisorRuntimeBindingReceipt.from_canonical(material), receipt)
-            with self.assertRaises(RuntimeBindingError): FileSupervisorRuntimeStore(root, source).persist(runtime, candidate_sha=candidate, context_identity=context, ready_at=10, freshness_until=20)
+            self.assertEqual(FileSupervisorRuntimeStore(root, source).persist(runtime, candidate_sha=candidate, context_identity=context, ready_at=10, freshness_until=20), receipt)
             record = root / ("record-" + receipt.record_identity.removeprefix("sha256:"))
             for filename, replacement in (("runtime.json", "{}"), ("receipt.json", "{}")):
                 original = (record / filename).read_text(encoding="utf-8")

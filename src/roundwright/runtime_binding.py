@@ -191,7 +191,10 @@ class InMemorySupervisorRuntimeStore:
         material = runtime.canonical_material(); content = "sha256:" + hashlib.sha256(material.encode()).hexdigest()
         record = "sha256:" + hashlib.sha256(json.dumps({"source_identity": self._source_identity, "candidate_sha": candidate_sha, "context_identity": context_identity, "resolved_configuration_digest": runtime.resolved_digest, "runtime_content_digest": content, "canonical_material_digest": content, "ready_at": ready_at, "freshness_until": freshness_until}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         receipt = SupervisorRuntimeBindingReceipt(self._source_identity, record, candidate_sha, context_identity, runtime.resolved_digest, content, ready_at, freshness_until, _RECEIPT_SCHEMA, content)
-        if record in self._records: raise RuntimeBindingError("supervisor runtime record already exists")
+        if record in self._records:
+            if self.read(receipt, evidence_time=ready_at) != runtime:
+                raise RuntimeBindingError("supervisor runtime record has drifted")
+            return receipt
         self._records[record] = material; return receipt
     def read(self, receipt: SupervisorRuntimeBindingReceipt, *, evidence_time: int) -> RuntimeBinding:
         if type(receipt) is not SupervisorRuntimeBindingReceipt or type(evidence_time) is not int or not receipt.ready_at <= evidence_time <= receipt.freshness_until:
@@ -264,7 +267,10 @@ class FileSupervisorRuntimeStore:
         if type(runtime) is not RuntimeBinding or not _SHA.fullmatch(candidate_sha) or not _DIGEST.fullmatch(context_identity) or type(ready_at) is not int or type(freshness_until) is not int or freshness_until < ready_at: raise RuntimeBindingError("supervisor runtime persist is invalid")
         receipt = self._record(runtime, candidate_sha=candidate_sha, context_identity=context_identity, ready_at=ready_at, freshness_until=freshness_until); directory = self._directory(receipt.record_identity)
         try: directory.mkdir()
-        except FileExistsError as error: raise RuntimeBindingError("supervisor runtime collision") from error
+        except FileExistsError:
+            if self.read(receipt, evidence_time=ready_at) != runtime:
+                raise RuntimeBindingError("supervisor runtime record has drifted")
+            return receipt
         except OSError as error: raise RuntimeBindingError("supervisor runtime publication failed") from error
         self._safe_path(directory)
         if _reparse(directory): raise RuntimeBindingError("supervisor runtime record is invalid")

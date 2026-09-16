@@ -50,7 +50,7 @@ from .provider_recovery import (
     SupervisorAccountingBlocker, record_supervisor_accounting_blocker,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
-from .state import TaskIdentity, check_database, require_runtime_binding, task_projection
+from .state import TaskIdentity, _open_writable_connection, check_database, require_runtime_binding, task_projection
 from .worker_planning import ProviderDispatchControl
 from .supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from .worker_toolbox import CompletionDeadline
@@ -892,6 +892,39 @@ class DurableDiffReviewRunner:
             physical_format_output_ordinal=selection.physical_format_output_ordinal,
             lease=self.lease, now=self.dispatch_control.now,
         )
+        if selection.physical_format_output_ordinal > 0:
+            # An occupied correction coordinate owns its original identity.
+            # Reject a substituted attempt before it can reserve fresh cost.
+            connection = _open_writable_connection(self.repository)
+            try:
+                coordinate_owner = connection.execute(
+                    "SELECT attempt_id, profile_identity FROM supervisor_attempt_coordinates "
+                    "WHERE task_id=? AND review_epoch=? AND review_round=? "
+                    "AND logical_profile_position=? AND physical_format_output_ordinal=?",
+                    (self.identity.task_id, self.review_epoch, self.review_round,
+                     selection.resolved_logical_profile_position, selection.physical_format_output_ordinal),
+                ).fetchone()
+            finally:
+                connection.close()
+            if (coordinate_owner is not None and coordinate_owner != (selection.provider_attempt_id, selected)) or (existing_prepared and coordinate_owner is None):
+                raise ProviderAttemptRuntimeError("provider prepared correction coordinate has drifted")
+        if existing_prepared:
+            if (
+                existing.role is not ProviderRole.SUPERVISOR
+                or existing.selected_profile_identity != selected
+                or existing.input_fingerprint != input_fingerprint
+                or existing.process_lease_id != selection.process_lease_id
+                or existing.process_lease_expires_at != selection.process_lease_expires_at
+                or existing.logical_profile_position != selection.resolved_logical_profile_position
+                or existing.physical_format_output_ordinal != selection.physical_format_output_ordinal
+                or existing.session_identity is not None
+                or existing.external_turn_identity is not None
+                or read_supervisor_dispatch_claim(
+                    self.repository, self.identity, recovery,
+                    attempt_id=selection.provider_attempt_id,
+                ) is not SupervisorDispatchClaimState.UNCLAIMED
+            ):
+                raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
         route_reserved = False
         if recovery_route is not None:
             route, coordinate, remaining, reservation_digest = self._recovery_route_material(entry)
@@ -945,7 +978,7 @@ class DurableDiffReviewRunner:
                     request_or_attempt_identity=selection.provider_attempt_id,
                     request_material=request_material, preflight_material=preflight_material,
                 )
-                if recovery_route is not None and existing_prepared and not route_reserved
+                if existing_prepared and not route_reserved and (recovery_route is not None or selection.physical_format_output_ordinal > 0)
                 else reserve_role_effect(
                     entry.advisory_execution, host_inputs=entry.execution_host,
                     ledger_path=self.budget_ledger_path, profile=audit.profile,

@@ -517,6 +517,51 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 prepare_attempt(repository, identity, recovery, attempt_id=runner.selection.provider_attempt_id, role=ProviderRole.SUPERVISOR, process_lease_id=runner.selection.process_lease_id, process_lease_expires_at=runner.selection.process_lease_expires_at, input_fingerprint="c" * 64, selected_profile_identity=runner.audit.profile_identity, logical_profile_position=1, physical_format_output_ordinal=0, lease=runner.lease, now=runner.dispatch_control.now)
             self.assertEqual(backend.calls, 1)
 
+    def test_prepared_format_correction_reuses_exact_reservation_after_crash(self) -> None:
+        import roundwright.provider_attempt_runtime as runtime_module
+        class ProcessDeath(BaseException): pass
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE))
+            first = self.sequence_entry(runner)
+            selection = replace(runner.selection, diff_review_attempt_id="crash-review", provider_attempt_id="crash-provider",
+                                message_identity="crash-message", process_lease_id="crash-lease", physical_format_output_ordinal=1)
+            second = self.sequence_entry(runner, selection=selection,
+                                         backend=Backend("crash-correction", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), []))
+            restarted = replace(runner, sequence=(first, second))
+            original = runtime_module.prepare_attempt
+            def interrupt(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    raise ProcessDeath
+                return result
+            with patch.object(runtime_module, "prepare_attempt", side_effect=interrupt):
+                with self.assertRaises(ProcessDeath): restarted.execute()
+            self.assertEqual((first.backend.calls, second.backend.calls), (1, 0))
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                before = connection.execute("SELECT * FROM role_budget_usage").fetchall()
+            self.assertEqual(len(before), 2)
+            for changed in (
+                replace(selection, provider_attempt_id="substituted-provider"),
+                replace(selection, message_identity="substituted-message"),
+                replace(selection, process_lease_id="substituted-lease"),
+                replace(selection, physical_format_output_ordinal=2),
+                replace(selection, logical_profile_position=2, within_round_attempt=2),
+            ):
+                with self.subTest(selection=changed):
+                    with self.assertRaises((ProviderAttemptRuntimeError, ProviderRecoveryError, RoleCapabilityError)):
+                        drifted = self.sequence_entry(runner, selection=changed, backend=second.backend)
+                        replace(runner, sequence=(first, drifted)).execute()
+                    self.assertEqual((first.backend.calls, second.backend.calls), (1, 0))
+                    with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                        self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+            self.assertEqual(replace(restarted).execute(), (first.selection.provider_attempt_id, selection.provider_attempt_id))
+            self.assertEqual((first.backend.calls, second.backend.calls), (1, 1))
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+            self.assertEqual(replace(restarted).execute(), (first.selection.provider_attempt_id, selection.provider_attempt_id))
+            self.assertEqual((first.backend.calls, second.backend.calls), (1, 1))
+
     def test_fallback_reserves_its_own_exact_binding_and_reconstructs_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, primary, repository, identity, recovery, _seal = self.durable_runner(

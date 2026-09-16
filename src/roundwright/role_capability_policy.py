@@ -1199,10 +1199,9 @@ def recover_role_effect_reservation(
 ) -> TrustedRoleEffectReservation:
     """Reconstruct one exact already-reserved effect without spending again.
 
-    This is intentionally for durable recovery routes only.  The caller must
-    first prove a matching ``reserving`` route state; this function merely
-    authenticates and reads that exact budget row so reconciliation can either
-    commit an existing successor or release the stranded reservation.
+    The caller must first authenticate a durable recovery route or an exact
+    prepared, unclaimed physical correction. This function authenticates and
+    reads that exact budget row; it neither admits a dispatch nor resets cost.
     """
 
     if not isinstance(ledger_path, Path):

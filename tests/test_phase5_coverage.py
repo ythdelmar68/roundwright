@@ -245,6 +245,11 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_readiness_accepts_only_exact_unclaimed_prepared_correction",
             "tests.test_codex_supervisor.SupervisorTests.test_ordered_dispatch_rechecks_scope_after_session_checkpoint",
             "tests.test_role_budget_ledger.DurableRoleBudgetLedgerTests.test_public_deletion_primitive_cannot_refund_an_admitted_debit",
+            "tests.test_codex_supervisor.SupervisorTests.test_real_qualification_entrypoint_rechecks_scope_after_session_checkpoint",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_scope_stop_during_response_read_cannot_commit_accepted_review",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_readiness_and_execution_share_complete_accepted_state_validation",
+            "tests.test_codex_supervisor.SupervisorTests.test_denial_before_correction_reservation_leaves_no_budget_or_successor",
+            "tests.test_production_coding_runtime.ProductionRuntimeTests.test_stopped_unclaimed_worker_reuses_exact_unused_reservation_after_clearance",
         )
         self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
         self.assertEqual(tuple(test for test in coverage.SEMANTIC_TESTS if test in required), required)
@@ -260,6 +265,10 @@ class Phase5CoverageTests(unittest.TestCase):
         self.assertEqual(
             tuple(coverage.ISSUE_132_E1R12_FINDING_REQUIREMENTS),
             ("E1R12-01", "E1R12-02", "E1R12-03", "E1R12-04"),
+        )
+        self.assertEqual(
+            tuple(coverage.ISSUE_132_E1R13_FINDING_REQUIREMENTS),
+            ("E1R13-01", "E1R13-02", "E1R13-03", "E1R13-04"),
         )
 
     def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:
@@ -295,6 +304,10 @@ class Phase5CoverageTests(unittest.TestCase):
         e1r12 = dict(coverage.ISSUE_132_E1R12_FINDING_REQUIREMENTS)
         e1r12.pop("E1R12-04")
         with patch.object(coverage, "ISSUE_132_E1R12_FINDING_REQUIREMENTS", e1r12), self.assertRaisesRegex(coverage.CoverageError, "E1R12 finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+        e1r13 = dict(coverage.ISSUE_132_E1R13_FINDING_REQUIREMENTS)
+        e1r13.pop("E1R13-04")
+        with patch.object(coverage, "ISSUE_132_E1R13_FINDING_REQUIREMENTS", e1r13), self.assertRaisesRegex(coverage.CoverageError, "E1R13 finding mapping"):
             coverage._validate_issue_132_semantic_tests()
 
     def test_issue_132_affected_module_inventory_rejects_candidate_review_omission(self) -> None:

@@ -39,7 +39,9 @@ TESTS = (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_recovery_route_is_exact_single_use_and_restart_safe",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_recovery_route_fence_interruption_reconciles_before_successor_dispatch",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_recovery_route_fence_interruption_reconciles_before_successor_session",
-    "tests.test_codex_supervisor.SupervisorTests.test_fallback_fence_is_abandoned_when_successor_budget_reservation_fails",
+    "tests.test_codex_supervisor.SupervisorTests.test_file_lifecycle_exact_prepare_replay_recovers_the_existing_plan",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_invalid_predecessor_cannot_mint_a_successor_session_or_budget",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_after_pre_dispatch_claim_blocks_before_native_session_open",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

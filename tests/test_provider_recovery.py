@@ -969,6 +969,10 @@ class ProviderRecoveryTests(unittest.TestCase):
                 target_attempt_id="route-successor",
                 target_request_digest="sha256:" + "4" * 64,
             )
+            with self.assertRaisesRegex(Exception, "already admitted"):
+                release_durable_recovery_route_authorization(
+                    repository, identity, issued, reservation_digest=reservation,
+                )
             # Exact restart replay is idempotent, but an admission cannot be
             # borrowed by a different supervisor request.
             commit_durable_recovery_route_successor_admission(

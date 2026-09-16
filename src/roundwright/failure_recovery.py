@@ -674,6 +674,12 @@ def release_durable_recovery_route_authorization(
         ).fetchone()
         if row != (reservation_digest, "consumed"):
             raise FailureRecoveryError("durable recovery route release has drifted")
+        admission = connection.execute(
+            "SELECT 1 FROM recovery_route_successor_admissions WHERE route_digest=?",
+            (authorization.route_digest,),
+        ).fetchone()
+        if admission is not None:
+            raise FailureRecoveryError("durable recovery route successor is already admitted")
         updated = connection.execute(
             "UPDATE recovery_route_authorizations "
             "SET state='issued', reservation_digest=NULL, consumed_at=NULL "

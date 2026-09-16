@@ -973,6 +973,16 @@ MIGRATIONS = (
         ),
         (("recovery_route_successor_admissions", "CREATE TABLE recovery_route_successor_admissions (route_digest TEXT PRIMARY KEY REFERENCES recovery_route_authorizations(route_digest), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, reservation_digest TEXT NOT NULL, target_attempt_id TEXT NOT NULL, target_request_digest TEXT NOT NULL, admitted_at INTEGER NOT NULL CHECK(admitted_at > 0), UNIQUE(task_id, target_attempt_id), UNIQUE(task_id, target_request_digest))"),),
     ),
+    Migration(
+        79,
+        (
+            "ALTER TABLE dependency_review_dispatch_claims RENAME TO dependency_review_dispatch_claims_v78",
+            "CREATE TABLE dependency_review_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT, turn_identity TEXT, state TEXT NOT NULL CHECK(state IN ('pre-dispatch', 'session-opened', 'turn-dispatched')), CHECK((session_identity IS NULL AND turn_identity IS NULL AND state = 'pre-dispatch') OR (session_identity IS NOT NULL AND turn_identity IS NULL AND state = 'session-opened') OR (session_identity IS NOT NULL AND turn_identity IS NOT NULL AND state = 'turn-dispatched')))",
+            "INSERT INTO dependency_review_dispatch_claims SELECT attempt_id, session_identity, turn_identity, state FROM dependency_review_dispatch_claims_v78",
+            "DROP TABLE dependency_review_dispatch_claims_v78",
+        ),
+        (("dependency_review_dispatch_claims", "CREATE TABLE dependency_review_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT, turn_identity TEXT, state TEXT NOT NULL CHECK(state IN ('pre-dispatch', 'session-opened', 'turn-dispatched')), CHECK((session_identity IS NULL AND turn_identity IS NULL AND state = 'pre-dispatch') OR (session_identity IS NOT NULL AND turn_identity IS NULL AND state = 'session-opened') OR (session_identity IS NOT NULL AND turn_identity IS NOT NULL AND state = 'turn-dispatched')))"),),
+    ),
 )
 
 

@@ -555,6 +555,12 @@ class DurableDiffReviewRunner:
                         )
                 elif terminal is not None:
                     route = self._authorize_terminal_successor(predecessor, entry)
+                else:
+                    # A profile transition is never an implicit fallback.
+                    # Only an authenticated terminal source may authorize it.
+                    raise ProviderAttemptRuntimeError(
+                        "provider profile transition has no terminal recovery route"
+                    )
             attempt_id, accepted = self._execute_selection(entry, recovery_route=route)
             attempt_ids.append(attempt_id)
             if accepted:

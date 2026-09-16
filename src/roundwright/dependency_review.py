@@ -678,9 +678,12 @@ class DependencyReviewStore:
             if row[6] != "prepared":
                 raise DependencyReviewError("dependency review dispatch claim is unavailable")
             existing = connection.execute("SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
-            if existing is not None:
+            if existing is None:
+                connection.execute("INSERT INTO dependency_review_dispatch_claims(attempt_id, session_identity, turn_identity, state) VALUES (?, ?, NULL, 'session-opened')", (attempt_id, session_identity))
+            elif existing == (None, None, "pre-dispatch"):
+                connection.execute("UPDATE dependency_review_dispatch_claims SET session_identity = ?, state = 'session-opened' WHERE attempt_id = ?", (session_identity, attempt_id))
+            else:
                 raise DependencyReviewError("dependency review dispatch claim is already consumed")
-            connection.execute("INSERT INTO dependency_review_dispatch_claims(attempt_id, session_identity, turn_identity, state) VALUES (?, ?, NULL, 'session-opened')", (attempt_id, session_identity))
             if task_identity is not None:
                 assert binding is not None
                 admission = (
@@ -699,6 +702,28 @@ class DependencyReviewStore:
                     )
                 elif tuple(existing_admission) != admission:
                     raise DependencyReviewError("dependency review failure admission has drifted")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim_pre_dispatch(self, repository: RepositoryIdentity, *, attempt_id: str, task_identity: TaskIdentity | None = None, binding: DependencyReviewBinding | None = None) -> None:
+        """Fence one native-session boundary before it can be crossed."""
+        if not _token(attempt_id) or (task_identity is None) != (binding is None) or (task_identity is not None and type(task_identity) is not TaskIdentity) or (binding is not None and type(binding) is not DependencyReviewBinding):
+            raise DependencyReviewError("dependency review dispatch claim is invalid")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, subset = self._read_attempt(connection, attempt_id)
+            if task_identity is not None:
+                assert binding is not None
+                self._require_current_authority(connection, task_identity, subset, binding)
+            existing = connection.execute("SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
+            if row[6] != "prepared" or existing is not None:
+                raise DependencyReviewError("dependency review dispatch claim is unavailable")
+            connection.execute("INSERT INTO dependency_review_dispatch_claims(attempt_id, session_identity, turn_identity, state) VALUES (?, NULL, NULL, 'pre-dispatch')", (attempt_id,))
             connection.commit()
         except Exception:
             connection.rollback()

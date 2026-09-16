@@ -516,6 +516,46 @@ class DependencyReviewServiceTests(unittest.TestCase):
             )
             self.assertEqual((result.kind, result.reason_code, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn", 0))
 
+    def test_restart_after_pre_dispatch_claim_blocks_before_native_session_open(self) -> None:
+        """The native-session boundary is fenced even before it has an ID."""
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="attempt-116", binding=binding)
+            store.claim_pre_dispatch(repository, attempt_id="attempt-116")
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116")
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                **effect,
+            )
+            self.assertEqual((result.kind, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, 0))
+            self.assertFalse(effect["budget_ledger_path"].exists())
+
+    def test_invalid_predecessor_cannot_mint_a_successor_session_or_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="attempt-116", binding=binding)
+            store.record_invalid(repository, attempt_id="attempt-116", output_digest=digest("a"), reason_code="malformed-response")
+            successor_subset = replace(subset, snapshot_id="subset-117", creation_reason="invalid-retry")
+            successor_binding = DependencyReviewBinding(successor_subset.candidate_sha, successor_subset.policy_digest, successor_subset.configuration_digest, binding.profile_identity)
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-117")))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            effect = self.effect_kwargs(repository, successor_subset, successor_binding, adapter, attempt_id="attempt-117")
+            with self.assertRaisesRegex(DependencyReviewDispatchError, "supersession is not recovery-eligible"):
+                DependencyReviewService().run(
+                    repository, successor_subset, attempt_id="attempt-117", binding=successor_binding,
+                    adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                    task_identity=identity, supersedes_attempt_id="attempt-116", **effect,
+                )
+            self.assertEqual(backend.sessions, [])
+            self.assertFalse(effect["budget_ledger_path"].exists())
+
     def test_restart_scope_denial_blocks_before_dependency_provider_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))

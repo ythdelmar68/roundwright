@@ -771,6 +771,15 @@ class SupervisorTests(unittest.TestCase):
                 with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, FileSupervisorLifecycle(Path(directory) / "qualifier", source), recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
             self.assertEqual((self.events, recorder.calls), ([], []))
 
+    def test_file_lifecycle_exact_prepare_replay_recovers_the_existing_plan(self):
+        """A generic Supervisor restart can reread, not replace, its plan."""
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("replay-runtime"), 10, readiness.observation_identity)
+        with TemporaryDirectory() as directory:
+            lifecycle = FileSupervisorLifecycle(Path(directory) / "lifecycle", digest("replay-source"))
+            first = lifecycle.prepare(plan, freshness_until=20)
+            self.assertEqual(lifecycle.prepare(plan, freshness_until=20), first)
+
     @unittest.skipUnless(
         os.name == "nt" and hasattr(Path(), "is_junction") and shutil.which("cmd.exe"),
         "Windows cmd.exe junction creation is unavailable",

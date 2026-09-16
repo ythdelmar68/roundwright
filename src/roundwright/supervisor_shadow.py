@@ -524,8 +524,14 @@ class FileSupervisorLifecycle:
         directory = self._record_dir(binding.record_identity)
         try:
             directory.mkdir()
-        except FileExistsError as error:
-            raise SupervisorShadowError("Supervisor file lifecycle collision") from error
+        except FileExistsError:
+            # Qualification can restart after any later durable checkpoint.
+            # Reuse only the byte-for-byte same plan and receipt; another
+            # identity remains a collision and fails closed.
+            existing, receipt = self.read_plan(binding.record_identity, evidence_time=plan.ready_at)
+            if existing != plan or receipt.binding != binding:
+                raise SupervisorShadowError("Supervisor file lifecycle collision")
+            return receipt
         except OSError as error:
             raise SupervisorShadowError("Supervisor file lifecycle publication failed") from error
         self._safe_path(directory)

@@ -85,3 +85,14 @@ admission in the same transaction as its route consumption before native
 dispatch. Three injected interruption tests pin those provider-runtime,
 dependency-review, and generic-Supervisor interleavings; no successor session
 or turn is opened until the appropriate admission is durable.
+
+## E1R7 correction closure
+
+The qualification inventory now pins production-path adversarial boundaries:
+an `INVALID` dependency predecessor cannot create a successor budget or native
+session; a one-shot dependency pre-dispatch claim blocks a restart before
+native session creation; and FileSupervisorLifecycle replays only an exact
+authenticated plan after a generic Supervisor restart.  A profile transition
+without a durable terminal route fails before a provider attempt.  The
+single-use route release helper also rejects every route that already has a
+durable successor admission, so an admitted turn cannot be re-armed.

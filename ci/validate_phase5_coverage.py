@@ -87,6 +87,8 @@ ISSUE_132_ARTIFACTS = {
     "failure-recovery-supervisor-boundary-v1": "src/roundwright/codex_supervisor.py",
     "failure-recovery-worker-boundary-v1": "src/roundwright/codex_worker.py",
     "failure-recovery-dependency-boundary-v1": "src/roundwright/codex_dependency_review.py",
+    "failure-recovery-dependency-store-v1": "src/roundwright/dependency_review.py",
+    "failure-recovery-supervisor-lifecycle-v1": "src/roundwright/supervisor_shadow.py",
     "failure-recovery-candidate-review-v1": "src/roundwright/candidate_review.py",
     "failure-recovery-supervisor-runtime-tests-v1": "tests/test_provider_attempt_runtime.py",
     "failure-recovery-runtime-tests-v1": "tests/test_provider_recovery.py",
@@ -527,7 +529,9 @@ SEMANTIC_TESTS = (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_durable_recovery_route_is_exact_single_use_and_restart_safe",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_recovery_route_fence_interruption_reconciles_before_successor_dispatch",
     "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_recovery_route_fence_interruption_reconciles_before_successor_session",
-    "tests.test_codex_supervisor.SupervisorTests.test_fallback_fence_is_abandoned_when_successor_budget_reservation_fails",
+    "tests.test_codex_supervisor.SupervisorTests.test_file_lifecycle_exact_prepare_replay_recovers_the_existing_plan",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_invalid_predecessor_cannot_mint_a_successor_session_or_budget",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_after_pre_dispatch_claim_blocks_before_native_session_open",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 ISSUE_132_FINDING_REQUIREMENTS = {
@@ -566,13 +570,15 @@ ISSUE_132_E1R3_FINDING_REQUIREMENTS = {
     "RW132-QUALIFICATION-008": ("ci/phase5_semantic_receipt.py", "tests.test_phase5_coverage.Phase5CoverageTests.test_issue_132_semantic_inventory_is_independently_pinned_and_ordered"),
     "RW132-ROUTE-FENCE-009": ("src/roundwright/provider_attempt_runtime.py", "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_recovery_route_fence_interruption_reconciles_before_successor_dispatch"),
     "RW132-DEPENDENCY-FENCE-010": ("src/roundwright/codex_dependency_review.py", "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_recovery_route_fence_interruption_reconciles_before_successor_session"),
-    "RW132-SUPERVISOR-FENCE-011": ("src/roundwright/codex_supervisor.py", "tests.test_codex_supervisor.SupervisorTests.test_fallback_fence_is_abandoned_when_successor_budget_reservation_fails"),
+    "RW132-SUPERVISOR-FENCE-011": ("src/roundwright/supervisor_shadow.py", "tests.test_codex_supervisor.SupervisorTests.test_file_lifecycle_exact_prepare_replay_recovers_the_existing_plan"),
 }
 ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + tuple(ISSUE_132_AFFECTED_MODULE_TESTS.values()) + (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restart_continues_same_profile_at_next_physical_format_ordinal",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_invalid_predecessor_cannot_mint_a_successor_session_or_budget",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_restart_after_pre_dispatch_claim_blocks_before_native_session_open",
 ) + ISSUE_132_E1R3_TESTS
 def _validate_issue_132_semantic_tests() -> None:
     """Keep the independently maintained E1R2/E1R3 inventory closed and ordered."""

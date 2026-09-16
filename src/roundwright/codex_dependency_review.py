@@ -415,6 +415,14 @@ class DependencyReviewService:
         if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest):
             return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, None, None, None, recovery_digest, "uncertain-provider-turn")
         admit()
+        # This claim deliberately precedes ``open_fresh_session``.  There is
+        # no provider supplied session identity at this point, so a restart
+        # treats the one-shot pre-dispatch marker as ambiguous rather than
+        # opening a duplicate native session.
+        store.claim_pre_dispatch(
+            repository, attempt_id=attempt.attempt_id, task_identity=task_identity,
+            binding=binding if task_identity is not None else None,
+        )
 
         def claimed_session(session_identity: str) -> None:
             admit()
@@ -541,8 +549,12 @@ class DependencyReviewService:
             raise DependencyReviewDispatchError("dependency review recovery predecessor is unavailable") from None
         finally:
             connection.close()
+        # Naming a predecessor is itself a recovery request.  It must never
+        # quietly degrade into an ordinary fresh attempt: an ACCEPTED or
+        # INVALID predecessor has no transient route to spend, and a missing
+        # record is indistinguishable from a changed lineage.
         if row is None or row[0] != "blocked":
-            return None
+            raise DependencyReviewDispatchError("dependency review supersession is not recovery-eligible")
         if row[1] == "uncertain-provider-turn" or row[2] == "reconcile-required":
             raise DependencyReviewDispatchError("dependency review reconciliation is incomplete")
         if row[1] != "sdk-turn-failed" or row[2] != "prebound-transient-route" or any(type(value) is not str for value in row[3:]):

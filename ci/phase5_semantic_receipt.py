@@ -67,6 +67,12 @@ TESTS = (
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_readiness_and_execution_share_complete_accepted_state_validation",
     "tests.test_codex_supervisor.SupervisorTests.test_denial_before_correction_reservation_leaves_no_budget_or_successor",
     "tests.test_production_coding_runtime.ProductionRuntimeTests.test_stopped_unclaimed_worker_reuses_exact_unused_reservation_after_clearance",
+    "tests.test_codex_supervisor.SupervisorTests.test_real_qualification_response_time_denial_cannot_seal_pass",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_response_time_scope_denial_records_blocked_not_accepted_or_invalid",
+    "tests.test_candidate_review.CandidateReviewTests.test_response_time_denial_rolls_back_findings_route_and_transition",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_unused_correction_debit_is_recovered_when_preparation_fails",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_initial_prepared_reservation_resumes_after_crash_without_double_debit",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_prepared_fallback_readiness_rejects_route_identity_claim_and_reservation_drift",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

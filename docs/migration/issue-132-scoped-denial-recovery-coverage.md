@@ -113,3 +113,26 @@ The release-helper storage tests reject both a generic successor admission
 and existing provider/dependency successor rows, preserving consumed state.
 The map seals the runtime store and all affected shared #136 artifacts as
 well as the #132 implementation and ordered semantic inventory.
+
+## E1R8 identity and bounded recovery
+
+Generic Supervisor syntax/shape outcomes retain `format-invalid` provenance.
+The original output and two same-profile corrections exhaust that allowance;
+they cannot authenticate session termination or dispatch the next profile.
+Dependency claim recovery authenticates the incoming task, complete subset,
+request digest, profile, configuration, authority and predecessor in the same
+transaction before it can block an in-flight attempt.
+
+Migration 80 authenticates each existing review against the explicit legacy
+or physical-ordinal digest encoding and retains that version for read-back,
+replay and completion. It preserves existing input and output identities;
+unverifiable or ambiguous rows roll back the migration. Populated schema-67
+accepted and in-flight fixtures exercise both preservation and drift rejection.
+
+Accounting validates historical format coordinates within each logical
+profile and retains cumulative cost across a verified outage and fallback.
+Deterministic accounting validation precedes route consumption and dispatch
+claiming. Both route-rearming APIs transactionally reject any admitted
+provider, dependency or generic successor. The production regression stops
+after preparing a successor, proves its reservation cannot be abandoned, and
+then completes restart with exactly one budget debit per physical attempt.

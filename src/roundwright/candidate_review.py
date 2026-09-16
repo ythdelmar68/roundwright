@@ -24,7 +24,7 @@ from typing import Iterable
 from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
 from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, preflight_candidate_evidence, seal_candidate
-from .provider_recovery import AttemptState, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
+from .provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_review_limit_finalization, transition_task
 from .worker_planning import ProviderDispatchControl
@@ -880,7 +880,24 @@ def record_diff_review(
     _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
     if _verification_snapshot(repository, identity, seal.candidate_sha) != dispatch.verification_digest:
         raise CandidateReviewError("diff review verification evidence has changed")
-    provider = read_attempt(repository, identity, dispatch.provider_attempt_id, context=context, now=now)
+    connection = _open_writable_connection(repository)
+    try:
+        persisted_provider = connection.execute(
+            "SELECT provider_role, selected_profile_identity, input_fingerprint FROM provider_attempts WHERE attempt_id = ? AND task_id = ?",
+            (dispatch.provider_attempt_id, identity.task_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    if persisted_provider != (
+        ProviderRole.SUPERVISOR.value,
+        dispatch.selected_profile_identity,
+        dispatch.input_digest,
+    ):
+        raise CandidateReviewError("diff review provider attempt does not match the durable dispatch")
+    try:
+        provider = read_attempt(repository, identity, dispatch.provider_attempt_id, context=context, now=now)
+    except ProviderRecoveryError as error:
+        raise CandidateReviewError("diff review provider authorization is unavailable or has drifted") from error
     if (
         provider.role is not ProviderRole.SUPERVISOR
         or provider.selected_profile_identity != dispatch.selected_profile_identity

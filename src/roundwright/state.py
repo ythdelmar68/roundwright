@@ -983,6 +983,11 @@ MIGRATIONS = (
         ),
         (("dependency_review_dispatch_claims", "CREATE TABLE dependency_review_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT, turn_identity TEXT, state TEXT NOT NULL CHECK(state IN ('pre-dispatch', 'session-opened', 'turn-dispatched')), CHECK((session_identity IS NULL AND turn_identity IS NULL AND state = 'pre-dispatch') OR (session_identity IS NOT NULL AND turn_identity IS NULL AND state = 'session-opened') OR (session_identity IS NOT NULL AND turn_identity IS NOT NULL AND state = 'turn-dispatched')))"),),
     ),
+    Migration(
+        80,
+        ("CREATE TABLE diff_review_digest_versions (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), digest_version INTEGER NOT NULL CHECK(digest_version IN (1, 2)))",),
+        (("diff_review_digest_versions", "CREATE TABLE diff_review_digest_versions (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), digest_version INTEGER NOT NULL CHECK(digest_version IN (1, 2)))"),),
+    ),
 )
 
 
@@ -1745,6 +1750,8 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 _migrate_legacy_worker_objectives(connection)
             if migration.version == 73:
                 _migrate_supervisor_attempt_coordinates(connection)
+            if migration.version == 80:
+                _migrate_diff_review_digest_versions(connection)
             connection.execute(
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
@@ -1797,6 +1804,24 @@ def _supervisor_coordinate_transition_is_valid(
     if epoch == previous_epoch:
         return review_round == previous_round + 1 and logical_position == 1 and format_ordinal == 0
     return epoch == previous_epoch + 1 and review_round in {previous_round, 1} and logical_position == 1 and format_ordinal == 0
+
+
+def _migrate_diff_review_digest_versions(connection: sqlite3.Connection) -> None:
+    """Identify historical encodings by authenticating their unchanged digests."""
+    from types import SimpleNamespace
+    from .candidate_review import CandidateReviewError, _read_diff_dispatch_connection
+
+    for review_id, task_id in connection.execute("SELECT diff_review_attempt_id, task_id FROM diff_review_attempts").fetchall():
+        versions = []
+        for version in (1, 2):
+            try:
+                _read_diff_dispatch_connection(connection, SimpleNamespace(task_id=task_id), review_id, digest_version=version)
+            except (CandidateReviewError, TypeError, ValueError):
+                continue
+            versions.append(version)
+        if len(versions) != 1:
+            raise StateError("legacy diff review identity is unauthenticated or ambiguous")
+        connection.execute("INSERT INTO diff_review_digest_versions VALUES (?, ?)", (review_id, versions[0]))
 
 
 def _migrate_supervisor_attempt_coordinates(connection: sqlite3.Connection) -> None:

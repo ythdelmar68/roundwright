@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -440,6 +441,69 @@ class CandidateReviewTests(unittest.TestCase):
                     process_lease_id="later-supervisor-lease", process_lease_expires_at=now + 60,
                     input_fingerprint="e" * 64, lease=lease, now=now,
                 )
+
+    def test_legacy_populated_reviews_preserve_authenticated_identity_on_migration(self):
+        import json
+        from types import SimpleNamespace
+        from roundwright.state import MIGRATIONS, StateError, _apply_migrations, initialize
+        for accepted, tamper in ((True, False), (False, False), (True, True), (False, True)):
+            with self.subTest(accepted=accepted, tamper=tamper), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository")
+                repository, identity, lease, _, binding, now = values
+                if accepted:
+                    seal, context, review = self.accepted_diff_review(values)
+                else:
+                    with patch(__name__ + ".record_diff_review", return_value=SimpleNamespace(accepted=True)):
+                        seal, context, review = self.accepted_diff_review(values)
+                policy = review.review_policy
+                # Exact schema-67 wire material, independent of the new encoders.
+                material = dict(task=identity.task_id, implementation=review.implementation_attempt_id, base=review.base_sha, candidate=review.candidate_sha, message=review.message_identity, verifications=review.verification_digest, within_round_attempt=review.within_round_attempt, selected_profile_identity=review.selected_profile_identity, review_round=policy.review_round, review_mode=policy.review_mode.value, review_complete_rounds=policy.complete_rounds, review_max_rounds=policy.max_rounds, review_max_supervisor_attempts_per_round=policy.max_supervisor_attempts_per_round, review_on_final_findings=policy.on_final_findings.value, review_policy_digest=policy.policy_digest)
+                if policy.review_epoch:
+                    material["review_epoch"] = policy.review_epoch
+                legacy_input = candidate_review._digest(material)
+                output = DiffReviewOutput(review.diff_review_attempt_id, review.provider_attempt_id, review.supervisor_session_identity, review.external_turn_identity, review.message_identity, seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS)
+                legacy_output = candidate_review._digest(dict(normalized_output_digest=output.digest, within_round_attempt=review.within_round_attempt, selected_profile_identity=review.selected_profile_identity))
+                path = database_path(repository)
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    connection.execute("UPDATE diff_review_attempts SET input_digest=? WHERE diff_review_attempt_id=?", (legacy_input, review.diff_review_attempt_id))
+                    connection.execute("UPDATE provider_attempts SET input_fingerprint=? WHERE attempt_id=?", (legacy_input, review.provider_attempt_id))
+                    if accepted:
+                        connection.execute("UPDATE diff_review_artifacts SET content_digest=?", (legacy_output,))
+                        connection.execute("UPDATE provider_completion_outputs SET output_fingerprint=? WHERE attempt_id=?", (legacy_output, review.provider_attempt_id))
+                # Reconstruct the historical schema without inventing migration receipts.
+                legacy_path = path.with_name("legacy.sqlite")
+                with closing(sqlite3.connect(legacy_path)) as connection, connection:
+                    _apply_migrations(connection, MIGRATIONS[:67])
+                    connection.execute("ATTACH DATABASE ? AS current", (str(path),))
+                    tables = [row[0] for row in connection.execute("SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+                    for table in tables:
+                        if table == "schema_migrations":
+                            continue
+                        columns = [row[1] for row in connection.execute(f'PRAGMA main.table_info("{table}")')]
+                        names = ",".join('"' + name + '"' for name in columns)
+                        connection.execute(f'DELETE FROM main."{table}"')
+                        connection.execute(f'INSERT INTO main."{table}" ({names}) SELECT {names} FROM current."{table}"')
+                    if tamper:
+                        connection.execute("UPDATE diff_review_attempts SET input_digest=?", ("f" * 64,))
+                legacy_path.replace(path)
+                if tamper:
+                    with self.assertRaisesRegex(StateError, "unauthenticated"):
+                        initialize(repository)
+                    with closing(sqlite3.connect(path)) as connection, connection:
+                        self.assertEqual(connection.execute("SELECT max(version) FROM schema_migrations").fetchone(), (67,))
+                    continue
+                self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+                dispatch = candidate_review._read_diff_dispatch(repository, identity, review.diff_review_attempt_id)
+                self.assertEqual((dispatch.input_digest, dispatch.digest_version), (legacy_input, 1))
+                if not accepted:
+                    replay = dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, implementation_attempt_id=review.implementation_attempt_id, provider_attempt_id=review.provider_attempt_id, supervisor_session_identity=review.supervisor_session_identity, external_turn_identity=review.external_turn_identity, message_identity=review.message_identity, process_lease_id="diff-accepted-lease", process_lease_expires_at=now + 60, review_round=policy.review_round, review_epoch=policy.review_epoch, lease=lease, now=now)
+                    self.assertEqual(replay, dispatch)
+                    result = record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=output, completion_evidence_fingerprint="c" * 64, lease=lease, now=now)
+                else:
+                    result = read_diff_review(repository, identity, review.diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.content_digest, legacy_output)
+                self.assertEqual(initialize(repository).version, len(MIGRATIONS))
 
     def test_accepted_diff_review_persists_a_profile_bound_output_digest(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1273,12 +1273,14 @@ def _require_clearance_record(connection, identity, record_digest: str, binding:
         raise FailureRecoveryError("legacy failure records cannot be cleared")
 
 
-def _append_clearance_decision(connection, identity, *, kind: str, record_digest: str, binding: FailureBinding, command_id: str, observed: int) -> str:
+def _append_clearance_decision(connection, identity, *, kind: str, record_digest: str, binding: FailureBinding, command_id: str, observed: int, requested_clearance_digest: str | None = None) -> str:
     history = _decision_history(connection, identity.task_id, record_digest, binding)
     predecessor = history[-1][0] if history else None
     prior_kind = history[-1][1]["kind"] if history else None
     if (kind == "clear" and prior_kind not in {None, "revoke"}) or (kind == "revoke" and prior_kind != "clear"):
         raise FailureRecoveryError("clearance decision is stale or out of order")
+    if kind == "revoke" and requested_clearance_digest != predecessor:
+        raise FailureRecoveryError("clearance revocation target is stale or substituted")
     receipt = _denial_command_receipt(
         connection, identity.task_id, record_digest, binding, command_id,
         kind=kind, expected_clearance_digest=predecessor if kind == "revoke" else None,
@@ -1335,7 +1337,7 @@ def record_durable_clearance_revocation(repository, identity, revocation: Cleara
         if row is None:
             raise FailureRecoveryError("clearance revocation clearance is unavailable")
         _require_clearance_record(connection, identity, row[0], revocation.binding)
-        digest = _append_clearance_decision(connection, identity, kind="revoke", record_digest=row[0], binding=revocation.binding, command_id=revocation.command_id, observed=observed)
+        digest = _append_clearance_decision(connection, identity, kind="revoke", record_digest=row[0], binding=revocation.binding, command_id=revocation.command_id, observed=observed, requested_clearance_digest=revocation.clearance_digest)
         connection.commit()
         return digest
     except Exception:

@@ -926,6 +926,25 @@ class ProviderRecoveryTests(unittest.TestCase):
                     repository, identity,
                     ClearanceRevocation(clearance_digest, binding, "owner-revoke-wrong-clearance"),
                 )
+            self.denial_command(repository, identity, record, "revoke-first", kind="revoke")
+            first_revocation = ClearanceRevocation(clearance_digest, binding, "revoke-first")
+            record_durable_clearance_revocation(repository, identity, first_revocation)
+            self.denial_command(repository, identity, record, "clear-second", kind="clear")
+            second = record_durable_clearance(repository, identity, Clearance(record.digest, binding, "clear-second"))
+            self.denial_command(repository, identity, record, "revoke-second", kind="revoke")
+            for request in (ClearanceRevocation(clearance_digest, binding, "revoke-second"),
+                            ClearanceRevocation(second, binding, "revoke-first"), first_revocation):
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    before = connection.execute("SELECT * FROM denial_clearance_decisions").fetchall()
+                with self.assertRaises(Exception):
+                    record_durable_clearance_revocation(repository, identity, request)
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertEqual(connection.execute("SELECT * FROM denial_clearance_decisions").fetchall(), before)
+                    require_scope_open(connection, identity.task_id, binding.authority_scope)
+            exact = ClearanceRevocation(second, binding, "revoke-second")
+            record_durable_clearance_revocation(repository, identity, exact)
+            with self.assertRaises(Exception):
+                record_durable_clearance_revocation(repository, identity, exact)
 
     def test_durable_routes_reject_legacy_and_unavailable_sources_before_any_effect(self) -> None:
         from roundwright.failure_recovery import EvidenceConfidence, FailureRecoveryError, _payload

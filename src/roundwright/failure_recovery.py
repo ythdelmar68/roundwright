@@ -402,6 +402,11 @@ def _read_route_source(connection, identity, record_digest: str, binding: Failur
         raise FailureRecoveryError("durable recovery route source is malformed") from error
     if record.digest != record_digest or record.binding != binding:
         raise FailureRecoveryError("durable recovery route source has drifted")
+    _require_failure_compatibility(record)
+    if (record.record_schema != "roundwright-failure-recovery/v3"
+            or record.evidence_confidence is not EvidenceConfidence.VERIFIED
+            or record.failure is FailureClass.UNKNOWN):
+        raise FailureRecoveryError("durable recovery route requires current verified evidence")
     _require_attempt_admission(connection, identity, binding)
     return record
 

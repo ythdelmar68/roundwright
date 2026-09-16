@@ -927,6 +927,61 @@ class ProviderRecoveryTests(unittest.TestCase):
                     ClearanceRevocation(clearance_digest, binding, "owner-revoke-wrong-clearance"),
                 )
 
+    def test_durable_routes_reject_legacy_and_unavailable_sources_before_any_effect(self) -> None:
+        from roundwright.failure_recovery import EvidenceConfidence, FailureRecoveryError, _payload
+        for variant in ("v1-unavailable", "v2-verified", "v3-unknown"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary)); initialize(repository)
+                lease = self.lease(repository); identity = self.identity("legacy-route"); self.admit(repository, identity, lease)
+                candidate = "c" * 40; self.seal_candidate(repository, identity, lease, candidate)
+                context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+                prepare_attempt(repository, identity, context, attempt_id="legacy-source", role=ProviderRole.SUPERVISOR,
+                                process_lease_id="legacy-lease", process_lease_expires_at=int(time.time()) + 100, input_fingerprint="a" * 64, lease=lease)
+                record_session_identity(repository, identity, context, attempt_id="legacy-source", session_identity="legacy-session", lease=lease)
+                binding = FailureBinding(candidate, "sha256:" + context.policy_fingerprint, context.runtime_binding.resolved_digest,
+                                         "supervisor:" + identity.task_id, FailureRole.SUPERVISOR, context.runtime_binding.supervisor_profile_identities[0],
+                                         "legacy-session", "legacy-source")
+                record = classify(binding, FailureClass.SESSION_TERMINATED, EvidenceSource.VERIFIED_LIFECYCLE)
+                if variant == "v1-unavailable":
+                    record = replace(record, record_schema="roundwright-failure-recovery/v1", evidence_confidence=EvidenceConfidence.UNAVAILABLE)
+                elif variant == "v2-verified":
+                    record = replace(record, record_schema="roundwright-failure-recovery/v2")
+                else:
+                    record = classify(binding, FailureClass.UNKNOWN, EvidenceSource.UNAVAILABLE)
+                values = dict(record_digest=record.digest, binding=binding, target_role=FailureRole.SUPERVISOR,
+                              target_profile_digest=context.runtime_binding.supervisor_profile_identities[1], target_route_digest="sha256:" + "d" * 64,
+                              coordinate_digest="sha256:" + "e" * 64, remaining_budget_digest="sha256:" + "f" * 64)
+                canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"))
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    connection.execute("INSERT INTO failure_recovery_records(record_digest,task_id,record_json,recorded_at) VALUES (?,?,?,?)",
+                                       (record.digest, identity.task_id, canonical(_payload(record)), 100))
+                    connection.commit()
+                with self.assertRaises(FailureRecoveryError):
+                    issue_durable_recovery_route_authorization(repository, identity, **values)
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertEqual(connection.execute("SELECT count(*) FROM recovery_route_authorizations").fetchone(), (0,))
+                    # Retained pre-repair route fixture: coherent identity, no
+                    # implementation bypass used to issue it during the test.
+                    route_payload = {"schema": "roundwright-durable-recovery-route/v1", **values,
+                                     "binding": _payload(record)["binding"], "target_role": "supervisor"}
+                    route_id = "sha256:" + hashlib.sha256(canonical(route_payload).encode()).hexdigest()
+                    connection.execute("INSERT INTO recovery_route_authorizations(route_digest,task_id,repository_id,record_digest,binding_json,target_role,target_profile_digest,target_route_digest,coordinate_digest,remaining_budget_digest,state,reservation_digest,issued_at,consumed_at) VALUES (?,?,?,?,?,?,?,?,?,?,'issued',NULL,100,NULL)",
+                                       (route_id, identity.task_id, identity.repository_id, record.digest, canonical(route_payload["binding"]), "supervisor", values["target_profile_digest"], values["target_route_digest"], values["coordinate_digest"], values["remaining_budget_digest"]))
+                    connection.commit()
+                    before = tuple(connection.execute("SELECT * FROM " + table).fetchall() for table in
+                                   ("recovery_route_authorizations", "provider_attempts", "provider_dispatch_claims", "recovery_route_successor_admissions"))
+                authorization = DurableRecoveryRouteAuthorization(route_id, **values)
+                with self.assertRaises(FailureRecoveryError):
+                    read_durable_recovery_route_authorization(repository, identity, route_id)
+                target = {key: values[key] for key in ("target_role", "target_profile_digest", "target_route_digest", "coordinate_digest", "remaining_budget_digest")}
+                for operation in (begin_durable_recovery_route_reservation, consume_durable_recovery_route_authorization):
+                    with self.assertRaises(FailureRecoveryError):
+                        operation(repository, identity, authorization, reservation_digest="sha256:" + "2" * 64, **target)
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    after = tuple(connection.execute("SELECT * FROM " + table).fetchall() for table in
+                                  ("recovery_route_authorizations", "provider_attempts", "provider_dispatch_claims", "recovery_route_successor_admissions"))
+                self.assertEqual(before, after)
+
     def test_durable_recovery_route_is_exact_single_use_and_restart_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary)); initialize(repository)

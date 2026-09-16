@@ -677,7 +677,8 @@ class SupervisorTests(unittest.TestCase):
     def native_sequence(self, modes):
         """Inject SDK handles, retaining the product session/schema/parser/adapter."""
         from roundwright.supervisor_toolbox import _Session
-        fixture = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * len(modes))
+        coordinates = tuple((self.profiles[0], 1, index) if index < 3 else (self.profiles[1], 2, 0) for index in range(len(modes)))
+        fixture = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * len(modes), coordinates=coordinates)
         adapters, requests, *rest = fixture
         converted = []
         for adapter, mode in zip(adapters, modes, strict=True):
@@ -742,14 +743,15 @@ class SupervisorTests(unittest.TestCase):
     def test_native_corrections_cross_schema_parser_adapter_and_durable_lifecycle(self):
         for modes in (("legacy",), ("syntax", "pass"), ("shape", "syntax", "pass"),
                       ("syntax", "shape", "syntax"), ("syntax", "substitute", "pass"),
-                      ("syntax", "legacy", "pass"), ("boolean", "pass")):
+                      ("syntax", "legacy", "pass"), ("boolean", "pass"), ("syntax", "shape", "syntax", "pass")):
             with self.subTest(modes=modes), TemporaryDirectory() as directory:
                 fixture = list(self.native_sequence(modes))
                 fixture[5] = FileSupervisorLifecycle(Path(directory), digest("native-lifecycle"))
                 result = self.qualify_fixture(fixture)
-                accepted = modes[-1] in {"pass", "legacy"}
-                self.assertEqual(result.envelope.terminal.value, "accepted" if accepted else "exhausted")
-                self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [1] * len(modes))
+                accepted = len(modes) <= 3 and modes[-1] in {"pass", "legacy"}
+                self.assertEqual(result.envelope.terminal.value, "invalid" if len(modes) == 4 else "accepted" if accepted else "exhausted")
+                self.assertEqual(result.failover.exhausted, not accepted)
+                self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [1] * min(3, len(modes)) + ([0] if len(modes) == 4 else []))
                 self.assertEqual(set(result.failover.attempted_profile_identities), {fixture[0][0].profile_identity})
                 # Read the exact persisted record through a new file-store instance.
                 record_dir = next(Path(directory).glob("record-*"))
@@ -958,10 +960,7 @@ class SupervisorTests(unittest.TestCase):
         class ProcessDeath(BaseException): pass
         for boundary in ("plan", "fence", "budget", "admission", "dispatch", "admission-drift", "budget-drift", "claim-drift"):
             with self.subTest(boundary=boundary), TemporaryDirectory() as directory:
-                adapters, requests, readiness, binding, policy, _, recorder = self.sequence_fixture((
-                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
-                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
-                ))
+                adapters, requests, readiness, binding, policy, _, recorder = self.native_sequence(("shape", "pass"))
                 lifecycle = FileSupervisorLifecycle(Path(directory), digest("crash-lifecycle"))
                 def exercise(run, repository, budget):
                     if boundary == "plan":

@@ -28,7 +28,7 @@ from .worker_toolbox import CompletionDeadline, _bounded_events, _close, _field,
 def _schema(contract: SupervisorResponseContract = SupervisorResponseContract.VERDICT) -> dict[str, object]:
     if contract is SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING:
         return {"type": "object", "properties": {"status": {"type": "string", "enum": ["complete", "blocked"]}, "action": {"type": "string", "enum": ["accept-formal-review", "retain-terminal-product-block"]}, "blocker": {"type": ["string", "null"], "enum": ["provider-accounting-incomplete", None]}}, "required": ["status", "action", "blocker"], "additionalProperties": False}
-    return {"type": "object", "properties": {"verdict": {"type": "string", "enum": ["pass", "findings"]}, "findings": {"type": "array", "items": {"type": "string"}, "maxItems": 32}, "binding": {"type": "object", "properties": {"input_digest": {"type": "string"}, "candidate_sha": {"type": "string"}, "within_round_attempt": {"type": "integer"}, "profile_identity": {"type": "string"}}, "required": ["input_digest", "candidate_sha", "within_round_attempt", "profile_identity"], "additionalProperties": False}}, "required": ["verdict", "findings", "binding"], "additionalProperties": False}
+    return {"type": "object", "properties": {"verdict": {"type": "string", "enum": ["pass", "findings"]}, "findings": {"type": "array", "items": {"type": "string"}, "maxItems": 32}, "binding": {"type": "object", "properties": {"input_digest": {"type": "string"}, "candidate_sha": {"type": "string"}, "logical_profile_position": {"type": "integer", "minimum": 1}, "physical_format_output_ordinal": {"type": "integer", "minimum": 0, "maximum": 2}, "profile_identity": {"type": "string"}}, "required": ["input_digest", "candidate_sha", "logical_profile_position", "physical_format_output_ordinal", "profile_identity"], "additionalProperties": False}}, "required": ["verdict", "findings", "binding"], "additionalProperties": False}
 
 
 class HarnessNativeCodexSupervisorBackend(NativeCodexSupervisorBackend):
@@ -214,7 +214,14 @@ def _consume(handle: object, completion: CompletionDeadline, clock: Callable[[],
                 return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE)
             return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, parsed)
         binding = parsed.get("binding") if type(parsed) is dict else None
-        if type(parsed) is not dict or set(parsed) != {"verdict", "findings", "binding"} or parsed.get("verdict") not in {"pass", "findings"} or type(parsed.get("findings")) is not list or type(binding) is not dict or set(binding) != {"input_digest", "candidate_sha", "within_round_attempt", "profile_identity"} or type(binding["input_digest"]) is not str or type(binding["candidate_sha"]) is not str or type(binding["within_round_attempt"]) is not int or type(binding["profile_identity"]) is not str:
+        common = {"input_digest", "candidate_sha", "profile_identity"}
+        coordinates = ({"logical_profile_position", "physical_format_output_ordinal"}, {"within_round_attempt"})
+        if (type(parsed) is not dict or set(parsed) != {"verdict", "findings", "binding"}
+                or parsed.get("verdict") not in {"pass", "findings"}
+                or type(parsed.get("findings")) is not list or type(binding) is not dict
+                or not any(set(binding) == common | fields for fields in coordinates)
+                or any(type(binding[key]) is not str for key in common)
+                or any(type(binding[key]) is not int for key in set(binding) - common)):
             return NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE)
         return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, parsed)
     except TimeoutError:

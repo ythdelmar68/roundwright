@@ -588,7 +588,11 @@ def _output(value: object, request: CodexSupervisorRequest) -> tuple[SupervisorV
     legacy_binding = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity}
     if type(value) is dict and set(value) == {"verdict", "findings", "binding"} and type(value.get("binding")) is dict and frozenset(value["binding"]) in {frozenset(binding), frozenset(legacy_binding)} and value["binding"].get("candidate_sha") != binding["candidate_sha"]:
         raise _CandidateBindingDrift("Supervisor output candidate has drifted")
-    accepted_binding = value.get("binding") == binding or (request.physical_format_output_ordinal == 0 and value.get("binding") == legacy_binding)
+    supplied = value.get("binding") if type(value) is dict else None
+    accepted_binding = (type(supplied) is dict
+                        and all(type(supplied[key]) is type(expected) for key, expected in binding.items() if key in supplied)
+                        and ("within_round_attempt" not in supplied or type(supplied["within_round_attempt"]) is int)
+                        and (supplied == binding or (request.physical_format_output_ordinal == 0 and supplied == legacy_binding)))
     if type(value) is not dict or set(value) != {"verdict", "findings", "binding"} or type(value["verdict"]) is not str or type(value["findings"]) is not list or any(not _token(item) for item in value["findings"]) or not accepted_binding:
         raise CodexSupervisorError("Supervisor output is malformed")
     try:

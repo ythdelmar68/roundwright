@@ -152,7 +152,16 @@ def qualify_supervisor_sequence(adapters, requests, advisory_executions, *args, 
             )
             supplied_turn(session_identity, turn_identity)
 
-        def run():
+        def run(*, new_attempt=False):
+            if new_attempt:
+                return prepare_attempt(
+                    repository, identity, recoveries[requests[0].provider_attempt_id],
+                    attempt_id="new-review-identity", role=ProviderRole.SUPERVISOR,
+                    process_lease_id="new-review-lease", process_lease_expires_at=int(time.time()) + 100,
+                    input_fingerprint="e" * 64, selected_profile_identity=requests[0].selected_profile_identity,
+                    logical_profile_position=1, physical_format_output_ordinal=0,
+                    review_epoch=context.review_epoch, review_round=context.review_round + 1, lease=lease,
+                )
             return _qualify_supervisor_sequence(
                 adapters, requests, advisory_executions, *args,
                 repository=repository, task_identity=identity,
@@ -665,6 +674,133 @@ class SupervisorTests(unittest.TestCase):
     def runtime_store(self):
         return InMemorySupervisorRuntimeStore(self.configuration.runtime_store_authority_identity)
 
+    def native_sequence(self, modes):
+        """Inject SDK handles, retaining the product session/schema/parser/adapter."""
+        from roundwright.supervisor_toolbox import _Session
+        fixture = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * len(modes))
+        adapters, requests, *rest = fixture
+        converted = []
+        for adapter, mode in zip(adapters, modes, strict=True):
+            profile, identity = adapter._profile, adapter._backend.identity
+            class FixtureLaunch:
+                # Internal SDK fixture below the intentionally disabled native
+                # launch gate. No production activation or launch authorization.
+                def __init__(inner, profile): inner.profile = profile
+                def verify(inner, *, cwd, profile, required_capability):
+                    self.assertEqual(required_capability.value, "read-only-review")
+                    self.assertEqual((cwd, profile), (ROOT, inner.profile))
+            class NativeBackend:
+                def __init__(inner, profile, identity, mode, launch):
+                    inner.profile, inner.identity, inner.mode, inner.launch = profile, identity, mode, launch
+                    inner.calls = 0
+                def open_fresh_session(inner, profile):
+                    inner.calls += 1
+                    class Handle:
+                        id = "turn-" + inner.identity
+                        def stream(handle):
+                            if inner.mode == "denial":
+                                return iter(({"method": "turn/completed", "payload": {"turn": {"id": handle.id, "status": "failed", "error": {"codexErrorInfo": "sandboxError", "message": "private denial"}}}},))
+                            return iter((
+                                {"method": "item/completed", "payload": {"turn_id": handle.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": handle.text}}},
+                                {"method": "turn/completed", "payload": {"turn": {"id": handle.id, "status": "completed"}}},
+                            ))
+                    class Thread:
+                        id = "session-" + inner.identity
+                        def turn(thread, prompt, **controls):
+                            material = json.loads(prompt)["review_material"]
+                            keys = controls["output_schema"]["properties"]["binding"]["required"]
+                            self.assertEqual(set(keys), {"input_digest", "candidate_sha", "profile_identity", "logical_profile_position", "physical_format_output_ordinal"})
+                            binding = {key: material[key] for key in keys}
+                            if inner.mode == "substitute":
+                                binding["input_digest"] = requests[0].input_digest
+                                binding["physical_format_output_ordinal"] = 0
+                            elif inner.mode == "boolean":
+                                binding["logical_profile_position"] = True
+                            elif inner.mode == "legacy":
+                                binding["within_round_attempt"] = binding.pop("logical_profile_position")
+                                binding.pop("physical_format_output_ordinal")
+                            handle = Handle()
+                            handle.text = ("not-json" if inner.mode == "syntax" else "{}" if inner.mode == "shape"
+                                           else json.dumps({"verdict": "pass", "findings": [], "binding": binding}))
+                            return handle
+                    return _Session(Thread(), object(), ROOT, profile, "deny-all", "read-only", lambda value: value,
+                                    CompletionDeadline(100, 600), time.monotonic, inner.launch)
+            converted.append(CodexSupervisorAdapter(NativeBackend(profile, identity, mode, FixtureLaunch(profile)), profile, adapter._audit))
+        return (tuple(converted), requests, *rest)
+
+    def qualify_fixture(self, fixture, **kwargs):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = fixture
+        return qualify_supervisor_sequence(
+            adapters, requests, self.admissions(adapters, requests), readiness, binding, policy, lifecycle, recorder,
+            evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+            trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+            review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store,
+            review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _: None,
+            checkpoint_turn=lambda *_: None, **kwargs,
+        )
+
+    def test_native_corrections_cross_schema_parser_adapter_and_durable_lifecycle(self):
+        for modes in (("legacy",), ("syntax", "pass"), ("shape", "syntax", "pass"),
+                      ("syntax", "shape", "syntax"), ("syntax", "substitute", "pass"),
+                      ("syntax", "legacy", "pass"), ("boolean", "pass")):
+            with self.subTest(modes=modes), TemporaryDirectory() as directory:
+                fixture = list(self.native_sequence(modes))
+                fixture[5] = FileSupervisorLifecycle(Path(directory), digest("native-lifecycle"))
+                result = self.qualify_fixture(fixture)
+                accepted = modes[-1] in {"pass", "legacy"}
+                self.assertEqual(result.envelope.terminal.value, "accepted" if accepted else "exhausted")
+                self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [1] * len(modes))
+                self.assertEqual(set(result.failover.attempted_profile_identities), {fixture[0][0].profile_identity})
+                # Read the exact persisted record through a new file-store instance.
+                record_dir = next(Path(directory).glob("record-*"))
+                durable = FileSupervisorLifecycle(Path(directory), digest("native-lifecycle")).read(
+                    "sha256:" + record_dir.name.removeprefix("record-"), evidence_time=101)
+                self.assertTrue(durable.expected_plan.schema.endswith("/v3"))
+                self.assertEqual(durable.terminal.terminal, result.envelope.terminal.value)
+
+    def test_native_denial_persists_scope_stop_before_terminal_and_restart(self):
+        from roundwright.failure_recovery import FailureRecoveryError, FailureClass, parse_failure_record, require_scope_open
+        for crash in (False, True):
+            with self.subTest(crash=crash), TemporaryDirectory() as directory:
+                fixture = list(self.native_sequence(("denial", "pass")))
+                fixture[5] = FileSupervisorLifecycle(Path(directory), digest("denial-lifecycle"))
+                class ProcessDeath(BaseException): pass
+                def exercise(run, repository, budget):
+                    if crash:
+                        with patch.object(fixture[5], "append", side_effect=ProcessDeath):
+                            with self.assertRaises(ProcessDeath): run()
+                    else:
+                        result = run()
+                        self.assertEqual((result.envelope.terminal.value, result.envelope.blocker, result.comparison.disposition.value),
+                                         ("blocked", "provider-outcome-blocked", "match"))
+                        self.assertEqual(fixture[6].calls, ["prepare"])
+                        record_dir = next(Path(directory).glob("record-*"))
+                        durable = FileSupervisorLifecycle(Path(directory), digest("denial-lifecycle")).read(
+                            "sha256:" + record_dir.name.removeprefix("record-"), evidence_time=101)
+                        self.assertEqual(durable.terminal.terminal, "blocked")
+                    with closing(sqlite3.connect(database_path(repository))) as connection:
+                        rows = connection.execute("SELECT record_json FROM failure_recovery_records").fetchall()
+                        self.assertEqual(len(rows), 1)
+                        decision = parse_failure_record(json.loads(rows[0][0]))
+                        self.assertIs(decision.failure, FailureClass.HOST_SECURITY_DENIAL)
+                        self.assertNotIn("private denial", rows[0][0])
+                        with self.assertRaises(FailureRecoveryError):
+                            require_scope_open(connection, self.context.task_id, "supervisor:" + self.context.task_id)
+                    with closing(sqlite3.connect(budget)) as connection:
+                        before = connection.execute("SELECT * FROM role_budget_usage").fetchall()
+                    with self.assertRaises((FailureRecoveryError, SupervisorShadowError)): run()
+                    from roundwright.provider_recovery import ProviderRecoveryError
+                    with self.assertRaisesRegex(ProviderRecoveryError, "scope is stopped"):
+                        run(new_attempt=True)
+                    # The second pre-admitted attempt has another identity and no dispatch claim.
+                    from roundwright.supervisor_shadow import _require_durable_sequence_admission
+                    with self.assertRaises(FailureRecoveryError):
+                        _require_durable_sequence_admission(repository, TaskIdentity(self.context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright", "codex/supervisor-sequence", "C:/private/supervisor-sequence", self.context.base_sha), (fixture[1][1],), fixture[4])
+                    with closing(sqlite3.connect(budget)) as connection:
+                        self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+                    self.assertEqual([a._backend.calls for a in fixture[0]], [1, 0])
+                self.qualify_fixture(fixture, _exercise=exercise)
+
     def test_sequence_ambiguous_primary_is_terminal_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
@@ -934,6 +1070,64 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNot(value.expected_plan, plan)
         self.assertIsNot(value.events[0], event)
         self.assertIsNot(value.terminal, terminal)
+
+    def test_historical_v2_inflight_and_accepted_file_records_retain_exact_identities(self):
+        def canonical(value): return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        def hashed(value): return "sha256:" + hashlib.sha256(canonical(value).encode()).hexdigest()
+        _, _, readiness, binding, policy, _, _ = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        # Literal base/main v2 payload and hash vocabulary, independent of the
+        # current serializer. Write these retained bytes before any product read.
+        payload = {"schema": "roundwright-supervisor-expected-lifecycle/v2", "binding": binding.__dict__,
+                   "policy_digest": policy.policy_digest, "configuration_digest": policy.configuration_digest,
+                   "runtime_identity": digest("retained-runtime"), "ready_at": 10,
+                   "observation_identity": readiness.observation_identity,
+                   "allowed_terminal": ["accepted", "exhausted", "ambiguous", "incomplete"],
+                   "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted",
+                   "terminal_next_action": "retain-terminal-product-block"}
+        context = hashed({"task_id": binding.task_id, "base_sha": binding.base_sha, "candidate_sha": binding.candidate_sha,
+                          "requests": binding.request_identities, "profiles": binding.profile_identities, "runtime": binding.runtime_fingerprints,
+                          "epoch": binding.review_epoch, "round": binding.review_round, "mode": binding.review_mode, "capture_plan": binding.capture_plan_digest})
+        plan_id = hashed({**payload, "context_identity": context,
+                          "allowed_result_kinds": ["accepted", "blocked", "invalid", "incomplete", "ambiguous"], "attempt_budget": 3})
+        source = digest("retained-v2-source")
+        record_id = hashed({"source_identity": source, "plan_identity": plan_id, "observation_identity": readiness.observation_identity,
+                            "candidate_sha": binding.candidate_sha, "context_identity": context, "capture_plan_digest": binding.capture_plan_digest})
+        chain = SupervisorLifecycleChainBinding(record_id, source, readiness.observation_identity, binding.candidate_sha, context, plan_id, binding.capture_plan_digest, 10, 20)
+        prepared = LifecycleChainReceipt(chain, hashed(payload), hashed({"genesis": chain.binding_digest}), 0)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_dir = root / ("record-" + record_id.removeprefix("sha256:")); record_dir.mkdir()
+            (record_dir / "plan.json").write_text(canonical(payload), encoding="utf-8")
+            (record_dir / "plan-receipt.json").write_text(canonical(prepared.payload()), encoding="utf-8")
+            lifecycle = FileSupervisorLifecycle(root, source)
+            plan, read_receipt = lifecycle.read_plan(record_id, evidence_time=10)
+            self.assertEqual((plan.source_identity, plan.plan_identity, read_receipt), (hashed(payload), plan_id, prepared))
+            self.assertEqual(lifecycle.read_progress(record_id, evidence_time=10)[2:], ((), (), None, None))
+            invalid = SupervisorAttemptEvent(record_id, source, readiness.observation_identity, binding.candidate_sha, context, plan_id,
+                                              binding.capture_plan_digest, 1, prepared.receipt_digest, binding.request_identities[0],
+                                              binding.profile_identities[0], binding.runtime_fingerprints[0], "invalid", digest("retained-invalid"),
+                                              None, None, 10, 20)
+            invalid_receipt = lifecycle.append(record_id, invalid, evidence_time=10)
+            progress = FileSupervisorLifecycle(root, source).read_progress(record_id, evidence_time=10)
+            self.assertEqual((progress[0].plan_identity, progress[1], progress[2], progress[3], progress[4]),
+                             (plan_id, prepared, (invalid,), (invalid_receipt,), None))
+            event = SupervisorAttemptEvent(record_id, source, readiness.observation_identity, binding.candidate_sha, context, plan_id,
+                                            binding.capture_plan_digest, 2, invalid_receipt.receipt_digest, binding.request_identities[1],
+                                            binding.profile_identities[1], binding.runtime_fingerprints[1], "accepted", digest("retained-result"),
+                                            digest("retained-result"), "pass", 10, 20)
+            receipt = lifecycle.append(record_id, event, evidence_time=10)
+            terminal = SupervisorTerminalRecord(record_id, source, readiness.observation_identity, binding.candidate_sha, context, plan_id,
+                                                 binding.capture_plan_digest, receipt.receipt_digest, 2, "accepted", event.result_identity, None, "apply-bound-review-result", 10)
+            terminal_receipt = lifecycle.finalize(record_id, terminal, evidence_time=10)
+            retained = {path.name: path.read_bytes() for path in record_dir.iterdir()}
+            read = FileSupervisorLifecycle(root, source).read(record_id, evidence_time=10)
+            self.assertEqual((read.expected_plan.plan_identity, read.plan_receipt, read.terminal_receipt), (plan_id, prepared, terminal_receipt))
+            self.assertEqual({path.name: path.read_bytes() for path in record_dir.iterdir()}, retained)
+            for tampered in ({**payload, "allowed_terminal": payload["allowed_terminal"] + ["invalid"]},
+                             {**payload, "schema": "roundwright-supervisor-expected-lifecycle/v3"}):
+                (record_dir / "plan.json").write_text(canonical(tampered), encoding="utf-8")
+                with self.assertRaises(SupervisorShadowError):
+                    FileSupervisorLifecycle(root, source).read_plan(record_id, evidence_time=10)
 
     def test_legacy_v1_accepted_and_exhausted_records_retain_original_identities(self):
         _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)

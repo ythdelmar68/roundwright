@@ -19,7 +19,7 @@ from .runtime_binding import ExternalSupervisorRuntimeStore, FileSupervisorRunti
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recover_role_effect_reservation, recovery_reservation_digest
 from .state import TaskIdentity, _open_writable_connection, _require_matching_task, database_path, require_runtime_binding
 from .provider_recovery import RecoveryContext
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, begin_durable_recovery_route_reservation, classify_for_role, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, parse_failure_record, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, begin_durable_recovery_route_reservation, classify_for_role, classify_native_failure, require_scope_open, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, parse_failure_record, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
 
 
 SUPERVISOR_FAILOVER_PROFILE = "roundwright-shadow-profile/supervisor-review-failover/v1"
@@ -56,6 +56,7 @@ def _require_durable_sequence_admission(repository: RepositoryIdentity, identity
     except (OSError, sqlite3.DatabaseError) as error:
         raise SupervisorShadowError("Supervisor durable candidate admission is unavailable") from error
     try:
+        require_scope_open(connection, identity.task_id, "supervisor:" + identity.task_id)
         seal = connection.execute(
             "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id=?",
             (identity.task_id,),
@@ -193,6 +194,7 @@ class SupervisorSequenceTerminal(StrEnum):
     AMBIGUOUS = "ambiguous"
     INCOMPLETE = "incomplete"
     INVALID = "invalid"
+    BLOCKED = "blocked"
 
 
 @dataclass(frozen=True)
@@ -240,22 +242,23 @@ class ResolvedSupervisorSequencePolicy:
 class SupervisorExpectedLifecycle:
     """Policy-only envelope armed before provider events can exist."""
 
-    binding: SupervisorSequenceBinding; policy_digest: str; configuration_digest: str; runtime_identity: str; ready_at: int; observation_identity: str; schema: str = "roundwright-supervisor-expected-lifecycle/v2"
+    binding: SupervisorSequenceBinding; policy_digest: str; configuration_digest: str; runtime_identity: str; ready_at: int; observation_identity: str; schema: str = "roundwright-supervisor-expected-lifecycle/v3"
     def __post_init__(self) -> None:
-        if type(self.binding) is not SupervisorSequenceBinding or not all(_digest(value) for value in (self.policy_digest, self.configuration_digest, self.runtime_identity, self.observation_identity)) or type(self.ready_at) is not int or self.ready_at < 0 or self.schema not in {"roundwright-supervisor-expected-lifecycle/v1", "roundwright-supervisor-expected-lifecycle/v2"}:
+        if type(self.binding) is not SupervisorSequenceBinding or not all(_digest(value) for value in (self.policy_digest, self.configuration_digest, self.runtime_identity, self.observation_identity)) or type(self.ready_at) is not int or self.ready_at < 0 or self.schema not in {"roundwright-supervisor-expected-lifecycle/v1", "roundwright-supervisor-expected-lifecycle/v2", "roundwright-supervisor-expected-lifecycle/v3"}:
             raise SupervisorShadowError("Supervisor expected lifecycle is invalid")
     def payload(self) -> dict[str, object]:
         common = {"schema": self.schema, "binding": self.binding.__dict__.copy(), "policy_digest": self.policy_digest, "configuration_digest": self.configuration_digest, "runtime_identity": self.runtime_identity, "ready_at": self.ready_at, "observation_identity": self.observation_identity}
         if self.schema.endswith("/v1"):
             return {**common, "allowed_terminal": ("accepted", "exhausted"), "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "exhausted_next_action": "retain-terminal-product-block"}
-        return {**common, "allowed_terminal": ("accepted", "exhausted", "ambiguous", "incomplete", "invalid"), "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "terminal_next_action": "retain-terminal-product-block"}
+        return {**common, "allowed_terminal": (("accepted", "exhausted", "ambiguous", "incomplete") if self.schema.endswith("/v2") else ("accepted", "exhausted", "ambiguous", "incomplete", "invalid", "blocked")), "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted", "terminal_next_action": "retain-terminal-product-block"}
     @property
     def context_identity(self) -> str: return _hash({"task_id": self.binding.task_id, "base_sha": self.binding.base_sha, "candidate_sha": self.binding.candidate_sha, "requests": self.binding.request_identities, "profiles": self.binding.profile_identities, "runtime": self.binding.runtime_fingerprints, "epoch": self.binding.review_epoch, "round": self.binding.review_round, "mode": self.binding.review_mode, "capture_plan": self.binding.capture_plan_digest})
     @property
     def plan_identity(self) -> str:
         # V1 record identity is immutable historical evidence.  It predates
         # BLOCKED, so its result vocabulary must remain byte-for-byte stable.
-        kinds = ("accepted", "invalid", "incomplete", "ambiguous") if self.schema.endswith("/v1") else tuple(item.value for item in SupervisorResultKind)
+        kinds = (("accepted", "invalid", "incomplete", "ambiguous") if self.schema.endswith("/v1")
+                 else ("accepted", "blocked", "invalid", "incomplete", "ambiguous"))
         return _hash({**self.payload(), "context_identity": self.context_identity, "allowed_result_kinds": kinds, "attempt_budget": len(self.binding.profile_identities)})
     @property
     def source_identity(self) -> str: return _hash(self.payload())
@@ -283,8 +286,8 @@ class SupervisorTerminalRecord:
     record_identity: str; source_identity: str; observation_identity: str; candidate_sha: str; context_identity: str; plan_identity: str; capture_plan_digest: str; prior_digest: str; attempt_count: int; terminal: str; accepted_result_identity: str | None; blocker: str | None; next_action: str; ready_at: int
     def __post_init__(self) -> None:
         accepted = self.terminal == "accepted"
-        expected_blocker = {"exhausted": "attempt-budget-exhausted", "ambiguous": "provider-outcome-ambiguous", "incomplete": "provider-outcome-incomplete", "invalid": "provider-outcome-invalid"}.get(self.terminal)
-        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.plan_identity, self.capture_plan_digest, self.prior_digest)) or not _SHA.fullmatch(self.candidate_sha) or self.terminal not in {"accepted", "exhausted", "ambiguous", "incomplete", "invalid"} or type(self.attempt_count) is not int or self.attempt_count < 1 or type(self.ready_at) is not int or self.ready_at < 0 or (accepted and (not _digest(self.accepted_result_identity) or self.blocker is not None or self.next_action != "apply-bound-review-result")) or (not accepted and (self.accepted_result_identity is not None or self.blocker != expected_blocker or self.next_action != "retain-terminal-product-block")): raise SupervisorShadowError("Supervisor terminal record is invalid")
+        expected_blocker = {"exhausted": "attempt-budget-exhausted", "ambiguous": "provider-outcome-ambiguous", "incomplete": "provider-outcome-incomplete", "invalid": "provider-outcome-invalid", "blocked": "provider-outcome-blocked"}.get(self.terminal)
+        if not all(_digest(value) for value in (self.record_identity, self.source_identity, self.observation_identity, self.context_identity, self.plan_identity, self.capture_plan_digest, self.prior_digest)) or not _SHA.fullmatch(self.candidate_sha) or self.terminal not in {"accepted", "exhausted", "ambiguous", "incomplete", "invalid", "blocked"} or type(self.attempt_count) is not int or self.attempt_count < 1 or type(self.ready_at) is not int or self.ready_at < 0 or (accepted and (not _digest(self.accepted_result_identity) or self.blocker is not None or self.next_action != "apply-bound-review-result")) or (not accepted and (self.accepted_result_identity is not None or self.blocker != expected_blocker or self.next_action != "retain-terminal-product-block")): raise SupervisorShadowError("Supervisor terminal record is invalid")
 
 @dataclass(frozen=True)
 class LifecycleChainReceipt:
@@ -354,7 +357,7 @@ class CompleteSupervisorLifecycleRecord:
         if tuple(receipt.ordinal for receipt in receipts) != tuple(range(len(receipts))) or any(receipt.prior_digest != previous.receipt_digest for previous, receipt in zip(receipts, receipts[1:])) or self.terminal.prior_digest != receipts[-2].receipt_digest:
             raise SupervisorShadowError("Complete supervisor lifecycle chain is invalid")
         accepted = tuple(event for event in self.events if event.result_kind == SupervisorResultKind.ACCEPTED.value)
-        if (self.expected_plan.schema.endswith("/v1") and self.terminal.terminal not in {"accepted", "exhausted"}) or (self.terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(self.events) or self.terminal.accepted_result_identity != accepted[-1].result_identity)) or (self.terminal.terminal != "accepted" and accepted):
+        if (self.terminal.terminal not in self.expected_plan.payload()["allowed_terminal"]) or (self.terminal.terminal not in {"accepted", "exhausted"} and self.events[-1].result_kind != self.terminal.terminal) or (self.terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(self.events) or self.terminal.accepted_result_identity != accepted[-1].result_identity)) or (self.terminal.terminal != "accepted" and accepted):
             raise SupervisorShadowError("Complete supervisor lifecycle terminal is invalid")
 
 
@@ -486,6 +489,7 @@ class FileSupervisorLifecycle:
         terminal_receipt = LifecycleChainReceipt(binding, _hash(terminal.__dict__), terminal.prior_digest, len(events) + 1)
         if terminal.prior_digest != previous.receipt_digest or self._receipt(self._read_canonical(entries["terminal-receipt.json"])) != terminal_receipt:
             raise SupervisorShadowError("Supervisor file lifecycle terminal receipt was tampered")
+        CompleteSupervisorLifecycleRecord(plan, plan_receipt, tuple(events), terminal, terminal_receipt)
         return plan, plan_receipt, tuple(events), tuple(receipts), terminal, terminal_receipt
 
     @staticmethod
@@ -573,7 +577,7 @@ class FileSupervisorLifecycle:
         if (terminal.source_identity, terminal.observation_identity, terminal.candidate_sha, terminal.context_identity, terminal.plan_identity, terminal.capture_plan_digest, terminal.ready_at) != (plan_receipt.source_identity, plan_receipt.observation_identity, plan_receipt.candidate_sha, plan_receipt.context_identity, plan_receipt.plan_identity, plan_receipt.capture_plan_digest, plan_receipt.ready_at):
             raise SupervisorShadowError("Supervisor file lifecycle finalize is invalid")
         accepted = tuple(item for item in events if item.result_kind == SupervisorResultKind.ACCEPTED.value)
-        if (plan.schema.endswith("/v1") and terminal.terminal not in {"accepted", "exhausted"}) or (terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(events) or terminal.accepted_result_identity != accepted[-1].result_identity)) or (terminal.terminal != "accepted" and accepted):
+        if (terminal.terminal not in plan.payload()["allowed_terminal"]) or (terminal.terminal not in {"accepted", "exhausted"} and events[-1].result_kind != terminal.terminal) or (terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(events) or terminal.accepted_result_identity != accepted[-1].result_identity)) or (terminal.terminal != "accepted" and accepted):
             raise SupervisorShadowError("Supervisor file lifecycle finalize is invalid")
         receipt = LifecycleChainReceipt(plan_receipt.binding, _hash(terminal.__dict__), terminal.prior_digest, len(events) + 1)
         directory = self._record_dir(record_identity)
@@ -669,6 +673,7 @@ class InMemorySupervisorLifecycle:
         terminal_receipt = LifecycleChainReceipt(plan_receipt.binding, _hash(terminal.__dict__), terminal.prior_digest, len(events) + 1)
         if terminal.prior_digest != previous.receipt_digest or self._receipt(terminal_entry[1]) != terminal_receipt:
             raise SupervisorShadowError("Supervisor lifecycle terminal receipt was tampered")
+        CompleteSupervisorLifecycleRecord(plan, plan_receipt, tuple(events), terminal, terminal_receipt)
         return plan, plan_receipt, tuple(events), tuple(receipts), terminal, terminal_receipt
     def append(self, record_identity: str, event: SupervisorAttemptEvent, *, evidence_time: int) -> LifecycleChainReceipt:
         record = self._records.get(record_identity)
@@ -692,7 +697,8 @@ class InMemorySupervisorLifecycle:
         if (terminal.observation_identity, terminal.candidate_sha, terminal.context_identity, terminal.plan_identity, terminal.capture_plan_digest, terminal.ready_at) != (plan_receipt.observation_identity, plan_receipt.candidate_sha, plan_receipt.context_identity, plan_receipt.plan_identity, plan_receipt.capture_plan_digest, plan_receipt.ready_at): raise SupervisorShadowError("Supervisor lifecycle finalize is invalid")
         plan = self._plan(record["plan"])
         accepted = tuple(event for material, _receipt in events for event in (SupervisorAttemptEvent(**json.loads(material)),) if event.result_kind == SupervisorResultKind.ACCEPTED.value)
-        if (plan.schema.endswith("/v1") and terminal.terminal not in {"accepted", "exhausted"}) or (terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(events) or terminal.accepted_result_identity != accepted[-1].result_identity)) or (terminal.terminal != "accepted" and accepted): raise SupervisorShadowError("Supervisor lifecycle finalize is invalid")
+        last = SupervisorAttemptEvent(**json.loads(events[-1][0]))
+        if (terminal.terminal not in plan.payload()["allowed_terminal"]) or (terminal.terminal not in {"accepted", "exhausted"} and last.result_kind != terminal.terminal) or (terminal.terminal == "accepted" and (len(accepted) != 1 or accepted[-1].ordinal != len(events) or terminal.accepted_result_identity != accepted[-1].result_identity)) or (terminal.terminal != "accepted" and accepted): raise SupervisorShadowError("Supervisor lifecycle finalize is invalid")
         terminal_receipt = LifecycleChainReceipt(plan_receipt.binding, _hash(terminal.__dict__), terminal.prior_digest, len(events) + 1); record["terminal"] = (self._material(terminal.__dict__), self._material(terminal_receipt.payload())); return terminal_receipt
     def read_chain(self, record_identity: str, *, evidence_time: int) -> tuple[SupervisorExpectedLifecycle, LifecycleChainReceipt, tuple[SupervisorAttemptEvent, ...], SupervisorTerminalRecord, LifecycleChainReceipt]:
         record = self._records.get(record_identity)
@@ -735,7 +741,7 @@ class SupervisorSequenceEnvelope:
         elif self.terminal is SupervisorSequenceTerminal.EXHAUSTED:
             if len(self.attempts) != len(self.profile_identities) or accepted_attempts or self.accepted_ordinal is not None or self.accepted_result_identity is not None or self.accepted_verdict is not None or self.blocker != "attempt-budget-exhausted":
                 raise SupervisorShadowError("Supervisor exhausted sequence is invalid")
-        elif self.terminal in (SupervisorSequenceTerminal.AMBIGUOUS, SupervisorSequenceTerminal.INCOMPLETE, SupervisorSequenceTerminal.INVALID):
+        elif self.terminal in (SupervisorSequenceTerminal.AMBIGUOUS, SupervisorSequenceTerminal.INCOMPLETE, SupervisorSequenceTerminal.INVALID, SupervisorSequenceTerminal.BLOCKED):
             expected_kind = self.terminal.value
             if len(self.attempts) > len(self.profile_identities) or accepted_attempts or self.attempts[-1].result_kind != expected_kind or self.accepted_ordinal is not None or self.accepted_result_identity is not None or self.accepted_verdict is not None or self.blocker != f"provider-outcome-{expected_kind}" or self.next_action != "retain-terminal-product-block":
                 raise SupervisorShadowError("Supervisor terminal outcome sequence is invalid")
@@ -777,7 +783,7 @@ def export_supervisor_sequence(binding: SupervisorSequenceBinding, attempts: tup
     if failover.result is None:
         return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
     result = failover.result
-    if result.kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE, SupervisorResultKind.INVALID):
+    if result.kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE, SupervisorResultKind.INVALID, SupervisorResultKind.BLOCKED):
         return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal(result.kind.value), attempts, None, None, None, f"provider-outcome-{result.kind.value}", "retain-terminal-product-block")
     if result.kind is not SupervisorResultKind.ACCEPTED or result.verdict is None or len(attempts) > len(binding.profile_identities) or attempts[-1].result_kind != SupervisorResultKind.ACCEPTED.value or attempts[-1].verdict != result.verdict.value:
         raise SupervisorShadowError("Supervisor sequence accepted result is invalid")
@@ -793,7 +799,7 @@ def derive_expected_supervisor_sequence(binding: SupervisorSequenceBinding, poli
         if len(lifecycle_attempts) != policy.policy.max_supervisor_attempts_per_round or any(item.result_kind == SupervisorResultKind.ACCEPTED.value for item in lifecycle_attempts):
             raise SupervisorShadowError("Supervisor expected exhaustion is invalid")
         return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, lifecycle_attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
-    if lifecycle_result.result.kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE, SupervisorResultKind.INVALID):
+    if lifecycle_result.result.kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE, SupervisorResultKind.INVALID, SupervisorResultKind.BLOCKED):
         terminal = SupervisorSequenceTerminal(lifecycle_result.result.kind.value)
         if lifecycle_attempts[-1].result_kind != terminal.value:
             raise SupervisorShadowError("Supervisor expected terminal outcome is invalid")
@@ -817,7 +823,7 @@ def _durable_sequence_envelope(record: CompleteSupervisorLifecycleRecord) -> Sup
     if record.terminal.terminal == "accepted":
         accepted = attempts[-1]
         return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.ACCEPTED, attempts, accepted.ordinal, record.terminal.accepted_result_identity, accepted.verdict, None, "apply-bound-review-result")
-    if record.terminal.terminal in {"ambiguous", "incomplete", "invalid"}:
+    if record.terminal.terminal in {"ambiguous", "incomplete", "invalid", "blocked"}:
         terminal = SupervisorSequenceTerminal(record.terminal.terminal)
         return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, terminal, attempts, None, None, None, record.terminal.blocker, record.terminal.next_action)
     return SupervisorSequenceEnvelope(binding.task_id, binding.base_sha, binding.candidate_sha, binding.request_identities, binding.profile_identities, binding.runtime_fingerprints, binding.review_epoch, binding.review_round, binding.review_mode, binding.capture_plan_digest, SupervisorSequenceTerminal.EXHAUSTED, attempts, None, None, None, "attempt-budget-exhausted", "retain-terminal-product-block")
@@ -967,6 +973,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         try:
             connection.execute("BEGIN IMMEDIATE")
             _require_matching_task(connection, task_identity)
+            require_scope_open(connection, task_identity.task_id, "supervisor:" + task_identity.task_id)
             seal = connection.execute("SELECT base_sha, candidate_sha FROM candidate_seals WHERE task_id=?", (task_identity.task_id,)).fetchone()
             if seal != (task_identity.base_sha, request.context.candidate_sha):
                 raise SupervisorShadowError("Supervisor candidate admission has drifted")
@@ -983,6 +990,19 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
 
     def checkpoint_result(ordinal: int, request: CodexSupervisorRequest, result: CodexSupervisorResult) -> None:
         nonlocal prior
+        if result.kind is SupervisorResultKind.BLOCKED:
+            if result.session_identity is None or result.failure is None:
+                raise SupervisorShadowError("Supervisor typed blocked source is incomplete")
+            failure_binding = FailureBinding(
+                binding.candidate_sha, resolved_policy.policy_digest,
+                resolved_policy.configuration_digest, "supervisor:" + binding.task_id,
+                FailureRole.SUPERVISOR, request.selected_profile_identity,
+                result.session_identity, request.provider_attempt_id,
+            )
+            decision = classify_native_failure(FailureRole.SUPERVISOR, failure_binding, result.failure)
+            decision_digest = record_durable_failure(repository, task_identity, decision, now=evidence_time)
+            if read_durable_failure(repository, task_identity, decision_digest) != decision:
+                raise SupervisorShadowError("Supervisor blocked source decision has drifted")
         observed = _sequence_attempt(ordinal, request, result); observed_attempts.append(observed)
         event = SupervisorAttemptEvent(expected_receipt.record_identity, expected_receipt.source_identity, expected_receipt.observation_identity, expected_receipt.candidate_sha, expected_receipt.context_identity, expected_receipt.plan_identity, expected_receipt.capture_plan_digest, ordinal, prior.receipt_digest, request.input_digest, request.selected_profile_identity, adapters[ordinal - 1].runtime_fingerprint, result.kind.value, observed.result_identity, observed.result_identity if result.kind is SupervisorResultKind.ACCEPTED else None, observed.verdict, expected_receipt.ready_at, expected_receipt.freshness_until)
         try: prior = lifecycle.append(expected_receipt.record_identity, event, evidence_time=evidence_time)
@@ -1180,7 +1200,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
             terminal_kind, accepted_result_identity, blocker, next_action = "exhausted", None, "attempt-budget-exhausted", "retain-terminal-product-block"
         elif result.kind is SupervisorResultKind.ACCEPTED:
             terminal_kind, accepted_result_identity, blocker, next_action = "accepted", attempts[-1].result_identity, None, "apply-bound-review-result"
-        elif result.kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE, SupervisorResultKind.INVALID):
+        elif result.kind in (SupervisorResultKind.AMBIGUOUS, SupervisorResultKind.INCOMPLETE, SupervisorResultKind.INVALID, SupervisorResultKind.BLOCKED):
             terminal_kind, accepted_result_identity, blocker, next_action = result.kind.value, None, f"provider-outcome-{result.kind.value}", "retain-terminal-product-block"
         else:
             raise SupervisorShadowError("Supervisor sequence terminal outcome is invalid")

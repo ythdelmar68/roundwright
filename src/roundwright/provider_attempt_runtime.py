@@ -38,6 +38,7 @@ from .failure_recovery import (
     commit_durable_recovery_route_reservation,
     issue_durable_recovery_route_authorization,
     native_failure_class, parse_failure_record, read_durable_failure,
+    require_scope_effect_admission,
 )
 from .provider_health import CodexFailure
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, recovery_reservation_digest, recover_role_effect_reservation, reserve_role_effect, trusted_provider_launch_context
@@ -807,21 +808,17 @@ class DurableDiffReviewRunner:
         entries = self.preflight_checkpoint_prerequisites()
         first = entries[0]
         try:
-            current = read_attempt(
+            read_attempt(
                 self.repository, self.identity, first.selection.provider_attempt_id,
                 context=first.recovery, now=self.dispatch_control.now,
             )
         except ProviderRecoveryError:
             return self.materialize_prepared_snapshot(entries)
         try:
-            if current.state is AttemptState.PREPARED:
-                claim = read_supervisor_dispatch_claim(
-                    self.repository, self.identity, first.recovery,
-                    attempt_id=first.selection.provider_attempt_id,
-                )
-                if claim is SupervisorDispatchClaimState.UNCLAIMED:
-                    return self.materialize_prepared_snapshot(entries)
-            for entry in entries:
+            current = None
+            previous = None
+            prepared_seen = False
+            for position, entry in enumerate(entries):
                 try:
                     stored = read_attempt(
                         self.repository, self.identity, entry.selection.provider_attempt_id,
@@ -831,15 +828,59 @@ class DurableDiffReviewRunner:
                     # A later selection may correctly be absent after a
                     # terminal first attempt, but no existing row may drift.
                     continue
-                if stored.role is not ProviderRole.SUPERVISOR or stored.selected_profile_identity != entry.audit.profile_identity or stored.state not in {AttemptState.PREPARED, AttemptState.ACCEPTED, AttemptState.INVALIDATED, AttemptState.BLOCKED, AttemptState.AMBIGUOUS}:
+                selection = entry.selection
+                expected_input = preflight_diff_review_session_checkpoint(
+                    self.repository, self.identity, entry.recovery, self.binding, self.seal,
+                    dependency_binding=self.dependency_binding, control=self.dispatch_control,
+                    implementation_attempt_id=selection.implementation_attempt_id,
+                    provider_attempt_id=selection.provider_attempt_id,
+                    message_identity=selection.message_identity,
+                    process_lease_id=selection.process_lease_id,
+                    process_lease_expires_at=selection.process_lease_expires_at,
+                    selected_profile_identity=entry.audit.profile_identity,
+                    within_round_attempt=selection.resolved_logical_profile_position,
+                    review_round=self.review_round, review_epoch=self.review_epoch,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                if (prepared_seen
+                        or stored.role is not ProviderRole.SUPERVISOR
+                        or stored.selected_profile_identity != entry.audit.profile_identity
+                        or stored.input_fingerprint != expected_input
+                        or stored.process_lease_id != selection.process_lease_id
+                        or stored.process_lease_expires_at != selection.process_lease_expires_at
+                        or stored.logical_profile_position != selection.resolved_logical_profile_position
+                        or stored.physical_format_output_ordinal != selection.physical_format_output_ordinal
+                        or stored.state not in {AttemptState.PREPARED, AttemptState.ACCEPTED, AttemptState.INVALIDATED, AttemptState.BLOCKED, AttemptState.AMBIGUOUS}):
                     raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
-                if read_supervisor_dispatch_claim(
+                claim = read_supervisor_dispatch_claim(
                     self.repository, self.identity, entry.recovery,
                     attempt_id=entry.selection.provider_attempt_id,
-                ) is not SupervisorDispatchClaimState.CLAIMED:
+                )
+                if stored.state is AttemptState.PREPARED:
+                    if (claim is not SupervisorDispatchClaimState.UNCLAIMED
+                            or stored.session_identity is not None
+                            or stored.external_turn_identity is not None
+                            or stored.output_pointer is not None
+                            or stored.accepted_review_identity is not None):
+                        raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
+                    if position:
+                        predecessor = entries[position - 1].selection
+                        if (previous is None or previous.state is not AttemptState.INVALIDATED
+                                or selection.resolved_logical_profile_position != predecessor.resolved_logical_profile_position
+                                or selection.physical_format_output_ordinal != predecessor.physical_format_output_ordinal + 1
+                                or entry.audit.profile_identity != entries[position - 1].audit.profile_identity
+                                or not self._format_correction_is_durable(predecessor.provider_attempt_id)):
+                            raise ProviderAttemptRuntimeError("provider prepared correction is unauthenticated")
+                    prepared_seen = True
+                elif claim is not SupervisorDispatchClaimState.CLAIMED:
                     raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
+                current = stored
+                previous = stored
+            if current is None:
+                raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable")
             return current
-        except ProviderRecoveryError:
+        except (CandidateReviewError, GitIdentityError, ProviderRecoveryError):
             raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable") from None
 
     def _execute_selection(self, entry: DiffReviewSequenceEntry, *, recovery_route: object | None = None) -> tuple[str, bool]:
@@ -847,6 +888,17 @@ class DurableDiffReviewRunner:
 
         selection, recovery, audit, backend = entry.selection, entry.recovery, entry.audit, entry.backend
         runtime = recovery.runtime_binding
+        def require_effect_scope() -> None:
+            try:
+                require_scope_effect_admission(
+                    self.repository, self.identity, "supervisor:" + self.identity.task_id,
+                )
+            except Exception as error:
+                raise ProviderAttemptRuntimeError("provider attempt dispatch scope is stopped") from error
+
+        # A stopped correction is rejected before preflight can materialize an
+        # attempt and before the separate budget ledger can record a debit.
+        require_effect_scope()
         existing_prepared = False
         try:
             existing = read_attempt(
@@ -951,13 +1003,16 @@ class DurableDiffReviewRunner:
                             request_or_attempt_identity=selection.provider_attempt_id,
                             request_material=request_material, preflight_material=preflight_material,
                         )
-                        recovered.reject_recovery_route()
+                        abandon_durable_recovery_route_reservation(
+                            self.repository, self.identity, recovery_route,
+                            reservation_digest=reservation_digest,
+                            effect_reservation=recovered,
+                        )
                     except RoleCapabilityError:
-                        pass
-                    abandon_durable_recovery_route_reservation(
-                        self.repository, self.identity, recovery_route,
-                        reservation_digest=reservation_digest,
-                    )
+                        abandon_durable_recovery_route_reservation(
+                            self.repository, self.identity, recovery_route,
+                            reservation_digest=reservation_digest,
+                        )
                     route_reserved = begin_durable_recovery_route_reservation(
                         self.repository, self.identity, recovery_route,
                         reservation_digest=reservation_digest, target_role=FailureRole.SUPERVISOR,
@@ -994,9 +1049,11 @@ class DurableDiffReviewRunner:
         except (RoleCapabilityError, ProviderAttemptRuntimeError) as error:
             if recovery_route is not None and route_reserved:
                 try:
-                    if reservation is not None:
-                        reservation.reject_recovery_route()
-                    abandon_durable_recovery_route_reservation(self.repository, self.identity, recovery_route, reservation_digest=reservation_digest)
+                    abandon_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                        effect_reservation=reservation,
+                    )
                 except Exception:
                     pass
             raise ProviderAttemptRuntimeError("provider attempt budget admission is denied") from error
@@ -1014,10 +1071,10 @@ class DurableDiffReviewRunner:
         except Exception:
             if recovery_route is not None and route_reserved:
                 try:
-                    reservation.reject_recovery_route()
                     abandon_durable_recovery_route_reservation(
                         self.repository, self.identity, recovery_route,
                         reservation_digest=reservation_digest,
+                        effect_reservation=reservation,
                     )
                 except Exception:
                     pass
@@ -1125,6 +1182,7 @@ class DurableDiffReviewRunner:
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
                 advisory_execution=entry.advisory_execution,
                 effect_reservation=reservation,
+                scope_admission=require_effect_scope,
             )
         except CodexSupervisorCheckpointError as error:
             raise ProviderAttemptCheckpointFailure(

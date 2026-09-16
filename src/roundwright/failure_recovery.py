@@ -501,6 +501,10 @@ def begin_durable_recovery_route_reservation(
                     authorization.remaining_budget_digest)):
             raise FailureRecoveryError("durable recovery route reservation has drifted")
         _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
+        require_scope_open(
+            connection, identity.task_id,
+            authorization.target_role.value + ":" + identity.task_id,
+        )
         if row[8:] == ("issued", None):
             if connection.execute(
                 "UPDATE recovery_route_authorizations SET state='reserving', "
@@ -649,9 +653,14 @@ def _require_no_recovery_successor(connection, identity, authorization) -> None:
 
 def abandon_durable_recovery_route_reservation(
     repository, identity, authorization: DurableRecoveryRouteAuthorization, *,
-    reservation_digest: str,
+    reservation_digest: str, effect_reservation: object | None = None,
 ) -> None:
-    """Restore only a fenced, not-yet-admitted route during reconciliation."""
+    """Restore only a fenced, not-yet-admitted route during reconciliation.
+
+    When a budget row exists, its refund occurs while this function retains
+    the product ledger's ``BEGIN IMMEDIATE`` lock.  No retry can admit or
+    consume the route between the no-successor proof and the refund.
+    """
 
     from .state import _open_writable_connection, _require_matching_task
     if type(authorization) is not DurableRecoveryRouteAuthorization or not _DIGEST.fullmatch(reservation_digest):
@@ -675,6 +684,11 @@ def abandon_durable_recovery_route_reservation(
             raise FailureRecoveryError("durable recovery route abandonment has drifted")
         _read_route_source(connection, identity, authorization.record_digest, authorization.binding)
         _require_no_recovery_successor(connection, identity, authorization)
+        if effect_reservation is not None:
+            from .role_capability_policy import _release_exclusive_recovery_reservation
+            _release_exclusive_recovery_reservation(
+                effect_reservation, reservation_digest=reservation_digest,
+            )
         updated = connection.execute(
             "UPDATE recovery_route_authorizations SET state='issued', reservation_digest=NULL "
             "WHERE route_digest=? AND task_id=? AND state='reserving' AND reservation_digest=?",
@@ -1364,6 +1378,32 @@ def require_scope_open(connection, task_id: str, scope: str) -> None:
         history = _decision_history(connection, task_id, digest, record.binding)
         if not history or history[-1][1]["kind"] != "clear":
             raise FailureRecoveryError("failure scope remains stopped")
+
+
+def require_scope_effect_admission(repository, identity, scope: str) -> None:
+    """Linearize one effect boundary against durable scope decisions.
+
+    A plain read can race a concurrent STOP_SCOPE append.  Taking the product
+    ledger's immediate write lock makes this check the dispatch linearization
+    point: a denial committed first is observed, while a denial committed
+    later is ordered after this already-admitted boundary.  Callers repeat the
+    check at every native, checkpoint, and local-effect boundary.
+    """
+
+    from .state import _open_writable_connection, _require_matching_task
+    if not isinstance(scope, str):
+        raise FailureRecoveryError("failure scope is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        require_scope_open(connection, identity.task_id, scope)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource | FailureEvidence) -> FailureRecord:

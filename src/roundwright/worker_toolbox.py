@@ -49,7 +49,7 @@ from .coding_worker_state import (
 from .configuration import ProviderProfile, RepositoryIdentity
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import AttemptState, ProviderRole, RecoveryContext, read_attempt, record_external_turn, record_session_identity, recover_attempt
-from .failure_recovery import FailureBinding, FailureRole, classify_native_failure, read_durable_failure, record_durable_failure, require_scope_open
+from .failure_recovery import FailureBinding, FailureRole, classify_native_failure, read_durable_failure, record_durable_failure, require_scope_open, require_scope_effect_admission
 from .git_identity import TransitionLease
 from .state import TaskIdentity, _open_writable_connection
 from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
@@ -869,6 +869,16 @@ class ProductionWorkerFailureLifecycle:
         ):
             raise WorkerShadowError("production Worker attempt is not dispatchable")
 
+    def require_effect_scope(self) -> None:
+        """Serialize one Worker effect admission with same-scope denials."""
+
+        try:
+            require_scope_effect_admission(
+                self.repository, self.task_identity, "worker:" + self.task_identity.task_id,
+            )
+        except Exception as error:
+            raise WorkerShadowError("production Worker dispatch scope is stopped") from error
+
     def record_session(self, request: CodexWorkerRequest, session_identity: str) -> None:
         try:
             record_session_identity(
@@ -975,6 +985,7 @@ class ProductionCodingWorkerRuntime:
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
         self._failure_lifecycle.require_dispatchable(request, self._dispatch_receipt)
         request_material, preflight_material = self._adapter.effect_material(request)
+        self._failure_lifecycle.require_effect_scope()
         try:
             reservation = reserve_role_effect(
                 self._advisory_execution, host_inputs=self._execution_host,
@@ -1020,7 +1031,7 @@ class ProductionCodingWorkerRuntime:
             if state == "submitted": acknowledged_sequences.add(item.sequence)
 
         callback = execute if request.action is not WorkerAction.PLANNING else None
-        result = self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, effect_reservation=reservation)
+        result = self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, effect_reservation=reservation, scope_admission=self._failure_lifecycle.require_effect_scope)
         if result.kind is WorkerResultKind.BLOCKED:
             self._failure_lifecycle.record_terminal_failure(request, result)
         return result

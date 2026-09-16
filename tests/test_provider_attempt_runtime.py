@@ -562,6 +562,114 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(replace(restarted).execute(), (first.selection.provider_attempt_id, selection.provider_attempt_id))
             self.assertEqual((first.backend.calls, second.backend.calls), (1, 1))
 
+    def test_readiness_accepts_only_exact_unclaimed_prepared_correction(self) -> None:
+        """Validate resumes the same debit/checkpoint but rejects claim or binding drift."""
+
+        import roundwright.provider_attempt_runtime as runtime_module
+        class ProcessDeath(BaseException): pass
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner)
+            selection = replace(
+                runner.selection, diff_review_attempt_id="readiness-review",
+                provider_attempt_id="readiness-provider", message_identity="readiness-message",
+                process_lease_id="readiness-lease", physical_format_output_ordinal=1,
+            )
+            second = self.sequence_entry(
+                runner, selection=selection,
+                backend=Backend("readiness-correction", NativeSupervisorResponse(
+                    SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE,
+                ), []),
+            )
+            restarted = replace(runner, sequence=(first, second))
+            original = runtime_module.prepare_attempt
+            def interrupt(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    raise ProcessDeath
+                return result
+            with patch.object(runtime_module, "prepare_attempt", side_effect=interrupt), self.assertRaises(ProcessDeath):
+                restarted.execute()
+            before = read_attempt(repository, identity, selection.provider_attempt_id, context=recovery)
+            self.assertEqual((before.state, read_supervisor_dispatch_claim(
+                repository, identity, recovery, attempt_id=selection.provider_attempt_id,
+            )), (AttemptState.PREPARED, "unclaimed"))
+            self.assertEqual(restarted.validate_accounting_checkpoint(), before)
+            drifted = replace(
+                restarted, sequence=(first, replace(second, selection=replace(
+                    selection, message_identity="readiness-message-drift",
+                ))),
+            )
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "drifted"):
+                drifted.validate_accounting_checkpoint()
+            claim_supervisor_dispatch(
+                repository, identity, recovery, attempt_id=selection.provider_attempt_id,
+                lease=runner.lease, now=runner.dispatch_control.now,
+            )
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "drifted"):
+                restarted.validate_accounting_checkpoint()
+
+    def test_stopped_scope_rejects_correction_before_any_state_or_budget_change(self) -> None:
+        """A denied correction is inert across product and budget ledgers."""
+
+        from roundwright.failure_recovery import (
+            EvidenceSource, FailureBinding, FailureClass, FailureRole, classify,
+            record_durable_failure,
+        )
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            source = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            assert source.session_identity is not None
+            record_durable_failure(
+                repository, identity,
+                classify(FailureBinding(
+                    recovery.candidate_sha, "sha256:" + recovery.policy_fingerprint,
+                    recovery.runtime_binding.resolved_digest, "supervisor:" + identity.task_id,
+                    FailureRole.SUPERVISOR, first.audit.profile_identity,
+                    source.session_identity, source.attempt_id,
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+            )
+            selection = replace(
+                runner.selection, diff_review_attempt_id="denied-review",
+                provider_attempt_id="denied-provider", message_identity="denied-message",
+                process_lease_id="denied-lease", physical_format_output_ordinal=1,
+            )
+            backend = Backend("denied-correction", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), [])
+            denied = replace(runner, sequence=(first, self.sequence_entry(
+                runner, selection=selection, backend=backend,
+            )))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                product_before = {
+                    table: connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                    for table in (
+                        "provider_attempts", "supervisor_attempt_coordinates",
+                        "provider_dispatch_claims", "recovery_route_authorizations",
+                        "provider_invalid_outputs",
+                    )
+                }
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                budget_before = connection.execute("SELECT * FROM role_budget_usage ORDER BY 1").fetchall()
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "scope is stopped"):
+                denied.execute()
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual({
+                    table: connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                    for table in product_before
+                }, product_before)
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute("SELECT * FROM role_budget_usage ORDER BY 1").fetchall(), budget_before)
+            self.assertEqual(backend.calls, 0)
+
     def test_fallback_reserves_its_own_exact_binding_and_reconstructs_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, primary, repository, identity, recovery, _seal = self.durable_runner(

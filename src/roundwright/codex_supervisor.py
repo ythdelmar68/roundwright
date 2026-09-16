@@ -309,8 +309,10 @@ class CodexSupervisorAdapter:
             },
         )
 
-    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, effect_reservation: TrustedRoleEffectReservation) -> CodexSupervisorResult:
-        if type(request) is not CodexSupervisorRequest or request.selected_profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
+    def dispatch(self, request: CodexSupervisorRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, effect_reservation: TrustedRoleEffectReservation, scope_admission: Callable[[], None] | None = None) -> CodexSupervisorResult:
+        if (type(request) is not CodexSupervisorRequest or request.selected_profile_identity != self.profile_identity
+                or not callable(checkpoint_session) or not callable(checkpoint_turn)
+                or (scope_admission is not None and not callable(scope_admission))):
             raise CodexSupervisorError("Supervisor dispatch is invalid")
         if (type(advisory_execution) is not SealedRoleExecution
                 or advisory_execution.seam is not RoleExecutionSeam.SUPERVISOR
@@ -320,12 +322,18 @@ class CodexSupervisorAdapter:
             request_material, preflight_material = self.effect_material(request)
 
             def admit() -> dict[str, object]:
-                return effect_reservation.require_before_effect(
+                receipt = effect_reservation.require_before_effect(
                     advisory_execution, profile=self._profile,
                     request_or_attempt_identity=request.provider_attempt_id,
                     request_material=request_material,
                     preflight_material=preflight_material,
                 )
+                if scope_admission is not None:
+                    try:
+                        scope_admission()
+                    except Exception as error:
+                        raise CodexSupervisorError("Supervisor durable scope admission is denied") from error
+                return receipt
 
             admit()
         except RoleCapabilityError as error:
@@ -420,11 +428,15 @@ class SupervisorFallbackAuthorization:
     consume: Callable[[TrustedRoleEffectReservation], None]
     prepare: Callable[[], bool | None] | None = None
     abandon: Callable[[], None] | None = None
+    release: Callable[[TrustedRoleEffectReservation], None] | None = None
 
     def __post_init__(self) -> None:
         if (not _DIGEST.fullmatch(self.source_request_identity)
                 or not _DIGEST.fullmatch(self.target_request_identity)
-                or not callable(self.consume)):
+                or not callable(self.consume)
+                or (self.prepare is not None and not callable(self.prepare))
+                or (self.abandon is not None and not callable(self.abandon))
+                or (self.release is not None and not callable(self.release))):
             raise CodexSupervisorError("Supervisor fallback authorization is invalid")
 
 
@@ -510,10 +522,14 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
             except Exception as error:
                 # Only refund after durable read-back proves no admission
                 # committed. An exception can occur after the commit itself.
-                if pending_authorization.abandon is not None:
+                if pending_authorization.release is not None:
+                    try:
+                        pending_authorization.release(effect_reservation)
+                    except Exception:
+                        pass
+                elif pending_authorization.abandon is not None:
                     try:
                         pending_authorization.abandon()
-                        effect_reservation.reject_recovery_route()
                     except Exception:
                         pass
                 raise CodexSupervisorError("Supervisor fallback route consumption is denied") from error

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import sys
 import tempfile
 import time
@@ -15,10 +16,10 @@ from types import MappingProxyType, SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerRequest, NativeWorkerToolResult, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
+from roundwright.codex_worker import BoundedWorkerToolSurface, CodexWorkerAdapter, CodexWorkerContext, CodexWorkerError, CodexWorkerRequest, NativeWorkerResponse, NativeWorkerToolResult, WorkerAction, WorkerCapabilityContract, WorkerOutcomeSource, WorkerParserDiagnostic, WorkerResultKind, WorkerSdkTurnErrorCategory, WorkerTool, worker_request_digest
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.role_capability_policy import AdvisoryRole, RoleCapabilityError, trusted_provider_launch_context
+from roundwright.role_capability_policy import AdvisoryRole, RoleCapabilityError, reserve_role_effect, trusted_provider_launch_context
 from roundwright.shadow import RecorderBinding
 from roundwright.worker_shadow import WorkerQualificationBinding, require_worker_shadow_capture_readiness
 from roundwright.worker_toolbox import CompletionDeadline, HarnessExternalWorkerRecorder, HarnessNativeCodexWorkerBackend, run_bounded_worker_adapter_qualification
@@ -181,6 +182,85 @@ class WorkerToolboxTests(unittest.TestCase):
                 action=WorkerAction.PLANNING,
             )
         self.assertEqual(self.events, [])
+
+    def test_scope_fence_rechecks_after_reservation_before_worker_session(self):
+        """A denial ordered after preflight still wins before provider effects."""
+
+        class Backend:
+            def __init__(inner): inner.calls = 0
+            def open_session(inner, *_args, **_kwargs):
+                inner.calls += 1
+                raise AssertionError("scope denial must precede native session construction")
+
+        backend = Backend()
+        adapter = CodexWorkerAdapter(backend, self.profile, self.audit, BoundedWorkerToolSurface(()))
+        with tempfile.TemporaryDirectory() as temporary:
+            trust = self.effect_kwargs(backend, Path(temporary))
+            request_material, preflight_material = adapter.effect_material(self.request)
+            reservation = reserve_role_effect(
+                trust["advisory_execution"], host_inputs=trust["execution_host"],
+                ledger_path=trust["budget_ledger_path"], profile=self.profile,
+                request_or_attempt_identity=self.request.attempt_id,
+                request_material=request_material, preflight_material=preflight_material,
+            )
+            calls = 0
+            def stopped_scope() -> None:
+                nonlocal calls
+                calls += 1
+                if calls >= 2:
+                    raise RoleCapabilityError("durable Worker scope is stopped")
+            with self.assertRaisesRegex(CodexWorkerError, "scope admission is denied"):
+                adapter.dispatch(
+                    self.request, checkpoint_session=lambda _value: None,
+                    checkpoint_turn=lambda _session, _turn: None,
+                    advisory_execution=trust["advisory_execution"],
+                    effect_reservation=reservation, scope_admission=stopped_scope,
+                )
+        self.assertEqual((calls, backend.calls), (2, 0))
+
+    def test_completed_worker_reservation_cannot_be_publicly_refunded(self):
+        """A retained debit is not a caller-owned recovery credential."""
+
+        class Turn:
+            def identity(inner): return "worker-turn"
+            def abort(inner): pass
+            def read_response(inner): return NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "complete"})
+        class Session:
+            def identity(inner): return "worker-session"
+            def close(inner): pass
+            def start_turn(inner, *_args): return Turn()
+        class Backend:
+            def open_session(inner, *_args, **_kwargs): return Session()
+
+        backend = Backend()
+        adapter = CodexWorkerAdapter(backend, self.profile, self.audit, BoundedWorkerToolSurface(()))
+        with tempfile.TemporaryDirectory() as temporary:
+            trust = self.effect_kwargs(backend, Path(temporary))
+            request_material, preflight_material = adapter.effect_material(self.request)
+            reservation = reserve_role_effect(
+                trust["advisory_execution"], host_inputs=trust["execution_host"],
+                ledger_path=trust["budget_ledger_path"], profile=self.profile,
+                request_or_attempt_identity=self.request.attempt_id,
+                request_material=request_material, preflight_material=preflight_material,
+            )
+            result = adapter.dispatch(
+                self.request, checkpoint_session=lambda _value: None,
+                checkpoint_turn=lambda _session, _turn: None,
+                advisory_execution=trust["advisory_execution"], effect_reservation=reservation,
+            )
+            self.assertEqual(result.kind, WorkerResultKind.ACCEPTED)
+            connection = sqlite3.connect(trust["budget_ledger_path"])
+            try:
+                before = connection.execute("SELECT * FROM role_budget_usage").fetchall()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(RoleCapabilityError, "exclusive authorization"):
+                reservation.reject_recovery_route()
+            connection = sqlite3.connect(trust["budget_ledger_path"])
+            try:
+                self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+            finally:
+                connection.close()
 
     def test_preflight_drift_does_not_construct_or_call_provider(self):
         self.binding = WorkerQualificationBinding(self.binding.case_id, self.binding.task_id, self.binding.attempt_id, self.binding.input_digest, self.binding.resume_session_identity, self.binding.source_digest, self.binding.repository_fingerprint, self.binding.worktree_fingerprint, self.binding.branch_fingerprint, self.binding.policy_fingerprint, self.binding.base_sha, self.binding.candidate_sha, self.binding.base_fingerprint, self.binding.candidate_fingerprint, self.binding.profile_identity, self.binding.configuration_digest, self.binding.runtime_fingerprint, self.binding.native_channel_producer_identity, self.binding.exporter_identity, self.binding.comparator_identity, self.binding.recorder_binding_digest, digest("other-store"), self.binding.capture_plan_digest, self.binding.deterministic_state, self.binding.blocker, self.binding.next_action)

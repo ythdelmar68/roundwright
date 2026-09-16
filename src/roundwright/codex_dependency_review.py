@@ -24,6 +24,7 @@ from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAudi
 from .failure_recovery import (
     DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding,
     FailureClass, FailureRole, FailureRecord, RecoveryAction, FailureRecoveryError, require_scope_open,
+    require_scope_effect_admission,
     abandon_durable_recovery_route_reservation,
     begin_durable_recovery_route_reservation,
     commit_durable_recovery_route_reservation,
@@ -160,9 +161,11 @@ class CodexDependencyReviewAdapter:
         )
 
     def dispatch(
-        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, effect_reservation: TrustedRoleEffectReservation,
+        self, request: DependencyReviewRequest, *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], advisory_execution: SealedRoleExecution, effect_reservation: TrustedRoleEffectReservation, scope_admission: Callable[[], None] | None = None,
     ) -> DependencyReviewDispatchResult:
-        if type(request) is not DependencyReviewRequest or request.profile_identity != self.profile_identity or not callable(checkpoint_session) or not callable(checkpoint_turn):
+        if (type(request) is not DependencyReviewRequest or request.profile_identity != self.profile_identity
+                or not callable(checkpoint_session) or not callable(checkpoint_turn)
+                or (scope_admission is not None and not callable(scope_admission))):
             raise DependencyReviewDispatchError("dependency review dispatch is invalid")
         if (type(advisory_execution) is not SealedRoleExecution
                 or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW
@@ -172,12 +175,20 @@ class CodexDependencyReviewAdapter:
             request_material, preflight_material = self.effect_material(request)
 
             def admit() -> dict[str, object]:
-                return effect_reservation.require_before_effect(
+                receipt = effect_reservation.require_before_effect(
                     advisory_execution, profile=self._profile,
                     request_or_attempt_identity=request.attempt_id,
                     request_material=request_material,
                     preflight_material=preflight_material,
                 )
+                if scope_admission is not None:
+                    try:
+                        scope_admission()
+                    except Exception as error:
+                        raise DependencyReviewDispatchError(
+                            "dependency review durable scope admission is denied"
+                        ) from error
+                return receipt
 
             admit()
         except RoleCapabilityError as error:
@@ -208,6 +219,9 @@ class CodexDependencyReviewAdapter:
                     "sdk-turn-failed", error.failure,
                 )
             return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "session": session_id, "turn": turn_id, "status": "ambiguous"}), "uncertain-provider-turn")
+        except DependencyReviewDispatchError:
+            _abort(turn)
+            raise
         except Exception:
             _abort(turn)
             return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "session": session_id, "turn": turn_id, "status": "ambiguous"}), "uncertain-provider-turn")
@@ -259,6 +273,15 @@ class DependencyReviewService:
         )
         if task_identity is not None:
             store.require_current_authority(repository, task_identity, subset, binding)
+        def require_effect_scope() -> None:
+            if task_identity is None:
+                return
+            try:
+                require_scope_effect_admission(
+                    repository, task_identity, "dependency-review:" + task_identity.task_id,
+                )
+            except FailureRecoveryError as error:
+                raise DependencyReviewDispatchError("dependency review dispatch scope is stopped") from error
         # A previously checkpointed session is already ambiguous.  Detect it
         # before deriving a recovery route or reserving a successor budget so
         # restart reconciliation cannot create any later durable effect.
@@ -291,6 +314,7 @@ class DependencyReviewService:
             advisory_execution, execution_host, adapter,
         )
         request_material, preflight_material = adapter.effect_material(request)
+        require_effect_scope()
         route_reserved = False
         if recovery_route is not None:
             route, coordinate, remaining, reservation_digest = self._recovery_route_material(
@@ -322,13 +346,16 @@ class DependencyReviewService:
                             request_material=request_material,
                             preflight_material=preflight_material,
                         )
-                        recovered.reject_recovery_route()
+                        abandon_durable_recovery_route_reservation(
+                            repository, task_identity, recovery_route,
+                            reservation_digest=reservation_digest,
+                            effect_reservation=recovered,
+                        )
                     except RoleCapabilityError:
-                        pass
-                    abandon_durable_recovery_route_reservation(
-                        repository, task_identity, recovery_route,
-                        reservation_digest=reservation_digest,
-                    )
+                        abandon_durable_recovery_route_reservation(
+                            repository, task_identity, recovery_route,
+                            reservation_digest=reservation_digest,
+                        )
                     route_reserved = begin_durable_recovery_route_reservation(
                         repository, task_identity, recovery_route,
                         reservation_digest=reservation_digest,
@@ -379,11 +406,10 @@ class DependencyReviewService:
         except (RoleCapabilityError, DependencyReviewDispatchError) as error:
             if recovery_route is not None and route_reserved:
                 try:
-                    if reservation is not None:
-                        reservation.reject_recovery_route()
                     abandon_durable_recovery_route_reservation(
                         repository, task_identity, recovery_route,
                         reservation_digest=reservation_digest,
+                        effect_reservation=reservation,
                     )
                 except Exception:
                     pass
@@ -401,10 +427,10 @@ class DependencyReviewService:
         except Exception:
             if recovery_route is not None and route_reserved:
                 try:
-                    reservation.reject_recovery_route()
                     abandon_durable_recovery_route_reservation(
                         repository, task_identity, recovery_route,
                         reservation_digest=reservation_digest,
+                        effect_reservation=reservation,
                     )
                 except Exception:
                     pass
@@ -452,6 +478,7 @@ class DependencyReviewService:
         result = adapter.dispatch(
             request, checkpoint_session=claimed_session, checkpoint_turn=claimed_turn,
             advisory_execution=advisory_execution, effect_reservation=reservation,
+            scope_admission=require_effect_scope,
         )
         if result.kind is DependencyReviewResultKind.ACCEPTED:
             assert result.proposal is not None

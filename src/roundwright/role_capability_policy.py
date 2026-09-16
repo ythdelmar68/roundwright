@@ -1096,11 +1096,43 @@ class TrustedRoleEffectReservation:
         return self._binding
 
     def reject_recovery_route(self) -> None:
-        """Remove a reservation that never acquired its durable route."""
+        """Reject unauthenticated refund requests.
 
-        if self._seal is not _EFFECT_RESERVATION_SEAL:
-            raise RoleCapabilityError("trusted role effect reservation is invalid")
+        A reserved debit is not evidence that its route remains unadmitted.
+        Only the durable recovery ledger may refund it while holding the
+        exclusive product transaction that proves no successor consumed the
+        route.  Keeping this method as a closed public seam makes stale callers
+        fail without changing the budget row.
+        """
+
+        raise RoleCapabilityError(
+            "role effect reservation release requires durable exclusive authorization"
+        )
+
+    def _release_exclusive_recovery_reservation(self, *, reservation_digest: str, authorization: object) -> None:
+        """Internal half of the cross-ledger recovery transaction."""
+
+        if (self._seal is not _EFFECT_RESERVATION_SEAL
+                or authorization is not _EXCLUSIVE_RECOVERY_RELEASE_SEAL
+                or reservation_digest != self.recovery_digest):
+            raise RoleCapabilityError("trusted recovery reservation release is unauthorized")
         self._ledger.release_exact_reservation(exposure=self._exposure)
+
+
+_EXCLUSIVE_RECOVERY_RELEASE_SEAL = object()
+
+
+def _release_exclusive_recovery_reservation(
+    reservation: TrustedRoleEffectReservation, *, reservation_digest: str,
+) -> None:
+    """Release only for a caller already holding the product-ledger lock."""
+
+    if type(reservation) is not TrustedRoleEffectReservation:
+        raise RoleCapabilityError("trusted recovery reservation release is invalid")
+    reservation._release_exclusive_recovery_reservation(
+        reservation_digest=reservation_digest,
+        authorization=_EXCLUSIVE_RECOVERY_RELEASE_SEAL,
+    )
 
 
 def _recovery_reservation_digest(

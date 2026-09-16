@@ -459,6 +459,7 @@ class CodexWorkerAdapter:
         checkpoint_submission: Callable[[NativeWorkerToolRequest, NativeWorkerToolResult, str, str | None], None] | None = None,
         advisory_execution: SealedRoleExecution,
         effect_reservation: TrustedRoleEffectReservation,
+        scope_admission: Callable[[], None] | None = None,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -467,7 +468,9 @@ class CodexWorkerAdapter:
         a completed one.
         """
 
-        if type(request) is not CodexWorkerRequest or not callable(checkpoint_session) or not callable(checkpoint_turn):
+        if (type(request) is not CodexWorkerRequest or not callable(checkpoint_session)
+                or not callable(checkpoint_turn)
+                or (scope_admission is not None and not callable(scope_admission))):
             raise CodexWorkerError("Worker dispatch is invalid")
         if (type(advisory_execution) is not SealedRoleExecution
                 or advisory_execution.seam is not RoleExecutionSeam.WORKER
@@ -480,12 +483,18 @@ class CodexWorkerAdapter:
                 # The record is deliberately re-read at each effect boundary.
                 # The durable reservation is evidence for this exact binding,
                 # not a cached permit or a second consumption.
-                return effect_reservation.require_before_effect(
+                receipt = effect_reservation.require_before_effect(
                     advisory_execution, profile=self._profile,
                     request_or_attempt_identity=request.attempt_id,
                     request_material=request_material,
                     preflight_material=preflight_material,
                 )
+                if scope_admission is not None:
+                    try:
+                        scope_admission()
+                    except Exception as error:
+                        raise CodexWorkerError("Worker durable scope admission is denied") from error
+                return receipt
 
             admission_receipt = admit()
         except RoleCapabilityError as error:

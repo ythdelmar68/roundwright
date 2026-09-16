@@ -193,3 +193,27 @@ one or two format corrections, exhaust after ordinal two, and reject terminal
 replay without spending or dispatching again. A multi-profile jump that skips
 required physical coordinates is rejected before any provider or budget effect.
 The semantic inventory retains every earlier E1R1–E1R9 and compatibility test.
+
+## E1R11 serialized effect and correction recovery boundaries
+
+Every Worker, dependency-review, and direct Supervisor correction effect now
+rechecks the durable scope through an immediate product-ledger transaction.
+That transaction is the linearization point against a concurrent same-scope
+STOP decision, and adapters repeat it before native session, turn, response,
+checkpoint, and local tool boundaries. Candidate-bound regressions inject a
+denial after the earlier preflight read and prove that neither Worker nor
+dependency-review constructs a provider session.
+
+Recovery reservation refunds are no longer caller-owned. The public refund
+seam fails closed, including after a completed Worker turn. A route refund can
+occur only while the recovery helper holds the product ledger's exclusive
+transaction and has proved the exact reservation is still unconsumed and has
+no provider, dependency-review, or generic Supervisor successor admission.
+This keeps an admitted retry and its retained debit intact under stale replay.
+
+A same-profile correction checks the stopped Supervisor scope before preflight
+or budget reservation. Rejection leaves attempts, coordinates, claims, routes,
+invalid results, sessions, provider calls, and budget rows byte-for-byte
+unchanged. Readiness accepts the same exact authenticated PREPARED/UNCLAIMED
+correction checkpoint that execution recovers, while changed request/lease/
+coordinate material or a consumed dispatch claim fails closed.

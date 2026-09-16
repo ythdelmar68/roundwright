@@ -37,7 +37,7 @@ from roundwright.provider_health import CodexAdapterError, CodexCapability, Code
 from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, read_durable_failure, record_durable_failure, read_durable_recovery_route_authorization, release_durable_recovery_route_authorization
+from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, classify, read_durable_failure, record_durable_failure, read_durable_recovery_route_authorization, release_durable_recovery_route_authorization
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
 from tests.role_admission_fixture import independent_execution, sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
@@ -698,6 +698,32 @@ class DependencyReviewServiceTests(unittest.TestCase):
             adapter = CodexDependencyReviewAdapter(backend, profile, audit)
             DependencyReviewStore().start_attempt(repository, subset, attempt_id="changed-attempt", binding=binding)
             self.assertEqual(backend.sessions, [])
+
+    def test_scope_denial_after_initial_check_blocks_before_reservation_and_session(self) -> None:
+        """The serialized effect fence closes the initial-read race."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116")
+            with patch(
+                "roundwright.codex_dependency_review.require_scope_effect_admission",
+                side_effect=FailureRecoveryError("failure scope remains stopped"),
+            ), patch("roundwright.codex_dependency_review.reserve_role_effect") as reserve, self.assertRaisesRegex(
+                DependencyReviewDispatchError, "scope is stopped",
+            ):
+                DependencyReviewService().run(
+                    repository, subset, attempt_id="attempt-116", binding=binding,
+                    adapter=adapter, checkpoint_session=lambda _value: None,
+                    checkpoint_turn=lambda _session, _turn: None,
+                    task_identity=identity,
+                    **effect,
+                )
+            reserve.assert_not_called()
+            self.assertEqual(backend.sessions, [])
+            self.assertFalse(effect["budget_ledger_path"].exists())
 
     def test_digit_leading_native_ids_persist_the_exact_durable_turn_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

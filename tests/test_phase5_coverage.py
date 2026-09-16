@@ -238,6 +238,11 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_prepared_format_correction_reuses_exact_reservation_after_crash",
             "tests.test_codex_supervisor.SupervisorTests.test_one_logical_profile_allows_bounded_physical_corrections_and_replay",
             "tests.test_codex_supervisor.SupervisorTests.test_generic_sequence_rejects_profile_jump_before_correction_coordinates",
+            "tests.test_worker_toolbox.WorkerToolboxTests.test_scope_fence_rechecks_after_reservation_before_worker_session",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_scope_denial_after_initial_check_blocks_before_reservation_and_session",
+            "tests.test_worker_toolbox.WorkerToolboxTests.test_completed_worker_reservation_cannot_be_publicly_refunded",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_stopped_scope_rejects_correction_before_any_state_or_budget_change",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_readiness_accepts_only_exact_unclaimed_prepared_correction",
         )
         self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
         self.assertEqual(tuple(test for test in coverage.SEMANTIC_TESTS if test in required), required)
@@ -245,6 +250,10 @@ class Phase5CoverageTests(unittest.TestCase):
         self.assertEqual(
             tuple(coverage.ISSUE_132_E1R3_FINDING_REQUIREMENTS),
             ("RW132-PROD-001", "RW132-RECOVERY-002", "RW132-BINDING-003", "RW132-DURABLE-004", "RW132-EVIDENCE-005", "RW132-TAXONOMY-006", "RW132-ACCOUNTING-007", "RW132-QUALIFICATION-008", "RW132-ROUTE-FENCE-009", "RW132-DEPENDENCY-FENCE-010", "RW132-SUPERVISOR-FENCE-011"),
+        )
+        self.assertEqual(
+            tuple(coverage.ISSUE_132_E1R11_FINDING_REQUIREMENTS),
+            ("E1R11-01", "E1R11-02", "E1R11-03", "E1R11-04"),
         )
 
     def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:
@@ -272,6 +281,10 @@ class Phase5CoverageTests(unittest.TestCase):
         e1r3 = dict(coverage.ISSUE_132_E1R3_FINDING_REQUIREMENTS)
         e1r3.pop("RW132-QUALIFICATION-008")
         with patch.object(coverage, "ISSUE_132_E1R3_FINDING_REQUIREMENTS", e1r3), self.assertRaisesRegex(coverage.CoverageError, "E1R3 stable finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+        e1r11 = dict(coverage.ISSUE_132_E1R11_FINDING_REQUIREMENTS)
+        e1r11.pop("E1R11-04")
+        with patch.object(coverage, "ISSUE_132_E1R11_FINDING_REQUIREMENTS", e1r11), self.assertRaisesRegex(coverage.CoverageError, "E1R11 finding mapping"):
             coverage._validate_issue_132_semantic_tests()
 
     def test_issue_132_affected_module_inventory_rejects_candidate_review_omission(self) -> None:

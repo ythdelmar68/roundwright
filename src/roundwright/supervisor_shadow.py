@@ -1184,7 +1184,19 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
             except Exception as error:
                 raise SupervisorShadowError("Supervisor fallback reservation is unavailable") from error
 
-        return SupervisorFallbackAuthorization(source.input_digest, target.input_digest, consume, prepare, abandon)
+        def release(reservation: TrustedRoleEffectReservation) -> None:
+            try:
+                abandon_durable_recovery_route_reservation(
+                    repository, task_identity, authorization,
+                    reservation_digest=reservation_digest,
+                    effect_reservation=reservation,
+                )
+            except Exception as error:
+                raise SupervisorShadowError("Supervisor fallback reservation is unavailable") from error
+
+        return SupervisorFallbackAuthorization(
+            source.input_digest, target.input_digest, consume, prepare, abandon, release,
+        )
 
     failover = dispatch_ordered_supervisor_attempts(
         requests, adapters, advisory_executions, execution_hosts,

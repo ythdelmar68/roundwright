@@ -284,6 +284,8 @@ class SupervisorTests(unittest.TestCase):
         )
         if count == 4:
             self.profiles += (ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fourth"),)
+        else:
+            self.profiles = self.profiles[:count]
         cli = {"review.max_supervisor_attempts_per_round": str(len(self.profiles)), "roles.supervisor.attempt_profiles": [{"name": profile.name, "model": profile.model, "reasoning_effort": profile.reasoning_effort.value} for profile in self.profiles]}
         if count == 3:
             cli = {}
@@ -761,6 +763,40 @@ class SupervisorTests(unittest.TestCase):
                     "sha256:" + record_dir.name.removeprefix("record-"), evidence_time=101)
                 self.assertTrue(durable.expected_plan.schema.endswith("/v3"))
                 self.assertEqual(durable.terminal.terminal, result.envelope.terminal.value)
+
+    def test_one_logical_profile_allows_bounded_physical_corrections_and_replay(self):
+        self.configure_supervisors(1)
+        for modes in (("syntax", "pass"), ("syntax", "shape", "pass"), ("syntax", "shape", "syntax")):
+            with self.subTest(modes=modes), TemporaryDirectory() as directory:
+                fixture = list(self.native_sequence(modes))
+                fixture[5] = FileSupervisorLifecycle(Path(directory), digest("one-profile-lifecycle"))
+                def exercise(run, repository, budget):
+                    result = run()
+                    self.assertEqual(result.envelope.terminal.value, "accepted" if modes[-1] == "pass" else "exhausted")
+                    with closing(sqlite3.connect(budget)) as connection:
+                        before = connection.execute("SELECT * FROM role_budget_usage").fetchall()
+                    with self.assertRaises(SupervisorShadowError):
+                        run()
+                    self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [1] * len(modes))
+                    with closing(sqlite3.connect(budget)) as connection:
+                        self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+                self.qualify_fixture(fixture, _exercise=exercise)
+
+    def test_generic_sequence_rejects_profile_jump_before_correction_coordinates(self):
+        self.configure_supervisors(2)
+        fixture = self.sequence_fixture(
+            (NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+             NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []})),
+            coordinates=((self.profiles[0], 1, 0), (self.profiles[1], 2, 0)),
+        )
+        def exercise(run, repository, budget):
+            for _ in range(2):
+                with self.assertRaisesRegex(SupervisorShadowError, "context has drifted"):
+                    run()
+                self.assertFalse(budget.exists())
+                self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [0, 0])
+                self.assertEqual(fixture[6].calls, [])
+        self.qualify_fixture(fixture, _exercise=exercise)
 
     def test_native_denial_persists_scope_stop_before_terminal_and_restart(self):
         from roundwright.failure_recovery import FailureRecoveryError, FailureClass, parse_failure_record, require_scope_open

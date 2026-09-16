@@ -832,7 +832,10 @@ def _durable_sequence_envelope(record: CompleteSupervisorLifecycleRecord) -> Sup
 def _valid_sequence_coordinates(requests: tuple[CodexSupervisorRequest, ...], runtime: RuntimeBinding, max_attempts: int) -> bool:
     """Require an exact, bounded physical-format route for each pre-bound turn."""
 
-    if not requests or len(requests) > max_attempts:
+    # The policy counts logical profiles; each selected profile independently
+    # permits the original output and at most two physical corrections.
+    profiles = tuple(dict.fromkeys(request.selected_profile_identity for request in requests))
+    if not requests or len(profiles) > max_attempts or profiles != runtime.supervisor_profile_identities[:len(profiles)]:
         return False
     logical, physical = 1, 0
     for request in requests:

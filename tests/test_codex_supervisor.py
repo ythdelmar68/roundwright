@@ -677,6 +677,8 @@ class SupervisorTests(unittest.TestCase):
     def native_sequence(self, modes):
         """Inject SDK handles, retaining the product session/schema/parser/adapter."""
         from roundwright.supervisor_toolbox import _Session
+        if len(modes) == 4:
+            self.configure_supervisors(4)
         coordinates = tuple((self.profiles[0], 1, index) if index < 3 else (self.profiles[1], 2, 0) for index in range(len(modes)))
         fixture = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * len(modes), coordinates=coordinates)
         adapters, requests, *rest = fixture

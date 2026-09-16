@@ -273,6 +273,8 @@ class DependencyReviewService:
             connection.close()
         if existing_attempt is not None and store.recover_dispatch_claim(
             repository, attempt_id=attempt_id, output_digest=recovery_digest,
+            subset=subset, binding=binding, input_digest=request.input_digest,
+            supersedes_attempt_id=supersedes_attempt_id, task_identity=task_identity,
         ):
             return DependencyReviewDispatchResult(
                 DependencyReviewResultKind.AMBIGUOUS, None, None, None,
@@ -412,7 +414,9 @@ class DependencyReviewService:
             except Exception as error:
                 raise DependencyReviewDispatchError("dependency review transient recovery route is unavailable") from error
         recovery_digest = _digest({"attempt_id": attempt.attempt_id, "status": "recovered-in-flight-dispatch"})
-        if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest):
+        if store.recover_dispatch_claim(repository, attempt_id=attempt.attempt_id, output_digest=recovery_digest,
+                                        subset=subset, binding=binding, input_digest=request.input_digest,
+                                        supersedes_attempt_id=supersedes_attempt_id, task_identity=task_identity):
             return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, None, None, None, recovery_digest, "uncertain-provider-turn")
         admit()
         # This claim deliberately precedes ``open_fresh_session``.  There is

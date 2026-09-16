@@ -804,14 +804,23 @@ class DependencyReviewStore:
         finally:
             connection.close()
 
-    def recover_dispatch_claim(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str) -> bool:
+    def recover_dispatch_claim(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str,
+                               subset: AffectedSubset, binding: DependencyReviewBinding,
+                               input_digest: str, supersedes_attempt_id: str | None,
+                               task_identity: TaskIdentity | None) -> bool:
         """Terminally block any persisted in-flight claim before a restart can dispatch."""
         if not _token(attempt_id) or not _digest(output_digest):
             raise DependencyReviewError("dependency review dispatch recovery is invalid")
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row, _ = self._read_attempt(connection, attempt_id)
+            row, stored_subset = self._read_attempt(connection, attempt_id)
+            binding.require_subset(subset)
+            if stored_subset != subset or row[:6] != (subset.task_id, subset.snapshot_id, binding.profile_identity, binding.configuration_digest, input_digest, supersedes_attempt_id):
+                raise DependencyReviewError("dependency review recovery identity has drifted")
+            if task_identity is not None:
+                self._require_current_authority(connection, task_identity, subset, binding)
+            self._verify_task_lineage(connection, subset.task_id)
             claim = connection.execute("SELECT state FROM dependency_review_dispatch_claims WHERE attempt_id = ?", (attempt_id,)).fetchone()
             if claim is None:
                 connection.commit()

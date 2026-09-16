@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -542,6 +543,23 @@ class DependencyReviewServiceTests(unittest.TestCase):
             with patch.object(backend, "open_fresh_session", side_effect=die), self.assertRaises(ProcessDeath):
                 run()
             self.assertEqual(len(backend.sessions), 1)
+            # A different incoming task or request must not recover this claim.
+            other_identity = replace(identity, task_id="task-other", source_id="source-other", branch="codex/other", worktree="C:/other")
+            other_lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="dependency-review-tests", ttl_seconds=60)
+            admit_task(repository, other_identity, (SourceSnapshot(other_identity.source_id, identity.repository_id, "a" * 64),), lease=other_lease)
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                connection.execute("INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)", (other_identity.task_id, other_identity.base_sha, binding.candidate_sha, "authority-other"))
+            record_runtime_binding(repository, other_identity, RuntimeBinding("roundwright-runtime/v1", binding.configuration_digest, digest("8"), (digest("9"),)))
+            for incoming_identity, incoming_subset in (
+                (other_identity, replace(subset, task_id=other_identity.task_id, snapshot_id="subset-other", source_digest="a" * 64)),
+                (identity, replace(subset, creation_reason="changed-request")),
+            ):
+                with self.subTest(task=incoming_identity.task_id), self.assertRaisesRegex(Exception, "recovery identity has drifted"):
+                    DependencyReviewService().run(repository, incoming_subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, task_identity=incoming_identity, **effect)
+                with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                    self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-116'").fetchone(), ("prepared",))
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM dependency_review_validation_outcomes").fetchone(), (0,))
+                self.assertEqual(len(backend.sessions), 1)
             connection = sqlite3.connect(effect["budget_ledger_path"])
             try:
                 before = connection.execute("SELECT * FROM role_budget_usage").fetchall()

@@ -460,6 +460,7 @@ class CodexWorkerAdapter:
         advisory_execution: SealedRoleExecution,
         effect_reservation: TrustedRoleEffectReservation,
         scope_admission: Callable[[], None] | None = None,
+        checkpoint_dispatch: Callable[[], None] | None = None,
     ) -> CodexWorkerResult:
         """Start/resume, checkpoint IDs, then consume exactly one typed result.
 
@@ -470,7 +471,8 @@ class CodexWorkerAdapter:
 
         if (type(request) is not CodexWorkerRequest or not callable(checkpoint_session)
                 or not callable(checkpoint_turn)
-                or (scope_admission is not None and not callable(scope_admission))):
+                or (scope_admission is not None and not callable(scope_admission))
+                or (checkpoint_dispatch is not None and not callable(checkpoint_dispatch))):
             raise CodexWorkerError("Worker dispatch is invalid")
         if (type(advisory_execution) is not SealedRoleExecution
                 or advisory_execution.seam is not RoleExecutionSeam.WORKER
@@ -505,6 +507,8 @@ class CodexWorkerAdapter:
         turn: NativeWorkerTurn | None = None
         try:
             admit()
+            if checkpoint_dispatch is not None:
+                checkpoint_dispatch()
             session = self._backend.open_session(self._profile, resume_session_identity=request.resume_session_identity, action=request.action)
             session_identity = _identity(session, "session")
             if request.resume_session_identity is not None and session_identity != request.resume_session_identity:

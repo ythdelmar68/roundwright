@@ -401,6 +401,87 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(runner.execute(), ("runtime-provider-one",))
             self.assertEqual(backend.calls, 1)
 
+    def test_scope_stop_during_response_read_cannot_commit_accepted_review(self) -> None:
+        """Completion evidence and scope admission linearize at acceptance."""
+
+        from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+
+            class DenyingTurn:
+                def identity(inner): return "runtime-denial-turn"
+                def abort(inner): return None
+                def read_response(inner):
+                    record_durable_failure(
+                        repository, identity,
+                        classify(FailureBinding(
+                            recovery.candidate_sha, "sha256:" + recovery.policy_fingerprint,
+                            recovery.runtime_binding.resolved_digest, "supervisor:" + identity.task_id,
+                            FailureRole.SUPERVISOR, runner.audit.profile_identity,
+                            "runtime-denial-session", runner.selection.provider_attempt_id,
+                        ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                        now=runner.dispatch_control.now,
+                    )
+                    return NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED,
+                        {"status": "complete", "action": "accept-formal-review", "blocker": None},
+                    )
+
+            class DenyingSession:
+                def identity(inner): return "runtime-denial-session"
+                def close(inner): return None
+                def start_turn(inner, _request): return DenyingTurn()
+
+            class DenyingBackend:
+                def __init__(inner): inner.calls = 0
+                def open_fresh_session(inner, _profile):
+                    inner.calls += 1
+                    return DenyingSession()
+
+            backend = DenyingBackend()
+            denied = replace(runner, backend=backend, sequence=(self.sequence_entry(runner, backend=backend),))
+            with self.assertRaises(Exception):
+                denied.execute()
+            stored = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            self.assertEqual((stored.state, stored.accepted_review_identity, backend.calls), (AttemptState.COMPLETED, None, 1))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state, accepted_review_identity FROM diff_review_attempts WHERE provider_attempt_id=?",
+                    (runner.selection.provider_attempt_id,),
+                ).fetchone(), ("recorded", None))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM accepted_provider_reviews WHERE attempt_id=?",
+                    (runner.selection.provider_attempt_id,),
+                ).fetchone(), (0,))
+
+    def test_readiness_and_execution_share_complete_accepted_state_validation(self) -> None:
+        """Claims, coordinates, and formal acceptance are all mandatory."""
+
+        mutations = {
+            "dispatch-claim": ("DELETE FROM provider_dispatch_claims WHERE attempt_id=?",),
+            "coordinate": ("DELETE FROM supervisor_attempt_coordinates WHERE attempt_id=?",),
+            "formal-acceptance": ("DELETE FROM accepted_provider_reviews WHERE attempt_id=?",),
+        }
+        for name, (statement,) in mutations.items():
+            with self.subTest(drift=name), TemporaryDirectory() as temporary:
+                runner, backend, repository, _identity, _recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    suffix=name,
+                )
+                self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+                with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                    connection.execute(statement, (runner.selection.provider_attempt_id,))
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    runner.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    runner.execute()
+                self.assertEqual(backend.calls, 1)
+
     def test_host_supervisor_execution_drift_blocks_before_attempt_or_backend(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, backend, repository, identity, _recovery, _seal = self.durable_runner(

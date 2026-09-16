@@ -870,6 +870,105 @@ class SupervisorTests(unittest.TestCase):
                     self.assertEqual([a._backend.calls for a in fixture[0]], [1, 0])
                 self.qualify_fixture(fixture, _exercise=exercise)
 
+    def test_real_qualification_entrypoint_rechecks_scope_after_session_checkpoint(self):
+        """The repository-bound qualifier threads its guard into dispatch."""
+
+        from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+            NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+        ))
+        holder = {}
+
+        def deny_at_session(session_identity):
+            record_durable_failure(
+                holder["repository"], holder["identity"],
+                classify(FailureBinding(
+                    self.context.candidate_sha, self.context.policy_digest,
+                    self.context.configuration_digest, "supervisor:" + self.context.task_id,
+                    FailureRole.SUPERVISOR, requests[0].selected_profile_identity,
+                    session_identity, requests[0].provider_attempt_id,
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                now=101,
+            )
+
+        def exercise(run, repository, _budget):
+            holder["repository"] = repository
+            holder["identity"] = TaskIdentity(
+                self.context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright",
+                "codex/supervisor-sequence", "C:/private/supervisor-sequence", self.context.base_sha,
+            )
+            with self.assertRaisesRegex(CodexSupervisorError, "scope admission"):
+                run()
+            self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 0, 0))
+            self.assertFalse(any(event[0] == "read" for event in self.events))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state, session_identity, external_turn_identity, accepted_review_identity FROM provider_attempts WHERE attempt_id=?",
+                    (requests[0].provider_attempt_id,),
+                ).fetchone(), ("prepared", "session-1", None, None))
+
+        qualify_supervisor_sequence(
+            adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+            evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+            trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+            review_authority_expectation=self.authority_expectation,
+            review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+            checkpoint_session=deny_at_session, checkpoint_turn=lambda *_: None, _exercise=exercise,
+        )
+
+    def test_denial_before_correction_reservation_leaves_no_budget_or_successor(self):
+        """Scope admission and the correction debit share one lock order."""
+
+        import roundwright.supervisor_shadow as shadow
+        from roundwright.failure_recovery import EvidenceSource, FailureClass, classify, record_durable_failure
+
+        adapters, requests, readiness, binding, policy, _, recorder = self.native_sequence(("shape", "pass"))
+        with TemporaryDirectory() as directory:
+            lifecycle = FileSupervisorLifecycle(Path(directory), digest("pre-reservation-denial"))
+
+            def exercise(run, repository, budget):
+                original = shadow.begin_durable_recovery_route_reservation
+
+                def deny_after_fence(*args, **kwargs):
+                    acquired = original(*args, **kwargs)
+                    authorization = args[2]
+                    record_durable_failure(
+                        repository, args[1],
+                        classify(authorization.binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                        now=101,
+                    )
+                    return acquired
+
+                with patch.object(shadow, "begin_durable_recovery_route_reservation", side_effect=deny_after_fence), self.assertRaises(CodexSupervisorError):
+                    run()
+                self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 0))
+                with closing(sqlite3.connect(budget)) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), [(1, 60, 4000)])
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM recovery_route_successor_admissions"
+                    ).fetchone(), (0,))
+                    route = connection.execute(
+                        "SELECT state, reservation_digest FROM recovery_route_authorizations"
+                    ).fetchone()
+                    self.assertEqual(route[0], "reserving")
+                    self.assertTrue(route[1].startswith("sha256:"))
+
+            qualify_supervisor_sequence(
+                adapters, requests, self.admissions(adapters, requests), readiness, binding, policy,
+                lifecycle, recorder, evidence_time=101, freshness_until=120,
+                runtime_store=FileSupervisorRuntimeStore(Path(directory) / "runtime", self.runtime_store().source_identity),
+                trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+                review_authority_expectation=self.authority_expectation,
+                review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+                checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+            )
+
     def test_sequence_ambiguous_primary_is_terminal_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)

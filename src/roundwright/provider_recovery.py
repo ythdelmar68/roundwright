@@ -635,6 +635,54 @@ def claim_supervisor_dispatch(
     return read_attempt(repository, identity, attempt_id, context=context, now=now)
 
 
+def claim_worker_dispatch(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
+    """Claim an untouched prepared Worker immediately before its effect."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    observed = _clock(now)
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        require_scope_open(connection, identity.task_id, "worker:" + identity.task_id)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        if (row.role is not ProviderRole.WORKER or row.state is not AttemptState.PREPARED
+                or row.session_identity is not None or row.external_turn_identity is not None
+                or row.output_pointer is not None or row.accepted_review_identity is not None):
+            raise ProviderRecoveryError("Worker dispatch claim requires an untouched prepared attempt")
+        if connection.execute(
+            "SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=?", (attempt_id,),
+        ).fetchone() is not None:
+            raise ProviderRecoveryError("Worker dispatch claim is already consumed")
+        connection.execute(
+            "INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)",
+            (attempt_id, identity.task_id, row.input_fingerprint, observed),
+        )
+        connection.commit()
+    except sqlite3.IntegrityError as error:
+        connection.rollback()
+        raise ProviderRecoveryError("Worker dispatch claim is already consumed") from error
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return read_attempt(repository, identity, attempt_id, context=context, now=now)
+
+
 def read_supervisor_dispatch_claim(
     repository: RepositoryIdentity, identity: TaskIdentity, context: RecoveryContext, *, attempt_id: str,
 ) -> SupervisorDispatchClaimState:
@@ -656,6 +704,32 @@ def read_supervisor_dispatch_claim(
         row = _attempt_row(connection, identity.task_id, attempt_id)
         if row.role is not ProviderRole.SUPERVISOR:
             raise ProviderRecoveryError("Supervisor dispatch claim has drifted")
+        return _dispatch_claim_state(connection, identity, row)
+    finally:
+        connection.close()
+
+
+def read_worker_dispatch_claim(
+    repository: RepositoryIdentity, identity: TaskIdentity, context: RecoveryContext, *, attempt_id: str,
+) -> SupervisorDispatchClaimState:
+    """Read the Worker pre-effect claim without changing durable state."""
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    path = database_path(repository)
+    if not path.exists():
+        raise ProviderRecoveryError("Worker dispatch claim is unavailable")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.DatabaseError) as error:
+        raise ProviderRecoveryError("Worker dispatch claim is unavailable") from error
+    try:
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        if row.role is not ProviderRole.WORKER:
+            raise ProviderRecoveryError("Worker dispatch claim has drifted")
         return _dispatch_claim_state(connection, identity, row)
     finally:
         connection.close()

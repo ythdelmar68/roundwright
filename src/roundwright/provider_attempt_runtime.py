@@ -20,7 +20,7 @@ from types import MappingProxyType
 from .configuration import RepositoryIdentity, ReviewMode
 from .candidate_review import (
     CandidateReviewError, DiffReviewOutput, DiffReviewVerdict, checkpoint_diff_review_session,
-    dispatch_diff_review, preflight_diff_review_session_checkpoint, record_diff_review,
+    dispatch_diff_review, preflight_diff_review_session_checkpoint, read_diff_review, record_diff_review,
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
@@ -853,12 +853,8 @@ class DurableDiffReviewRunner:
                         or stored.physical_format_output_ordinal != selection.physical_format_output_ordinal
                         or stored.state not in {AttemptState.PREPARED, AttemptState.ACCEPTED, AttemptState.INVALIDATED, AttemptState.BLOCKED, AttemptState.AMBIGUOUS}):
                     raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
-                claim = read_supervisor_dispatch_claim(
-                    self.repository, self.identity, entry.recovery,
-                    attempt_id=entry.selection.provider_attempt_id,
-                )
+                self._require_exact_persisted_attempt(entry, stored, expected_input)
                 if stored.state is AttemptState.PREPARED:
-                    self._require_exact_unclaimed_prepared(entry, stored, expected_input)
                     if position:
                         predecessor = entries[position - 1].selection
                         if (previous is None or previous.state is not AttemptState.INVALIDATED
@@ -868,8 +864,6 @@ class DurableDiffReviewRunner:
                                 or not self._format_correction_is_durable(predecessor.provider_attempt_id)):
                             raise ProviderAttemptRuntimeError("provider prepared correction is unauthenticated")
                     prepared_seen = True
-                elif claim is not SupervisorDispatchClaimState.CLAIMED:
-                    raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
                 current = stored
                 previous = stored
             if current is None:
@@ -881,31 +875,30 @@ class DurableDiffReviewRunner:
     def _require_exact_unclaimed_prepared(
         self, entry: DiffReviewSequenceEntry, stored: object, expected_input: str,
     ) -> None:
-        """One shared persisted-state contract for readiness and execution."""
+        """Compatibility wrapper for the shared persisted-state validator."""
+
+        self._require_exact_persisted_attempt(entry, stored, expected_input)
+        if stored.state is not AttemptState.PREPARED:
+            raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+
+    def _require_exact_persisted_attempt(
+        self, entry: DiffReviewSequenceEntry, stored: object, expected_input: str,
+    ) -> None:
+        """Validate one complete durable attempt for readiness and execution."""
 
         if not hasattr(stored, "state"):
-            raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+            raise ProviderAttemptRuntimeError("provider attempt has drifted")
         selection = entry.selection
         if (
-            stored.state is not AttemptState.PREPARED
-            or stored.role is not ProviderRole.SUPERVISOR
+            stored.role is not ProviderRole.SUPERVISOR
             or stored.selected_profile_identity != entry.audit.profile_identity
             or stored.input_fingerprint != expected_input
             or stored.process_lease_id != selection.process_lease_id
             or stored.process_lease_expires_at != selection.process_lease_expires_at
             or stored.logical_profile_position != selection.resolved_logical_profile_position
             or stored.physical_format_output_ordinal != selection.physical_format_output_ordinal
-            or stored.session_identity is not None
-            or stored.external_turn_identity is not None
-            or stored.output_pointer is not None
-            or stored.completion_evidence_fingerprint is not None
-            or stored.accepted_review_identity is not None
-            or read_supervisor_dispatch_claim(
-                self.repository, self.identity, entry.recovery,
-                attempt_id=selection.provider_attempt_id,
-            ) is not SupervisorDispatchClaimState.UNCLAIMED
         ):
-            raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+            raise ProviderAttemptRuntimeError("provider attempt has drifted")
         connection = _open_writable_connection(self.repository)
         try:
             coordinate = connection.execute(
@@ -921,7 +914,48 @@ class DurableDiffReviewRunner:
             selection.resolved_logical_profile_position,
             selection.physical_format_output_ordinal, entry.audit.profile_identity,
         ):
-            raise ProviderAttemptRuntimeError("provider prepared correction coordinate has drifted")
+            raise ProviderAttemptRuntimeError("provider attempt coordinate has drifted")
+        claim = read_supervisor_dispatch_claim(
+            self.repository, self.identity, entry.recovery,
+            attempt_id=selection.provider_attempt_id,
+        )
+        if stored.state is AttemptState.PREPARED:
+            if (
+                stored.session_identity is not None
+                or stored.external_turn_identity is not None
+                or stored.output_pointer is not None
+                or stored.completion_evidence_fingerprint is not None
+                or stored.accepted_review_identity is not None
+                or claim is not SupervisorDispatchClaimState.UNCLAIMED
+            ):
+                raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+            return
+        if claim is not SupervisorDispatchClaimState.CLAIMED:
+            raise ProviderAttemptRuntimeError("provider attempt dispatch claim has drifted")
+        if stored.state is AttemptState.ACCEPTED:
+            try:
+                accepted = read_diff_review(
+                    self.repository, self.identity, selection.diff_review_attempt_id,
+                    binding=self.binding, seal=self.seal, context=entry.recovery, lease=self.lease,
+                    invalidate_stale=False,
+                )
+            except (CandidateReviewError, GitIdentityError, ProviderRecoveryError) as error:
+                raise ProviderAttemptRuntimeError("provider accepted evidence has drifted") from error
+            if (
+                not accepted.accepted
+                or accepted.accepted_review_identity != selection.diff_review_attempt_id
+                or accepted.diff_review_attempt_id != selection.diff_review_attempt_id
+                or accepted.implementation_attempt_id != selection.implementation_attempt_id
+                or accepted.supervisor_session_identity != stored.session_identity
+                or accepted.message_identity != selection.message_identity
+                or accepted.base_sha != self.identity.base_sha
+                or accepted.candidate_sha != self.seal.candidate_sha
+                or stored.accepted_review_identity != selection.diff_review_attempt_id
+                or stored.external_turn_identity is None
+                or stored.output_pointer != "diff-review:" + selection.diff_review_attempt_id
+                or stored.completion_evidence_fingerprint is None
+            ):
+                raise ProviderAttemptRuntimeError("provider accepted evidence has drifted")
 
     def _execute_selection(self, entry: DiffReviewSequenceEntry, *, recovery_route: object | None = None) -> tuple[str, bool]:
         """Use public durable APIs for exactly one observed native outcome."""
@@ -946,6 +980,21 @@ class DurableDiffReviewRunner:
                 context=recovery, now=self.dispatch_control.now,
             )
             if existing.state is AttemptState.ACCEPTED:
+                accepted_input = preflight_diff_review_session_checkpoint(
+                    self.repository, self.identity, recovery, self.binding, self.seal,
+                    dependency_binding=self.dependency_binding, control=self.dispatch_control,
+                    implementation_attempt_id=selection.implementation_attempt_id,
+                    provider_attempt_id=selection.provider_attempt_id,
+                    message_identity=selection.message_identity,
+                    process_lease_id=selection.process_lease_id,
+                    process_lease_expires_at=selection.process_lease_expires_at,
+                    selected_profile_identity=audit.profile_identity,
+                    within_round_attempt=selection.resolved_logical_profile_position,
+                    review_round=self.review_round, review_epoch=self.review_epoch,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                self._require_exact_persisted_attempt(entry, existing, accepted_input)
                 return (existing.attempt_id, True)
             if existing.state is AttemptState.INVALIDATED:
                 terminal = read_supervisor_terminal_failure(

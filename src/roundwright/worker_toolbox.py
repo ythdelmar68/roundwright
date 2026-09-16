@@ -48,12 +48,12 @@ from .coding_worker_state import (
 )
 from .configuration import ProviderProfile, RepositoryIdentity
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
-from .provider_recovery import AttemptState, ProviderRole, RecoveryContext, read_attempt, record_external_turn, record_session_identity, recover_attempt
+from .provider_recovery import AttemptState, ProviderRole, RecoveryContext, SupervisorDispatchClaimState, claim_worker_dispatch, read_attempt, read_worker_dispatch_claim, record_external_turn, record_session_identity, recover_attempt
 from .failure_recovery import FailureBinding, FailureRole, classify_native_failure, read_durable_failure, record_durable_failure, require_scope_open, require_scope_effect_admission
 from .git_identity import TransitionLease
 from .state import TaskIdentity, _open_writable_connection
 from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
-from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect
+from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, recover_role_effect_reservation, reserve_role_effect
 from .shadow import RecorderBinding
 from .worker_shadow import (
     ExternalCapturePlanReceipt,
@@ -866,8 +866,28 @@ class ProductionWorkerFailureLifecycle:
             or attempt.state is not AttemptState.PREPARED
             or attempt.selected_profile_identity != self.recovery.runtime_binding.worker_profile_identity
             or attempt.input_fingerprint != request.input_digest.removeprefix("sha256:")
+            or attempt.session_identity is not None
+            or attempt.external_turn_identity is not None
+            or attempt.output_pointer is not None
+            or attempt.completion_evidence_fingerprint is not None
+            or attempt.accepted_review_identity is not None
+            or read_worker_dispatch_claim(
+                self.repository, self.task_identity, self.recovery,
+                attempt_id=request.attempt_id,
+            ) is not SupervisorDispatchClaimState.UNCLAIMED
         ):
             raise WorkerShadowError("production Worker attempt is not dispatchable")
+
+    def claim_dispatch(self, request: CodexWorkerRequest) -> None:
+        """Consume the no-effect proof immediately before native dispatch."""
+
+        try:
+            claim_worker_dispatch(
+                self.repository, self.task_identity, self.recovery,
+                attempt_id=request.attempt_id, lease=self.lease, now=self.observed_at,
+            )
+        except Exception as error:
+            raise WorkerShadowError("production Worker dispatch claim is unavailable") from error
 
     def require_effect_scope(self) -> None:
         """Serialize one Worker effect admission with same-scope denials."""
@@ -987,18 +1007,31 @@ class ProductionCodingWorkerRuntime:
         request_material, preflight_material = self._adapter.effect_material(request)
         try:
             from .failure_recovery import admit_scope_effect_reservation
-            reservation = admit_scope_effect_reservation(
-                self._failure_lifecycle.repository, self._failure_lifecycle.task_identity,
-                "worker:" + self._failure_lifecycle.task_identity.task_id,
-                lambda: reserve_role_effect(
+            try:
+                # Reuse only while require_dispatchable has proved that this
+                # exact PREPARED attempt has no session, turn, output, or
+                # pre-effect claim. A claimed/completed debit is never reset.
+                reservation = recover_role_effect_reservation(
                     self._advisory_execution, host_inputs=self._execution_host,
                     ledger_path=self._budget_ledger_path,
                     profile=self._adapter._profile,
                     request_or_attempt_identity=request.attempt_id,
                     request_material=request_material,
                     preflight_material=preflight_material,
-                ),
-            )
+                )
+            except RoleCapabilityError:
+                reservation = admit_scope_effect_reservation(
+                    self._failure_lifecycle.repository, self._failure_lifecycle.task_identity,
+                    "worker:" + self._failure_lifecycle.task_identity.task_id,
+                    lambda: reserve_role_effect(
+                        self._advisory_execution, host_inputs=self._execution_host,
+                        ledger_path=self._budget_ledger_path,
+                        profile=self._adapter._profile,
+                        request_or_attempt_identity=request.attempt_id,
+                        request_material=request_material,
+                        preflight_material=preflight_material,
+                    ),
+                )
         except RoleCapabilityError as error:
             raise WorkerShadowError("production coding budget admission is denied") from error
         try:
@@ -1035,7 +1068,7 @@ class ProductionCodingWorkerRuntime:
             if state == "submitted": acknowledged_sequences.add(item.sequence)
 
         callback = execute if request.action is not WorkerAction.PLANNING else None
-        result = self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, effect_reservation=reservation, scope_admission=self._failure_lifecycle.require_effect_scope)
+        result = self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, effect_reservation=reservation, scope_admission=self._failure_lifecycle.require_effect_scope, checkpoint_dispatch=lambda: self._failure_lifecycle.claim_dispatch(request))
         if result.kind is WorkerResultKind.BLOCKED:
             self._failure_lifecycle.record_terminal_failure(request, result)
         return result

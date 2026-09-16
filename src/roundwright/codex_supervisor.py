@@ -440,7 +440,7 @@ class SupervisorFallbackAuthorization:
             raise CodexSupervisorError("Supervisor fallback authorization is invalid")
 
 
-def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None, authorize_fallback: Callable[[CodexSupervisorRequest, CodexSupervisorResult, CodexSupervisorRequest], SupervisorFallbackAuthorization] | None = None, resume_invalid_attempts: int = 0, resume_result: CodexSupervisorResult | None = None, checkpoint_dispatch: Callable[[CodexSupervisorRequest], None] | None = None, scope_admission: Callable[[], None] | None = None) -> SupervisorFailoverResult:
+def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest, ...], adapters: tuple[CodexSupervisorAdapter, ...], advisory_executions: tuple[SealedRoleExecution, ...], execution_hosts: tuple[TrustedExecutionHostInputs, ...], budget_ledger_paths: tuple[Path, ...], *, checkpoint_session: Callable[[str], None], checkpoint_turn: Callable[[str, str], None], checkpoint_result: Callable[[int, CodexSupervisorRequest, CodexSupervisorResult], None] | None = None, authorize_fallback: Callable[[CodexSupervisorRequest, CodexSupervisorResult, CodexSupervisorRequest], SupervisorFallbackAuthorization] | None = None, resume_invalid_attempts: int = 0, resume_result: CodexSupervisorResult | None = None, checkpoint_dispatch: Callable[[CodexSupervisorRequest], None] | None = None, scope_admission: Callable[[], None] | None = None, reservation_admission: Callable[[Callable[[], TrustedRoleEffectReservation]], TrustedRoleEffectReservation] | None = None) -> SupervisorFailoverResult:
     """Run a bounded configured sequence without retrying uncertain outcomes.
 
     Only a typed format-invalid result may advance.  A typed ``BLOCKED`` is a
@@ -452,6 +452,7 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
         raise CodexSupervisorError("Supervisor failover inputs are invalid")
     if ((checkpoint_dispatch is not None and not callable(checkpoint_dispatch))
             or (scope_admission is not None and not callable(scope_admission))
+            or (reservation_admission is not None and not callable(reservation_admission))
             or (resume_invalid_attempts and (
                 type(resume_result) is not CodexSupervisorResult
                 or resume_result.kind is not SupervisorResultKind.INVALID
@@ -494,17 +495,20 @@ def dispatch_ordered_supervisor_attempts(requests: tuple[CodexSupervisorRequest,
         attempted.append(request.selected_profile_identity)
         request_material, preflight_material = adapter.effect_material(request)
         try:
+            reserve = lambda: reserve_role_effect(
+                advisory_execution, host_inputs=execution_host,
+                ledger_path=budget_ledger_path, profile=adapter._profile,
+                request_or_attempt_identity=request.provider_attempt_id,
+                request_material=request_material, preflight_material=preflight_material,
+            )
             effect_reservation = (
                 recover_role_effect_reservation(
                     advisory_execution, host_inputs=execution_host,
                     ledger_path=budget_ledger_path, profile=adapter._profile,
                     request_or_attempt_identity=request.provider_attempt_id,
                     request_material=request_material, preflight_material=preflight_material,
-                ) if recover_pending else reserve_role_effect(
-                    advisory_execution, host_inputs=execution_host,
-                    ledger_path=budget_ledger_path, profile=adapter._profile,
-                    request_or_attempt_identity=request.provider_attempt_id,
-                    request_material=request_material, preflight_material=preflight_material,
+                ) if recover_pending else (
+                    reservation_admission(reserve) if reservation_admission is not None else reserve()
                 )
             )
         except RoleCapabilityError as error:

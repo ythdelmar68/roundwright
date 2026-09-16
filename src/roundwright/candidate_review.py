@@ -25,6 +25,7 @@ from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
 from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, preflight_candidate_evidence, seal_candidate
 from .provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
+from .failure_recovery import require_scope_open
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_review_limit_finalization, transition_task
 from .worker_planning import ProviderDispatchControl
@@ -979,6 +980,7 @@ def read_diff_review(
     seal: CandidateSeal | None = None,
     context: RecoveryContext | None = None,
     lease: TransitionLease | None = None,
+    invalidate_stale: bool = True,
 ) -> PersistedDiffReview:
     _token(diff_review_attempt_id, "diff review identity")
     if binding is None or seal is None or context is None:
@@ -1024,7 +1026,7 @@ def read_diff_review(
         and persisted_follow_up_digests == expected_follow_up_digests
         and provenance_count == len(expected_follow_up_digests)
     )
-    if not accepted and row[6] == "accepted":
+    if not accepted and row[6] == "accepted" and invalidate_stale:
         _stale_diff_review_acceptance(repository, identity, diff_review_attempt_id, lease)
     return PersistedDiffReview(diff_review_attempt_id, row[0], row[1], row[2], row[3], row[4], row[5], row[7] if accepted else None, DiffReviewVerdict(row[9]), accepted, tuple(json.loads(row[10] or "[]")), row[11])
 
@@ -1397,6 +1399,11 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now, pass_
         connection.execute("BEGIN IMMEDIATE")
         _require_lease(connection, lease, identity, now)
         _require_matching_task(connection, identity, "diff-review")
+        # Acceptance is itself a scoped product transition.  Keep the scope
+        # read in the same transaction as both accepted rows so a STOP_SCOPE
+        # committed while the provider response is being read cannot be
+        # overtaken merely because completed output evidence exists.
+        require_scope_open(connection, identity.task_id, "supervisor:" + identity.task_id)
         _require_exact_provider_context(connection, identity, dispatch.provider_attempt_id, context)
         _require_sealed_provider_authorization(connection, identity, dispatch.provider_attempt_id, context, now)
         row = connection.execute("SELECT state, accepted_review_identity, verification_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (dispatch.diff_review_attempt_id, identity.task_id)).fetchone()

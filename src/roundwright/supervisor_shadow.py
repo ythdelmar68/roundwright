@@ -19,7 +19,7 @@ from .runtime_binding import ExternalSupervisorRuntimeStore, FileSupervisorRunti
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recover_role_effect_reservation, recovery_reservation_digest
 from .state import TaskIdentity, _open_writable_connection, _require_matching_task, database_path, require_runtime_binding
 from .provider_recovery import RecoveryContext
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, begin_durable_recovery_route_reservation, classify_for_role, classify_native_failure, require_scope_open, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, parse_failure_record, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, admit_scope_effect_reservation, begin_durable_recovery_route_reservation, classify_for_role, classify_native_failure, require_scope_effect_admission, require_scope_open, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, parse_failure_record, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
 
 
 SUPERVISOR_FAILOVER_PROFILE = "roundwright-shadow-profile/supervisor-review-failover/v1"
@@ -1198,6 +1198,18 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
             source.input_digest, target.input_digest, consume, prepare, abandon, release,
         )
 
+    def reserve_with_scope(reserve: Callable[[], TrustedRoleEffectReservation]) -> TrustedRoleEffectReservation:
+        """Preserve product-before-budget order and the dispatcher's unwind."""
+
+        try:
+            return admit_scope_effect_reservation(
+                repository, task_identity, "supervisor:" + task_identity.task_id, reserve,
+            )
+        except RoleCapabilityError:
+            raise
+        except Exception as error:
+            raise RoleCapabilityError("Supervisor scoped reservation is denied") from error
+
     failover = dispatch_ordered_supervisor_attempts(
         requests, adapters, advisory_executions, execution_hosts,
         tuple(budget_ledger_path for _ in adapters),
@@ -1207,6 +1219,10 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         resume_invalid_attempts=len(progress_events),
         resume_result=matched[0] if progress_events else None,
         checkpoint_dispatch=checkpoint_dispatch,
+        scope_admission=lambda: require_scope_effect_admission(
+            repository, task_identity, "supervisor:" + task_identity.task_id,
+        ),
+        reservation_admission=reserve_with_scope,
     )
     attempts = tuple(observed_attempts)
     try:

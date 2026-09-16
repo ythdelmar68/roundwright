@@ -240,6 +240,76 @@ class ProductionRuntimeTests(unittest.TestCase):
                 self.assertEqual(runtime._adapter._backend.calls, 0)
                 self.assertFalse(Path(temp, "role-budget.sqlite").exists())
 
+    def test_stopped_unclaimed_worker_reuses_exact_unused_reservation_after_clearance(self):
+        """A pre-effect stop cannot strand the Worker's only budget slot."""
+
+        from roundwright.failure_recovery import Clearance, EvidenceSource, FailureBinding, classify, record_durable_clearance, record_durable_failure
+        import roundwright.failure_recovery as recovery_module
+
+        with tempfile.TemporaryDirectory() as temp:
+            events = []
+            turn = Turn(events, (NativeWorkerTurnStep(response=NativeWorkerResponse(
+                WorkerResultKind.ACCEPTED, {"status": "done"},
+            )),))
+            with self.hermetic_runtime(Path(temp), turn, events) as runtime:
+                lifecycle = runtime._failure_lifecycle
+                repository, identity, recovery = lifecycle.repository, lifecycle.task_identity, lifecycle.recovery
+                prepare_attempt(
+                    repository, identity, recovery, attempt_id="reservation-stop-source",
+                    role=ProviderRole.WORKER, process_lease_id="reservation-stop-lease",
+                    process_lease_expires_at=2_000_000_000, input_fingerprint="c" * 64,
+                    lease=lifecycle.lease, now=101,
+                )
+                from roundwright.provider_recovery import record_session_identity
+                record_session_identity(
+                    repository, identity, recovery, attempt_id="reservation-stop-source",
+                    session_identity="reservation-stop-session", lease=lifecycle.lease, now=101,
+                )
+                denial = classify(FailureBinding(
+                    recovery.candidate_sha, "sha256:" + recovery.policy_fingerprint,
+                    recovery.runtime_binding.resolved_digest, "worker:" + identity.task_id,
+                    FailureRole.WORKER, recovery.runtime_binding.worker_profile_identity,
+                    "reservation-stop-session", "reservation-stop-source",
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
+                original = recovery_module.admit_scope_effect_reservation
+
+                def stop_after_reservation(*args, **kwargs):
+                    reservation = original(*args, **kwargs)
+                    record_durable_failure(repository, identity, denial, now=101)
+                    return reservation
+
+                with patch.object(recovery_module, "admit_scope_effect_reservation", side_effect=stop_after_reservation), self.assertRaisesRegex(Exception, "scope admission"):
+                    runtime.dispatch(self.request(), checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None)
+                self.assertEqual(runtime._adapter._backend.calls, 0)
+                with closing(sqlite3.connect(repository.root / ".roundwright" / "state.sqlite3")) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM provider_dispatch_claims WHERE attempt_id=?", (self.request().attempt_id,),
+                    ).fetchone(), (0,))
+                with closing(sqlite3.connect(Path(temp) / "role-budget.sqlite")) as connection:
+                    reserved = connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall()
+                    self.assertEqual(reserved, [(1, 60, 4000)])
+
+                fixture = ProviderRecoveryTests()
+                fixture.denial_command(repository, identity, denial, "reservation-stop-clear", kind="clear")
+                record_durable_clearance(
+                    repository, identity,
+                    Clearance(denial.digest, denial.binding, "reservation-stop-clear"),
+                )
+                result = runtime.dispatch(
+                    self.request(), checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None,
+                )
+                self.assertEqual((result.kind, runtime._adapter._backend.calls), (WorkerResultKind.ACCEPTED, 1))
+                with closing(sqlite3.connect(Path(temp) / "role-budget.sqlite")) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), reserved)
+                with closing(sqlite3.connect(repository.root / ".roundwright" / "state.sqlite3")) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM provider_dispatch_claims WHERE attempt_id=?", (self.request().attempt_id,),
+                    ).fetchone(), (1,))
+
     def test_test_only_harness_preserves_allowlisted_write_and_denial_coverage(self):
         with tempfile.TemporaryDirectory() as temp:
             events=[]; allowed=NativeWorkerToolRequest(1, WorkerTool.WORKSPACE_WRITE, path="out.txt", content="ok")

@@ -512,13 +512,19 @@ class DependencyReviewStore:
         for attempt_id in visited:
             DependencyReviewStore._read_attempt(connection, attempt_id)
 
-    def accept_proposal(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyReviewBinding) -> str:
-        if type(binding) is not DependencyReviewBinding:
+    def accept_proposal(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyReviewBinding, task_identity: TaskIdentity | None = None) -> str:
+        if type(binding) is not DependencyReviewBinding or (task_identity is not None and type(task_identity) is not TaskIdentity):
             raise DependencyReviewError("dependency review binding is invalid")
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
             attempt, subset = self._read_attempt(connection, proposal.attempt_id)
+            if task_identity is not None:
+                self._require_current_authority(connection, task_identity, subset, binding)
+                require_scope_open(
+                    connection, task_identity.task_id,
+                    "dependency-review:" + task_identity.task_id,
+                )
             if attempt[6] not in {"prepared", "accepted"} or (attempt[2], attempt[3]) != (binding.profile_identity, binding.configuration_digest):
                 raise DependencyReviewError("dependency review attempt is not available")
             self._verify_task_lineage(connection, attempt[0])
@@ -559,15 +565,22 @@ class DependencyReviewStore:
         finally:
             connection.close()
 
-    def record_invalid(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str, reason_code: str, owner_route: str = "owner-review") -> None:
+    def record_invalid(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str, reason_code: str, owner_route: str = "owner-review", task_identity: TaskIdentity | None = None, binding: DependencyReviewBinding | None = None) -> None:
         """Retain a malformed or ambiguous result without accepting a proposal."""
 
-        if not _token(attempt_id) or not _digest(output_digest) or not _REASON.fullmatch(reason_code) or not _REASON.fullmatch(owner_route):
+        if (not _token(attempt_id) or not _digest(output_digest) or not _REASON.fullmatch(reason_code)
+                or not _REASON.fullmatch(owner_route) or (task_identity is None) != (binding is None)
+                or (task_identity is not None and type(task_identity) is not TaskIdentity)
+                or (binding is not None and type(binding) is not DependencyReviewBinding)):
             raise DependencyReviewError("dependency review invalid outcome is malformed")
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row, _ = self._read_attempt(connection, attempt_id)
+            row, subset = self._read_attempt(connection, attempt_id)
+            if task_identity is not None:
+                assert binding is not None
+                self._require_current_authority(connection, task_identity, subset, binding)
+                require_scope_open(connection, task_identity.task_id, "dependency-review:" + task_identity.task_id)
             if row[6] not in {"prepared", "invalid"}:
                 raise DependencyReviewError("dependency review attempt is not available")
             self._verify_task_lineage(connection, row[0])
@@ -589,7 +602,7 @@ class DependencyReviewStore:
         finally:
             connection.close()
 
-    def record_blocked(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str, reason_code: str, owner_route: str = "owner-review") -> None:
+    def record_blocked(self, repository: RepositoryIdentity, *, attempt_id: str, output_digest: str, reason_code: str, owner_route: str = "owner-review", task_identity: TaskIdentity | None = None, binding: DependencyReviewBinding | None = None) -> None:
         """Retain an uncertain provider turn without permitting a retry in place.
 
         A blocked attempt is terminal evidence: a caller must create a successor
@@ -597,12 +610,19 @@ class DependencyReviewStore:
         provider turn from being silently replayed or accepted later.
         """
 
-        if not _token(attempt_id) or not _digest(output_digest) or not _REASON.fullmatch(reason_code) or not _REASON.fullmatch(owner_route):
+        if (not _token(attempt_id) or not _digest(output_digest) or not _REASON.fullmatch(reason_code)
+                or not _REASON.fullmatch(owner_route) or (task_identity is None) != (binding is None)
+                or (task_identity is not None and type(task_identity) is not TaskIdentity)
+                or (binding is not None and type(binding) is not DependencyReviewBinding)):
             raise DependencyReviewError("dependency review blocked outcome is malformed")
         connection = _open_writable_connection(repository)
         try:
             connection.execute("BEGIN IMMEDIATE")
-            row, _ = self._read_attempt(connection, attempt_id)
+            row, subset = self._read_attempt(connection, attempt_id)
+            if task_identity is not None:
+                assert binding is not None
+                self._require_current_authority(connection, task_identity, subset, binding)
+                require_scope_open(connection, task_identity.task_id, "dependency-review:" + task_identity.task_id)
             if row[6] not in {"prepared", "blocked"}:
                 raise DependencyReviewError("dependency review attempt is not available")
             self._verify_task_lineage(connection, row[0])
@@ -617,6 +637,60 @@ class DependencyReviewStore:
                 raise DependencyReviewError("dependency review blocked outcome has drifted")
             connection.execute("INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, ?, ?, ?, ?)", (attempt_id, *outcome))
             connection.execute("UPDATE dependency_review_attempts SET state = 'blocked' WHERE attempt_id = ?", (attempt_id,))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_scope_denied(
+        self, repository: RepositoryIdentity, *, attempt_id: str,
+        output_digest: str, task_identity: TaskIdentity,
+        binding: DependencyReviewBinding,
+    ) -> None:
+        """Retain a response-time scope stop as terminal blocked evidence.
+
+        This is deliberately not a general terminal-outcome bypass.  The same
+        transaction authenticates current authority, proves the exact durable
+        scope is stopped, and changes only the still-prepared attempt to the
+        fixed ``scope-stopped`` blocked outcome.
+        """
+
+        if (not _token(attempt_id) or not _digest(output_digest)
+                or type(task_identity) is not TaskIdentity
+                or type(binding) is not DependencyReviewBinding):
+            raise DependencyReviewError("dependency review scope denial is malformed")
+        connection = _open_writable_connection(repository)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row, subset = self._read_attempt(connection, attempt_id)
+            self._require_current_authority(connection, task_identity, subset, binding)
+            try:
+                require_scope_open(
+                    connection, task_identity.task_id,
+                    "dependency-review:" + task_identity.task_id,
+                )
+            except FailureRecoveryError:
+                pass
+            else:
+                raise DependencyReviewError("dependency review scope denial is unavailable")
+            outcome = ("blocked", "scope-stopped", output_digest, "owner-review")
+            stored = connection.execute(
+                "SELECT outcome, reason_code, output_digest, owner_route FROM dependency_review_validation_outcomes WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row[6] == "prepared" and stored is None:
+                connection.execute(
+                    "INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, ?, ?, ?, ?)",
+                    (attempt_id, *outcome),
+                )
+                connection.execute(
+                    "UPDATE dependency_review_attempts SET state = 'blocked' WHERE attempt_id = ?",
+                    (attempt_id,),
+                )
+            elif row[6] != "blocked" or tuple(stored or ()) != outcome:
+                raise DependencyReviewError("dependency review scope denial has drifted")
             connection.commit()
         except Exception:
             connection.rollback()

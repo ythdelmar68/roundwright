@@ -725,6 +725,56 @@ class DependencyReviewServiceTests(unittest.TestCase):
             self.assertEqual(backend.sessions, [])
             self.assertFalse(effect["budget_ledger_path"].exists())
 
+    def test_response_time_scope_denial_records_blocked_not_accepted_or_invalid(self) -> None:
+        """Proposal acceptance and the denial decision share one transaction."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116"),
+            ))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            original = Turn.read_response
+
+            def deny_after_read(turn):
+                response = original(turn)
+                record_durable_failure(
+                    repository, identity,
+                    classify(FailureBinding(
+                        binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                        "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                        binding.profile_identity, "session-116", "attempt-116",
+                    ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                )
+                return response
+
+            with patch.object(Turn, "read_response", deny_after_read):
+                result = DependencyReviewService().run(
+                    repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                    checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None,
+                    task_identity=identity,
+                    **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
+                )
+            self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.BLOCKED, "scope-stopped"))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-116'"
+                ).fetchone(), ("blocked",))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM dependency_review_proposals").fetchone(), (0,))
+                self.assertEqual(connection.execute(
+                    "SELECT outcome, reason_code FROM dependency_review_validation_outcomes WHERE attempt_id='attempt-116'"
+                ).fetchone(), ("blocked", "scope-stopped"))
+            restarted = DependencyReviewService().run
+            with self.assertRaises(DependencyReviewDispatchError):
+                restarted(
+                    repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                    checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None,
+                    task_identity=identity,
+                    **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
+                )
+            self.assertEqual(len(backend.sessions), 1)
+
     def test_digit_leading_native_ids_persist_the_exact_durable_turn_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))

@@ -1006,10 +1006,39 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
             decision_digest = record_durable_failure(repository, task_identity, decision, now=evidence_time)
             if read_durable_failure(repository, task_identity, decision_digest) != decision:
                 raise SupervisorShadowError("Supervisor blocked source decision has drifted")
-        observed = _sequence_attempt(ordinal, request, result); observed_attempts.append(observed)
+        observed = _sequence_attempt(ordinal, request, result)
         event = SupervisorAttemptEvent(expected_receipt.record_identity, expected_receipt.source_identity, expected_receipt.observation_identity, expected_receipt.candidate_sha, expected_receipt.context_identity, expected_receipt.plan_identity, expected_receipt.capture_plan_digest, ordinal, prior.receipt_digest, request.input_digest, request.selected_profile_identity, adapters[ordinal - 1].runtime_fingerprint, result.kind.value, observed.result_identity, observed.result_identity if result.kind is SupervisorResultKind.ACCEPTED else None, observed.verdict, expected_receipt.ready_at, expected_receipt.freshness_until)
-        try: prior = lifecycle.append(expected_receipt.record_identity, event, evidence_time=evidence_time)
-        except Exception as error: raise SupervisorShadowError("Supervisor durable lifecycle append failed") from error
+        if result.kind is SupervisorResultKind.ACCEPTED:
+            # The accepted lifecycle event is the qualification's product
+            # decision.  Hold the product-ledger writer lock while checking the
+            # durable scope and appending that event, so a STOP_SCOPE committed
+            # during response reading wins before any PASS evidence exists.
+            connection = _open_writable_connection(repository)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                _require_matching_task(connection, task_identity)
+                require_scope_open(
+                    connection, task_identity.task_id,
+                    "supervisor:" + task_identity.task_id,
+                )
+                prior = lifecycle.append(
+                    expected_receipt.record_identity, event,
+                    evidence_time=evidence_time,
+                )
+                connection.commit()
+            except Exception as error:
+                connection.rollback()
+                raise SupervisorShadowError(
+                    "Supervisor durable lifecycle acceptance is denied"
+                ) from error
+            finally:
+                connection.close()
+        else:
+            try:
+                prior = lifecycle.append(expected_receipt.record_identity, event, evidence_time=evidence_time)
+            except Exception as error:
+                raise SupervisorShadowError("Supervisor durable lifecycle append failed") from error
+        observed_attempts.append(observed)
         if result.kind is SupervisorResultKind.INVALID and result.diagnostic in {
             SupervisorDiagnostic.SYNTAX, SupervisorDiagnostic.SHAPE,
         }:

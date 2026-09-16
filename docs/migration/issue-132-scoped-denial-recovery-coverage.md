@@ -271,3 +271,23 @@ completion, or accepted evidence. `E1R13-04` proves a denial ordered before
 that claim leaves zero provider calls and that exact authoritative no-effect
 proof can recover the unused reservation after clearance. No public or
 completed-reservation refund surface is added or weakened.
+
+## E1R14 response-time acceptance and prepared-restart closure
+
+The E1R14 review evidence is retained below as an explicit before/after ledger.
+“Before” names the concrete candidate behavior identified by review; “after”
+names the candidate-bound invariant and executable regression that closes it.
+
+| Finding | Before: reproduced defect boundary | After: durable invariant and semantic evidence |
+| --- | --- | --- |
+| E1R14-01 | The real Supervisor qualification path could read a response after a same-scope denial and append PASS lifecycle evidence without another product-ledger fence. | Lifecycle acceptance authenticates the current task and open scope while holding `BEGIN IMMEDIATE`; `test_real_qualification_response_time_denial_cannot_seal_pass` proves no event or terminal PASS survives the denial. |
+| E1R14-02 | Dependency review checked scope after response parsing outside proposal persistence, so response-time denial could not produce one authoritative blocked outcome. | Proposal acceptance and outcome persistence authenticate authority and scope in their write transaction; `test_response_time_scope_denial_records_blocked_not_accepted_or_invalid` records only `blocked/scope-stopped`, with no proposal or second session. |
+| E1R14-03 | FINDINGS persistence lacked the PASS path's scope fence and changed task state in a later transaction, allowing partial artifacts/routes/items. | Scope check, artifact, route, review items, and `diff-review` to `implementing` transition share one transaction; `test_response_time_denial_rolls_back_findings_route_and_transition` proves complete rollback. |
+| E1R14-04 | Accepted replay validation did not require the exact persisted session checkpoint and formal turn binding. | Readiness and execution share the complete session/formal/claim/coordinate/acceptance validator; `test_readiness_and_execution_share_complete_accepted_state_validation` rejects deleted checkpoints and substituted turns without redispatch. |
+| E1R14-05 | Scope admission and reservation were separable, and a preparation rejection after an ordinary correction debit could strand that debit. | Scope admission serializes the budget write against STOP; only an exact sealed debit with no attempt, claim, checkpoint, completion, or formal review may be released. Concurrent stopped writers and `test_unused_correction_debit_is_recovered_when_preparation_fails` prove zero escaped or stranded cost. |
+| E1R14-06 | A physical-ordinal-zero PREPARED restart always attempted a fresh reservation instead of recovering an existing exact debit. | Initial PREPARED recovery accepts an optional exact reservation and reuses it; `test_initial_prepared_reservation_resumes_after_crash_without_double_debit` proves one debit and one provider call across the crash. |
+| E1R14-07 | Prepared-state readiness recognized only initial and same-profile correction shapes, rejecting an authorized next-profile fallback. | One classifier covers initial, correction, and terminal-authorized fallback attempts, including reserving and consumed route states. `test_format_correction_then_verified_outage_falls_back_without_stranding` proves both preparation and route-commit restarts; `test_prepared_fallback_readiness_rejects_route_identity_claim_and_reservation_drift` rejects every substituted binding. |
+
+All E1R14 tests are appended to the independently ordered Issue #132 semantic
+inventory. Windows declares no E1R14 skip, and the candidate-bound receipt must
+execute every entry before the coverage manifest can render or verify.

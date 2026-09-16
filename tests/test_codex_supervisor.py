@@ -919,6 +919,57 @@ class SupervisorTests(unittest.TestCase):
             checkpoint_session=deny_at_session, checkpoint_turn=lambda *_: None, _exercise=exercise,
         )
 
+    def test_real_qualification_response_time_denial_cannot_seal_pass(self):
+        """PASS lifecycle acceptance linearizes after the response-time stop."""
+
+        from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+            NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+        ))
+        original = Turn.read_response
+
+        def exercise(run, repository, _budget):
+            identity = TaskIdentity(
+                self.context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright",
+                "codex/supervisor-sequence", "C:/private/supervisor-sequence", self.context.base_sha,
+            )
+
+            def deny_after_read(turn):
+                response = original(turn)
+                record_durable_failure(
+                    repository, identity,
+                    classify(FailureBinding(
+                        self.context.candidate_sha, self.context.policy_digest,
+                        self.context.configuration_digest, "supervisor:" + self.context.task_id,
+                        FailureRole.SUPERVISOR, requests[0].selected_profile_identity,
+                        "session-1", requests[0].provider_attempt_id,
+                    ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                    now=101,
+                )
+                return response
+
+            with patch.object(Turn, "read_response", deny_after_read), self.assertRaisesRegex(
+                SupervisorShadowError, "lifecycle acceptance is denied",
+            ):
+                run()
+            self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 0, 0))
+            self.assertEqual(recorder.calls, ["prepare"])
+            record_identity = next(iter(lifecycle._records))
+            progress = lifecycle.read_progress(record_identity, evidence_time=101)
+            self.assertEqual((progress[2], progress[4]), ((), None))
+
+        qualify_supervisor_sequence(
+            adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+            evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+            trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+            review_authority_expectation=self.authority_expectation,
+            review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+            checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+        )
+
     def test_denial_before_correction_reservation_leaves_no_budget_or_successor(self):
         """Scope admission and the correction debit share one lock order."""
 

@@ -465,6 +465,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             "dispatch-claim": ("DELETE FROM provider_dispatch_claims WHERE attempt_id=?",),
             "coordinate": ("DELETE FROM supervisor_attempt_coordinates WHERE attempt_id=?",),
             "formal-acceptance": ("DELETE FROM accepted_provider_reviews WHERE attempt_id=?",),
+            "session-checkpoint": ("DELETE FROM provider_session_checkpoints WHERE attempt_id=?",),
+            "formal-turn": ("UPDATE diff_review_attempts SET external_turn_identity='substituted-turn' WHERE provider_attempt_id=?",),
         }
         for name, (statement,) in mutations.items():
             with self.subTest(drift=name), TemporaryDirectory() as temporary:
@@ -693,6 +695,79 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(ProviderAttemptRuntimeError, "drifted"):
                 restarted.validate_accounting_checkpoint()
 
+    def test_initial_prepared_reservation_resumes_after_crash_without_double_debit(self) -> None:
+        """Physical ordinal zero reuses an exact untouched sealed debit."""
+
+        class ProcessDeath(BaseException): pass
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            runner.validate_accounting_checkpoint()
+            original = provider_attempt_runtime.prepare_attempt
+            reserved_usage = []
+
+            def interrupt(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if not runner.budget_ledger_path.is_file():
+                    return result
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                    reserved_usage.extend(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall())
+                raise ProcessDeath
+
+            with patch.object(provider_attempt_runtime, "prepare_attempt", side_effect=interrupt), self.assertRaises(ProcessDeath):
+                runner.execute()
+            self.assertEqual(backend.calls, 0)
+            before = reserved_usage
+            self.assertEqual(before, [(1, 60, 4000)])
+            self.assertEqual(runner.validate_accounting_checkpoint().state, AttemptState.PREPARED)
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            self.assertEqual(backend.calls, 1)
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute("SELECT calls, duration_seconds, tokens FROM role_budget_usage").fetchall(), before)
+
+    def test_unused_correction_debit_is_recovered_when_preparation_fails(self) -> None:
+        """No attempt, claim, or call means the scoped debit is recoverable."""
+
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            selection = replace(
+                runner.selection, diff_review_attempt_id="unused-review",
+                provider_attempt_id="unused-provider", message_identity="unused-message",
+                process_lease_id="unused-lease", physical_format_output_ordinal=1,
+            )
+            correction = replace(runner, sequence=(first, self.sequence_entry(
+                runner, selection=selection,
+                backend=Backend("unused-correction", NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                ), []),
+            )))
+            original = provider_attempt_runtime.prepare_attempt
+
+            def reject_new_attempt(*args, **kwargs):
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    raise ProviderRecoveryError("injected preparation rejection")
+                return original(*args, **kwargs)
+
+            with patch.object(provider_attempt_runtime, "prepare_attempt", side_effect=reject_new_attempt), self.assertRaises(ProviderRecoveryError):
+                correction.execute()
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM provider_attempts WHERE attempt_id=?", (selection.provider_attempt_id,),
+                ).fetchone())
+            with closing(sqlite3.connect(correction.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT sum(calls), sum(duration_seconds), sum(tokens) FROM role_budget_usage"
+                ).fetchone(), (1, 60, 4000))
+
     def test_stopped_scope_rejects_correction_before_any_state_or_budget_change(self) -> None:
         """A denied correction is inert across product and budget ledgers."""
 
@@ -740,8 +815,15 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 }
             with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
                 budget_before = connection.execute("SELECT * FROM role_budget_usage ORDER BY 1").fetchall()
-            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "scope is stopped"):
-                denied.execute()
+            def denied_writer(_index):
+                try:
+                    denied.execute()
+                except ProviderAttemptRuntimeError as error:
+                    return str(error)
+                return "unexpected-success"
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                outcomes = tuple(pool.map(denied_writer, range(4)))
+            self.assertTrue(all("scope is stopped" in outcome for outcome in outcomes), outcomes)
             with closing(sqlite3.connect(database_path(repository))) as connection:
                 self.assertEqual({
                     table: connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
@@ -804,8 +886,8 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             FailureRecoveryError, abandon_durable_recovery_route_reservation,
             read_durable_recovery_route_authorization,
         )
-        for interrupted in (False, True):
-            with self.subTest(interrupted=interrupted), TemporaryDirectory() as temporary:
+        for interruption in (None, "prepared", "route-committed"):
+            with self.subTest(interruption=interruption), TemporaryDirectory() as temporary:
                 runner, primary, repository, identity, recovery, _ = self.durable_runner(
                     Path(temporary) / "repository",
                     NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
@@ -820,7 +902,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     self.sequence_entry(runner, selection=correction, backend=outage),
                     self.sequence_entry(runner, selection=successor, recovery=successor_recovery, audit=successor_recovery.health_receipt.audit_identity, backend=fallback),
                 ))
-                if interrupted:
+                if interruption == "prepared":
                     original = provider_attempt_runtime.read_supervisor_accounting_snapshot
                     def invalid_snapshot(*args, **kwargs):
                         if kwargs["current_attempt_id"] == successor.provider_attempt_id:
@@ -828,22 +910,97 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                         return original(*args, **kwargs)
                     with patch.object(provider_attempt_runtime, "read_supervisor_accounting_snapshot", side_effect=invalid_snapshot), self.assertRaisesRegex(ProviderAttemptRuntimeError, "accounting snapshot is unavailable"):
                         sequence.execute()
+                elif interruption == "route-committed":
+                    original = provider_attempt_runtime.commit_durable_recovery_route_reservation
+                    def interrupt_after_commit(*args, **kwargs):
+                        original(*args, **kwargs)
+                        raise ProviderRecoveryError("injected post-commit interruption")
+                    with patch.object(provider_attempt_runtime, "commit_durable_recovery_route_reservation", side_effect=interrupt_after_commit), self.assertRaisesRegex(ProviderAttemptRuntimeError, "recovery route is unavailable"):
+                        sequence.execute()
+                if interruption is not None:
                     self.assertEqual((primary.calls, outage.calls, fallback.calls), (1, 1, 0))
                     with closing(sqlite3.connect(database_path(repository))) as connection, connection:
-                        route_id, reservation = connection.execute("SELECT route_digest, reservation_digest FROM recovery_route_authorizations WHERE state='reserving'").fetchone()
+                        route_id, reservation, route_state = connection.execute("SELECT route_digest, reservation_digest, state FROM recovery_route_authorizations").fetchone()
                         self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_dispatch_claims WHERE attempt_id=?", (successor.provider_attempt_id,)).fetchone(), (0,))
                         self.assertEqual(connection.execute("SELECT state FROM provider_attempts WHERE attempt_id=?", (successor.provider_attempt_id,)).fetchone(), ("prepared",))
+                    self.assertEqual(route_state, "reserving" if interruption == "prepared" else "consumed")
+                    self.assertEqual(sequence.validate_accounting_checkpoint().state, AttemptState.PREPARED)
                     route = read_durable_recovery_route_authorization(repository, identity, route_id)
-                    with self.assertRaisesRegex(FailureRecoveryError, "successor is already admitted"):
+                    with self.assertRaisesRegex(FailureRecoveryError, "successor is already admitted|route abandonment has drifted"):
                         abandon_durable_recovery_route_reservation(repository, identity, route, reservation_digest=reservation)
                     with closing(sqlite3.connect(database_path(repository))) as connection, connection:
-                        self.assertEqual(connection.execute("SELECT state, reservation_digest FROM recovery_route_authorizations WHERE route_digest=?", (route_id,)).fetchone(), ("reserving", reservation))
+                        self.assertEqual(connection.execute("SELECT state, reservation_digest FROM recovery_route_authorizations WHERE route_digest=?", (route_id,)).fetchone(), (route_state, reservation))
                 expected = (runner.selection.provider_attempt_id, correction.provider_attempt_id, successor.provider_attempt_id)
                 self.assertEqual(sequence.execute(), expected)
                 self.assertEqual(sequence.execute(), expected)
                 self.assertEqual((primary.calls, outage.calls, fallback.calls), (1, 1, 1))
                 with closing(sqlite3.connect(sequence.budget_ledger_path)) as connection, connection:
                     self.assertEqual(connection.execute("SELECT sum(calls), sum(duration_seconds), sum(tokens) FROM role_budget_usage").fetchone(), (3, 180, 12000))
+
+    def test_prepared_fallback_readiness_rejects_route_identity_claim_and_reservation_drift(self) -> None:
+        """The shared PREPARED fallback classifier fails closed on every binding."""
+
+        for drift in ("route", "identity", "claim", "reservation"):
+            with self.subTest(drift=drift), TemporaryDirectory() as temporary:
+                runner, primary, repository, identity, recovery, _ = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.BLOCKED,
+                        failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+                        outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                        sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
+                    ),
+                    suffix="prepared-" + drift,
+                )
+                successor_recovery = provider_context(
+                    recovery, identity, ProviderRole.SUPERVISOR,
+                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+                )
+                successor = replace(
+                    runner.selection, diff_review_attempt_id="prepared-review-" + drift,
+                    provider_attempt_id="prepared-provider-" + drift,
+                    message_identity="prepared-message-" + drift,
+                    process_lease_id="prepared-lease-" + drift,
+                    within_round_attempt=2,
+                )
+                fallback = Backend("prepared-fallback-" + drift, NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                ), [])
+                sequence = replace(runner, sequence=(
+                    self.sequence_entry(runner, backend=primary),
+                    self.sequence_entry(
+                        runner, selection=successor, recovery=successor_recovery,
+                        audit=successor_recovery.health_receipt.audit_identity,
+                        backend=fallback,
+                    ),
+                ))
+                original = provider_attempt_runtime.read_supervisor_accounting_snapshot
+                def interrupt_prepared(*args, **kwargs):
+                    if kwargs["current_attempt_id"] == successor.provider_attempt_id:
+                        raise ProviderRecoveryError("injected prepared fallback interruption")
+                    return original(*args, **kwargs)
+                with patch.object(provider_attempt_runtime, "read_supervisor_accounting_snapshot", side_effect=interrupt_prepared), self.assertRaises(ProviderAttemptRuntimeError):
+                    sequence.execute()
+                self.assertEqual(sequence.validate_accounting_checkpoint().state, AttemptState.PREPARED)
+                if drift == "claim":
+                    claim_supervisor_dispatch(
+                        repository, identity, successor_recovery,
+                        attempt_id=successor.provider_attempt_id,
+                        lease=sequence.lease, now=sequence.dispatch_control.now,
+                    )
+                else:
+                    statements = {
+                        "route": "UPDATE recovery_route_authorizations SET target_route_digest='sha256:" + "e" * 64 + "'",
+                        "identity": "UPDATE provider_attempts SET selected_profile_identity='sha256:" + "e" * 64 + "' WHERE attempt_id='" + successor.provider_attempt_id + "'",
+                        "reservation": "UPDATE recovery_route_authorizations SET reservation_digest='sha256:" + "e" * 64 + "'",
+                    }
+                    with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                        connection.execute(statements[drift])
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    sequence.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    sequence.execute()
+                self.assertEqual(fallback.calls, 0)
 
     def test_format_invalid_cannot_jump_profiles_before_or_after_restart(self) -> None:
         for ordinal in (0, 2):

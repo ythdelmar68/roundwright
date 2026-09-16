@@ -1439,6 +1439,58 @@ def admit_scope_effect_reservation(
         connection.close()
 
 
+def release_unused_provider_effect_reservation(
+    repository, identity, scope: str, *, attempt_id: str,
+    effect_reservation: object,
+) -> None:
+    """Release only an exact debit that has no durable provider successor.
+
+    This is the non-route analogue of recovery-route abandonment.  It retains
+    the product writer lock while proving that no provider attempt, dispatch,
+    checkpoint, completion, or formal review owns the sealed
+    reservation.  Claimed or completed costs are therefore never refundable.
+    """
+
+    from .role_capability_policy import (
+        AdvisoryRole, TrustedRoleEffectReservation,
+        _release_exclusive_recovery_reservation,
+    )
+    from .state import _open_writable_connection, _require_matching_task
+    if (type(effect_reservation) is not TrustedRoleEffectReservation
+            or not isinstance(scope, str) or not isinstance(attempt_id, str)
+            or not attempt_id):
+        raise FailureRecoveryError("unused provider reservation is invalid")
+    binding = getattr(effect_reservation, "_binding", None)
+    request_identity = getattr(effect_reservation, "_request_identity", None)
+    expected_scope = None if binding is None else binding.role.value + ":" + identity.task_id
+    if (binding is None or binding.role not in {AdvisoryRole.SUPERVISOR, AdvisoryRole.DEPENDENCY_REVIEW}
+            or request_identity != attempt_id or scope != expected_scope):
+        raise FailureRecoveryError("unused provider reservation has drifted")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        occupied = any(connection.execute(statement, (attempt_id,)).fetchone() is not None for statement in (
+            "SELECT 1 FROM provider_attempts WHERE attempt_id=?",
+            "SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=?",
+            "SELECT 1 FROM provider_session_checkpoints WHERE attempt_id=?",
+            "SELECT 1 FROM provider_completion_outputs WHERE attempt_id=?",
+            "SELECT 1 FROM diff_review_attempts WHERE provider_attempt_id=?",
+        ))
+        if occupied:
+            raise FailureRecoveryError("unused provider reservation has a durable successor")
+        _release_exclusive_recovery_reservation(
+            effect_reservation,
+            reservation_digest=effect_reservation.recovery_digest,
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource | FailureEvidence) -> FailureRecord:
     """Project observations onto the only matrix-approved durable decision."""
     if type(evidence) is FailureEvidence:

@@ -491,11 +491,25 @@ class DependencyReviewService:
         if result.kind is DependencyReviewResultKind.ACCEPTED:
             assert result.proposal is not None
             try:
-                admit()
-                store.accept_proposal(repository, result.proposal, binding=binding)
+                store.accept_proposal(
+                    repository, result.proposal, binding=binding,
+                    task_identity=task_identity,
+                )
+            except FailureRecoveryError:
+                if task_identity is None:
+                    raise
+                store.record_scope_denied(
+                    repository, attempt_id=attempt.attempt_id,
+                    output_digest=result.output_digest,
+                    task_identity=task_identity, binding=binding,
+                )
+                return DependencyReviewDispatchResult(
+                    DependencyReviewResultKind.BLOCKED, result.session_identity,
+                    result.turn_identity, None, result.output_digest,
+                    "scope-stopped", CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+                )
             except DependencyReviewError:
-                admit()
-                store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code="proposal-rejected")
+                store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code="proposal-rejected", task_identity=task_identity, binding=binding if task_identity is not None else None)
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.INVALID, result.session_identity, result.turn_identity, None, result.output_digest, "proposal-rejected")
         elif result.kind is DependencyReviewResultKind.BLOCKED:
             if task_identity is not None and (result.session_identity is None or result.failure is None):
@@ -511,16 +525,28 @@ class DependencyReviewService:
                     repository, task_identity,
                     classify_native_failure(FailureRole.DEPENDENCY_REVIEW, failure_binding, result.failure),
                 )
-            admit()
-            store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="prebound-transient-route")
+            try:
+                store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="prebound-transient-route", task_identity=task_identity, binding=binding if task_identity is not None else None)
+            except FailureRecoveryError:
+                assert task_identity is not None
+                store.record_scope_denied(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, task_identity=task_identity, binding=binding)
+                return DependencyReviewDispatchResult(DependencyReviewResultKind.BLOCKED, result.session_identity, result.turn_identity, None, result.output_digest, "scope-stopped", result.failure)
         elif result.kind is DependencyReviewResultKind.AMBIGUOUS:
-            admit()
             # UNKNOWN is a durable reconciliation decision, never an ordinary
             # blocked predecessor that a successor can consume as a retry.
-            store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="reconcile-required")
+            try:
+                store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="reconcile-required", task_identity=task_identity, binding=binding if task_identity is not None else None)
+            except FailureRecoveryError:
+                assert task_identity is not None
+                store.record_scope_denied(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, task_identity=task_identity, binding=binding)
+                return DependencyReviewDispatchResult(DependencyReviewResultKind.BLOCKED, result.session_identity, result.turn_identity, None, result.output_digest, "scope-stopped", CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
         else:
-            admit()
-            store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code)
+            try:
+                store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, task_identity=task_identity, binding=binding if task_identity is not None else None)
+            except FailureRecoveryError:
+                assert task_identity is not None
+                store.record_scope_denied(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, task_identity=task_identity, binding=binding)
+                return DependencyReviewDispatchResult(DependencyReviewResultKind.BLOCKED, result.session_identity, result.turn_identity, None, result.output_digest, "scope-stopped", CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
         return result
 
     @staticmethod

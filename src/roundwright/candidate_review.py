@@ -925,6 +925,12 @@ def record_diff_review(
         connection.execute("BEGIN IMMEDIATE")
         _require_lease(connection, lease, identity, now)
         _require_matching_task(connection, identity, "diff-review")
+        if normalized.verdict is DiffReviewVerdict.FINDINGS:
+            # FINDINGS is every bit as product-significant as PASS: the
+            # artifact, Worker route, review items, and implementing
+            # transition are one current-scope decision.  A response-time
+            # STOP_SCOPE therefore leaves none of them behind.
+            require_scope_open(connection, identity.task_id, "supervisor:" + identity.task_id)
         artifact = connection.execute("SELECT verdict, findings_json, pass_follow_ups_json, content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,)).fetchone()
         expected_artifact = (normalized.verdict.value, json.dumps(findings), json.dumps(normalized.pass_follow_ups), bound_output_digest)
         if artifact is None:
@@ -956,6 +962,29 @@ def record_diff_review(
                     dispatch.provider_attempt_id, ReviewItemKind.FINDING,
                     ReviewItemSource.SUPERVISOR_FINDING, digest, "worker-repair", True, timestamp[0],
                 ))
+            if connection.execute(
+                "SELECT 1 FROM transition_events WHERE task_id = ? AND evidence_fingerprint = ?",
+                (identity.task_id, bound_output_digest),
+            ).fetchone() is not None:
+                raise CandidateReviewError("diff review transition evidence has already been committed")
+            blocked_from = connection.execute(
+                "SELECT blocked_from_state FROM tasks WHERE task_id = ?", (identity.task_id,),
+            ).fetchone()
+            if blocked_from is None or blocked_from[0] is not None:
+                raise CandidateReviewError("diff review findings transition is unavailable")
+            sequence = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM transition_events WHERE task_id = ?",
+                (identity.task_id,),
+            ).fetchone()[0]
+            if connection.execute(
+                "UPDATE tasks SET state = 'implementing', blocked_from_state = NULL WHERE task_id = ? AND state = 'diff-review'",
+                (identity.task_id,),
+            ).rowcount != 1:
+                raise CandidateReviewError("diff review findings transition is unavailable")
+            connection.execute(
+                "INSERT INTO transition_events(task_id, sequence, from_state, to_state, evidence_fingerprint) VALUES (?, ?, 'diff-review', 'implementing', ?)",
+                (identity.task_id, sequence, bound_output_digest),
+            )
         connection.commit()
     except Exception:
         connection.rollback()
@@ -963,9 +992,7 @@ def record_diff_review(
     finally:
         connection.close()
     bind_candidate_evidence(repository, binding, seal, evidence_fingerprint=completion_evidence_fingerprint, lease=lease)
-    if normalized.verdict is DiffReviewVerdict.FINDINGS:
-        transition_task(repository, identity, expected_state="diff-review", next_state="implementing", evidence_fingerprint=bound_output_digest, lease=lease)
-    else:
+    if normalized.verdict is not DiffReviewVerdict.FINDINGS:
         _require_live_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id, dispatch.implementation_attempt_id, lease)
         _accept_diff_pass(repository, identity, context, dispatch, lease, now, normalized.pass_follow_ups)
     return read_diff_review(repository, identity, diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)

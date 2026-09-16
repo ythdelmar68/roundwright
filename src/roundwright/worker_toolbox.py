@@ -49,9 +49,9 @@ from .coding_worker_state import (
 from .configuration import ProviderProfile, RepositoryIdentity
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import AttemptState, ProviderRole, RecoveryContext, read_attempt, record_external_turn, record_session_identity, recover_attempt
-from .failure_recovery import FailureBinding, FailureRole, classify_native_failure, read_durable_failure, record_durable_failure
+from .failure_recovery import FailureBinding, FailureRole, classify_native_failure, read_durable_failure, record_durable_failure, require_scope_open
 from .git_identity import TransitionLease
-from .state import TaskIdentity
+from .state import TaskIdentity, _open_writable_connection
 from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
 from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect
 from .shadow import RecorderBinding
@@ -844,6 +844,16 @@ class ProductionWorkerFailureLifecycle:
 
     def require_dispatchable(self, request: CodexWorkerRequest, receipt: CodingDispatchReceipt) -> None:
         self._require_request_binding(request, receipt)
+        # Preparation cannot authorize dispatch after another attempt stops
+        # this scope. Read the current authenticated clearance history before
+        # the caller reserves budget or opens a provider session.
+        connection = _open_writable_connection(self.repository)
+        try:
+            require_scope_open(connection, self.task_identity.task_id, "worker:" + self.task_identity.task_id)
+        except Exception as error:
+            raise WorkerShadowError("production Worker dispatch scope is stopped") from error
+        finally:
+            connection.close()
         try:
             attempt = read_attempt(
                 self.repository, self.task_identity, request.attempt_id,

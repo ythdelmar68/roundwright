@@ -23,7 +23,7 @@ from .dependency_review import (
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .failure_recovery import (
     DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding,
-    FailureClass, FailureRole, FailureRecord, RecoveryAction,
+    FailureClass, FailureRole, FailureRecord, RecoveryAction, FailureRecoveryError, require_scope_open,
     abandon_durable_recovery_route_reservation,
     begin_durable_recovery_route_reservation,
     commit_durable_recovery_route_reservation,
@@ -265,6 +265,12 @@ class DependencyReviewService:
         recovery_digest = _digest({"attempt_id": attempt_id, "status": "recovered-in-flight-dispatch"})
         connection = _open_writable_connection(repository)
         try:
+            # A denial also fences previously prepared identities. Do this
+            # before claim recovery, route creation, or budget reservation.
+            try:
+                require_scope_open(connection, subset.task_id, "dependency-review:" + subset.task_id)
+            except FailureRecoveryError as error:
+                raise DependencyReviewDispatchError("dependency review dispatch scope is stopped") from error
             existing_attempt = connection.execute(
                 "SELECT state FROM dependency_review_attempts WHERE attempt_id = ?",
                 (attempt_id,),

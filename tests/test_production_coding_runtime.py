@@ -6,7 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -193,6 +193,52 @@ class ProductionRuntimeTests(unittest.TestCase):
                 runtime.dispatch(self.request(), checkpoint_session=lambda _: events.append("session"), checkpoint_turn=lambda *_: events.append("turn"))
             self.assertEqual(events, [])
             self.assertFalse(Path(temp, "out.txt").exists())
+
+    def test_prepared_worker_rechecks_peer_denial_before_any_dispatch_effect(self):
+        from dataclasses import replace
+        from roundwright.failure_recovery import Clearance, ClearanceRevocation, EvidenceSource, FailureBinding, classify, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure
+        from roundwright.provider_recovery import record_session_identity
+        with tempfile.TemporaryDirectory() as temp:
+            events = []
+            turn = Turn(events, (NativeWorkerTurnStep(response=NativeWorkerResponse(WorkerResultKind.ACCEPTED, {"status": "done"})),))
+            with self.hermetic_runtime(Path(temp), turn, events) as runtime:
+                lifecycle = runtime._failure_lifecycle
+                repository, identity, recovery = lifecycle.repository, lifecycle.task_identity, lifecycle.recovery
+                prepare_attempt(repository, identity, recovery, attempt_id="peer-denial", role=ProviderRole.WORKER,
+                                process_lease_id="peer-lease", process_lease_expires_at=2_000_000_000,
+                                input_fingerprint="b" * 64, lease=lifecycle.lease, now=101)
+                record_session_identity(repository, identity, recovery, attempt_id="peer-denial",
+                                        session_identity="peer-session", lease=lifecycle.lease, now=101)
+                record = classify(FailureBinding(recovery.candidate_sha, "sha256:" + recovery.policy_fingerprint,
+                                  recovery.runtime_binding.resolved_digest, "worker:" + identity.task_id,
+                                  FailureRole.WORKER, recovery.runtime_binding.worker_profile_identity,
+                                  "peer-session", "peer-denial"), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST)
+                record_durable_failure(repository, identity, record, now=101)
+                def snapshot():
+                    with closing(sqlite3.connect(repository.root / ".roundwright" / "state.sqlite3")) as connection:
+                        return tuple(connection.execute("SELECT * FROM " + table).fetchall() for table in
+                                     ("provider_attempts", "recovery_route_authorizations", "provider_dispatch_claims"))
+                before = snapshot()
+                for _ in range(2):
+                    runtime._failure_lifecycle = replace(lifecycle)
+                    with self.assertRaisesRegex(WorkerShadowError, "scope is stopped"):
+                        runtime.dispatch(self.request(), checkpoint_session=lambda _: events.append("session"),
+                                         checkpoint_turn=lambda *_: events.append("turn"))
+                    self.assertEqual(snapshot(), before)
+                    self.assertEqual(runtime._adapter._backend.calls, 0)
+                    self.assertEqual(events, [])
+                    self.assertFalse(Path(temp, "role-budget.sqlite").exists())
+                fixture = ProviderRecoveryTests()
+                fixture.denial_command(repository, identity, record, "worker-exact-clear", kind="clear")
+                clearance = record_durable_clearance(repository, identity, Clearance(record.digest, record.binding, "worker-exact-clear"))
+                runtime._failure_lifecycle.require_dispatchable(self.request(), runtime._dispatch_receipt)
+                fixture.denial_command(repository, identity, record, "worker-exact-revoke", kind="revoke")
+                record_durable_clearance_revocation(repository, identity, ClearanceRevocation(clearance, record.binding, "worker-exact-revoke"))
+                with self.assertRaisesRegex(WorkerShadowError, "scope is stopped"):
+                    runtime.dispatch(self.request(), checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None)
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(runtime._adapter._backend.calls, 0)
+                self.assertFalse(Path(temp, "role-budget.sqlite").exists())
 
     def test_test_only_harness_preserves_allowlisted_write_and_denial_coverage(self):
         with tempfile.TemporaryDirectory() as temp:

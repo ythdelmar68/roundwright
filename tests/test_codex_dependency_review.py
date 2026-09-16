@@ -365,6 +365,59 @@ class DependencyReviewServiceTests(unittest.TestCase):
             )
             record = read_durable_failure(repository, identity, expected.digest)
             self.assertEqual((record.binding.role, record.failure), (FailureRole.DEPENDENCY_REVIEW, FailureClass.HOST_SECURITY_DENIAL))
+            budget = repository.root / "attempt-116-role-budget.sqlite"
+            def snapshot():
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    state = tuple(connection.execute("SELECT * FROM " + table).fetchall() for table in
+                                  ("dependency_review_attempts", "dependency_review_successors", "recovery_route_authorizations"))
+                with closing(sqlite3.connect(budget)) as connection:
+                    return state, connection.execute("SELECT * FROM role_budget_usage").fetchall()
+            before = snapshot()
+            for attempt_id in ("fresh-denied", "fresh-denied", "another-denied", "attempt-116"):
+                effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id=attempt_id)
+                effect["budget_ledger_path"] = budget
+                with self.assertRaisesRegex(Exception, "scope is stopped"):
+                    DependencyReviewService().run(
+                        repository, subset, attempt_id=attempt_id, binding=binding, adapter=adapter,
+                        checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None,
+                        task_identity=identity, **effect,
+                    )
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(len(backend.sessions), 1)
+
+    def test_prepared_dependency_retry_denial_is_inert_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="denied-source", binding=binding)
+            store.claim_pre_dispatch(repository, attempt_id="denied-source", task_identity=identity, binding=binding)
+            store.claim_session(repository, attempt_id="denied-source", session_identity="denied-session", task_identity=identity, binding=binding)
+            store.record_blocked(repository, attempt_id="denied-source", output_digest="sha256:" + "a" * 64,
+                                 reason_code="provider-blocked", owner_route="prebound-transient-route")
+            subset = replace(subset, snapshot_id="prepared-subset", creation_reason="denial-retry")
+            store.start_attempt(repository, subset, attempt_id="prepared-retry", binding=binding, supersedes_attempt_id="denied-source")
+            record_durable_failure(repository, identity, classify(FailureBinding(
+                binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                binding.profile_identity, "denied-session", "denied-source"),
+                FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            def snapshot():
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    return tuple(connection.execute("SELECT * FROM " + table).fetchall() for table in
+                                 ("dependency_review_attempts", "dependency_review_successors", "recovery_route_authorizations"))
+            before = snapshot()
+            for _ in range(2):
+                backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+                adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+                effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id="prepared-retry")
+                with self.assertRaisesRegex(DependencyReviewDispatchError, "scope is stopped"):
+                    DependencyReviewService().run(repository, subset, attempt_id="prepared-retry", binding=binding,
+                        adapter=adapter, task_identity=identity, supersedes_attempt_id="denied-source",
+                        checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, **effect)
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(backend.sessions, [])
+                self.assertFalse(effect["budget_ledger_path"].exists())
 
     def test_recovery_route_fence_interruption_reconciles_before_successor_session(self) -> None:
         """A successor restart clears a fence without a budget row before it opens a session."""

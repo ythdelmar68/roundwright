@@ -242,3 +242,32 @@ coordinates, context/health binding, dispatch claim, session/turn/output and
 completion fields, plus accepted identity invariants.  Thus a changed
 coordinate or structurally inconsistent row is rejected at readiness, while
 the exact persisted PREPARED/unclaimed correction remains resumable.
+
+## E1R13 end-to-end scope, acceptance, and budget closure
+
+The repository-bound Supervisor qualification entrypoint now supplies both the
+adapter scope callback and a product-ledger-serialized reservation admission.
+`E1R13-01` persists a same-scope denial from the real session checkpoint and
+proves that no turn, response read, or accepted result can follow. The direct
+correction regression persists a denial after the durable route fence but
+before budget admission and proves that the successor has no provider call,
+budget row, or successor-admission row.
+
+Diff PASS acceptance checks the Supervisor scope inside the same
+`BEGIN IMMEDIATE` transaction that writes the formal and provider acceptance
+rows. `E1R13-02` stops the scope while the response is being read and proves
+that completed evidence cannot overtake the denial into ACCEPTED state.
+
+Readiness and replay execution both use one complete persisted-attempt
+validator. For ACCEPTED attempts it requires the exact claim, coordinate,
+formal diff review, provider acceptance, output, candidate, profile, and policy
+bindings. `E1R13-03` deletes each independently required chain element and
+proves both entrypoints fail closed without redispatch.
+
+Worker dispatch now consumes a durable pre-effect claim immediately before the
+native session boundary. A restart may reuse a debit only when the exact
+attempt remains PREPARED, unclaimed, and has no session, turn, output,
+completion, or accepted evidence. `E1R13-04` proves a denial ordered before
+that claim leaves zero provider calls and that exact authoritative no-effect
+proof can recover the unused reservation after clearance. No public or
+completed-reservation refund surface is added or weakened.

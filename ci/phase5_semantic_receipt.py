@@ -93,6 +93,13 @@ TESTS = (
     "tests.test_dependency_review.DependencyReviewTests.test_graph_activation_rechecks_scope_immediately_before_mutation",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_scope_storage_failure_never_becomes_verified_host_denial",
     "tests.test_dependency_review.DependencyReviewTests.test_schema67_dependency_evidence_migrates_with_original_dispatch",
+    "tests.test_dependency_review.DependencyReviewTests.test_scope_denial_requires_the_typed_admission_exception",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_acceptance_reconciliation_failure_is_not_reclassified_as_denial",
+    "tests.test_dependency_review.DependencyReviewTests.test_initial_acceptance_rejects_a_substituted_durable_turn",
+    "tests.test_dependency_review.DependencyReviewTests.test_schema83_missing_admission_is_not_reconstructed",
+    "tests.test_dependency_review.DependencyReviewTests.test_incomplete_schema67_claim_does_not_mint_admission_authority",
+    "tests.test_codex_supervisor.SupervisorTests.test_scope_denial_after_session_open_uses_pre_dispatch_admission",
+    "tests.test_dependency_review.DependencyReviewTests.test_terminal_snapshot_authenticates_one_database_snapshot",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

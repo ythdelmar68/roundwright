@@ -365,6 +365,9 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         )
         return reviews.accept_proposal(
             repository, proposal, binding=binding, task_identity=identity,
+            observed_session_identity="session-" + proposal.attempt_id,
+            observed_turn_identity="turn-" + proposal.attempt_id,
+            observed_output_digest=proposal.proposal_digest,
         )
 
     def test_dependency_graph_pass_rejects_an_unaccepted_terminal_successor(self) -> None:

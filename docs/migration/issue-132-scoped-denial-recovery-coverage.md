@@ -365,3 +365,20 @@ preserving public-safe failure classification and fail-closed replay.
 The four new E1R18 tests are appended to the ordered semantic inventory; the
 two extended tests retain their E1R17 positions. Windows declares no E1R18
 skip, and render/verify requires their exact candidate-bound execution receipt.
+
+## E1R19 authenticated terminal-state closure
+
+E1R19 closes five races where a terminal projection could previously outlive
+the durable evidence that was supposed to authorize it.
+
+| Finding | Candidate-bound invariant and semantic evidence |
+| --- | --- |
+| E1R19-01 | Only the typed `ScopeAdmissionDenied` outcome can become `scope-stopped`; ordinary recovery reconciliation or storage failures propagate without a host-denial classification. `test_scope_denial_requires_the_typed_admission_exception` and `test_acceptance_reconciliation_failure_is_not_reclassified_as_denial` cover the store and service boundaries. |
+| E1R19-02 | Initial dependency acceptance atomically compares the adapter-observed session, turn, and output digest with the durable dispatch claim before retaining proposal evidence. `test_initial_acceptance_rejects_a_substituted_durable_turn` proves a syntactically valid concurrent turn substitution remains prepared and cannot activate or replay a graph. |
+| E1R19-03 | Migration 84 distinguishes authenticated pre-admission history from schemas that already required admission. `test_schema83_missing_admission_is_not_reconstructed` rejects deleted schema-83 authority, while `test_incomplete_schema67_claim_does_not_mint_admission_authority` proves incomplete legacy claims gain no new failure or route authority; the existing complete schema-67 migration remains valid. |
+| E1R19-04 | A genuine Supervisor scope stop after native session creation but before session checkpointing records against the durable pre-dispatch admission. `test_scope_denial_after_session_open_uses_pre_dispatch_admission` proves the attempt may remain `PREPARED` while its failure record and blocked lifecycle become terminal. |
+| E1R19-05 | Terminal dependency read-back authenticates dispatch, accepted binding, outcome digest, and returned projection within one SQLite snapshot. `test_terminal_snapshot_authenticates_one_database_snapshot` proves a concurrent digest replacement cannot be combined with earlier authenticated rows. |
+
+All seven adversarial tests are appended to the ordered semantic inventory.
+Windows declares no E1R19 skips, and render/verify requires their exact
+candidate-bound execution receipt.

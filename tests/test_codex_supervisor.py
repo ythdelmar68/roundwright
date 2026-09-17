@@ -912,6 +912,69 @@ class SupervisorTests(unittest.TestCase):
 
         self.qualify_fixture(fixture, _exercise=exercise)
 
+    def test_scope_denial_after_session_open_uses_pre_dispatch_admission(self):
+        """A stop before session checkpointing still closes the lifecycle."""
+
+        from roundwright.failure_recovery import (
+            FailureClass, FailureRole, ScopeAdmissionDenied, parse_failure_record,
+            pre_dispatch_failure_identity,
+        )
+
+        fixture = self.sequence_fixture((
+            NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+        ))
+        admissions = 0
+
+        def deny_after_session_open(*_args, **_kwargs):
+            nonlocal admissions
+            admissions += 1
+            if admissions == 3:
+                raise ScopeAdmissionDenied("scope stopped before session checkpoint")
+
+        def exercise(run, repository, _budget):
+            with patch(
+                "roundwright.supervisor_shadow.require_scope_effect_admission",
+                side_effect=deny_after_session_open,
+            ):
+                result = run()
+            request = fixture[1][0]
+            pre_dispatch = pre_dispatch_failure_identity(
+                FailureRole.SUPERVISOR, request.provider_attempt_id,
+            )
+            self.assertEqual(
+                (
+                    result.envelope.terminal.value,
+                    result.failover.result.kind,
+                    result.failover.result.session_identity,
+                    result.failover.result.turn_identity,
+                ),
+                ("blocked", SupervisorResultKind.BLOCKED, "session-1", None),
+            )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state, session_identity, external_turn_identity FROM provider_attempts "
+                    "WHERE attempt_id=?", (request.provider_attempt_id,),
+                ).fetchone(), ("prepared", None, None))
+                encoded = connection.execute(
+                    "SELECT record_json FROM failure_recovery_records"
+                ).fetchone()
+                self.assertIsNotNone(encoded)
+                decision = parse_failure_record(json.loads(encoded[0]))
+                self.assertEqual(
+                    (decision.failure, decision.binding.session_identity),
+                    (FailureClass.HOST_SECURITY_DENIAL, pre_dispatch),
+                )
+            record = fixture[5].read(
+                next(iter(fixture[5]._records)), evidence_time=101,
+            )
+            self.assertEqual(record.terminal.terminal, "blocked")
+
+        self.qualify_fixture(fixture, _exercise=exercise)
+
     def test_real_qualification_entrypoint_rechecks_scope_after_session_checkpoint(self):
         """The repository-bound qualifier threads its guard into dispatch."""
 

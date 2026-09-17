@@ -1771,6 +1771,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
             applied: dict[int, str] = {}
         else:
             applied = _read_applied(connection)
+        source_schema_version = max(applied, default=0)
         _validate_applied(applied, ordered)
         _validate_schema(connection, ordered[:len(applied)])
         for migration in ordered[len(applied):]:
@@ -1787,7 +1788,9 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
             if migration.version == 81:
                 _migrate_legacy_generic_supervisor_positions(connection)
             if migration.version == 84:
-                _migrate_dependency_review_evidence_bindings(connection)
+                _migrate_dependency_review_evidence_bindings(
+                    connection, source_schema_version=source_schema_version,
+                )
             connection.execute(
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
@@ -1920,7 +1923,9 @@ def _migrate_legacy_generic_supervisor_positions(connection: sqlite3.Connection)
             raise StateError("legacy generic Supervisor position is unavailable")
 
 
-def _migrate_dependency_review_evidence_bindings(connection: sqlite3.Connection) -> None:
+def _migrate_dependency_review_evidence_bindings(
+    connection: sqlite3.Connection, *, source_schema_version: int,
+) -> None:
     """Retain historical dependency identities without manufacturing claims."""
 
     from .failure_recovery import FailureRole, pre_dispatch_failure_identity
@@ -1939,20 +1944,47 @@ def _migrate_dependency_review_evidence_bindings(connection: sqlite3.Connection)
             and all(character in "0123456789abcdef" for character in value[7:])
         )
 
+    accepted = connection.execute(
+        "SELECT attempts.attempt_id, claims.session_identity, claims.turn_identity, claims.state, "
+        "outcomes.outcome, outcomes.output_digest, proposals.proposal_digest "
+        "FROM dependency_review_attempts AS attempts "
+        "LEFT JOIN dependency_review_dispatch_claims AS claims ON claims.attempt_id = attempts.attempt_id "
+        "LEFT JOIN dependency_review_validation_outcomes AS outcomes ON outcomes.attempt_id = attempts.attempt_id "
+        "LEFT JOIN dependency_review_proposals AS proposals ON proposals.attempt_id = attempts.attempt_id "
+        "WHERE attempts.state = 'accepted' ORDER BY attempts.attempt_id"
+    ).fetchall()
+    authenticated_accepted: dict[str, tuple[str, str, str]] = {}
+    for attempt_id, session_identity, turn_identity, claim_state, outcome, output_digest, proposal_digest in accepted:
+        if (
+            not opaque(attempt_id) or attempt_id in authenticated_accepted
+            or claim_state != "turn-dispatched" or not opaque(session_identity)
+            or not opaque(turn_identity) or outcome != "accepted"
+            or not digest(output_digest) or output_digest != proposal_digest
+        ):
+            raise StateError("legacy accepted dependency evidence is unauthenticated")
+        authenticated_accepted[attempt_id] = (
+            session_identity, turn_identity, output_digest,
+        )
+
     claims = connection.execute(
         "SELECT attempts.attempt_id, attempts.task_id, attempts.profile_identity, "
         "attempts.configuration_digest, subsets.task_id, subsets.candidate_sha, "
         "subsets.policy_digest, subsets.configuration_digest, claims.session_identity, "
-        "claims.turn_identity, claims.state "
+        "claims.turn_identity, claims.state, tasks.base_sha, seals.base_sha, "
+        "seals.candidate_sha, seals.state_identity, runtime.schema_version, runtime.resolved_digest "
         "FROM dependency_review_dispatch_claims AS claims "
         "JOIN dependency_review_attempts AS attempts ON attempts.attempt_id = claims.attempt_id "
         "JOIN dependency_review_subsets AS subsets ON subsets.snapshot_id = attempts.snapshot_id "
+        "JOIN tasks ON tasks.task_id = attempts.task_id "
+        "LEFT JOIN candidate_seals AS seals ON seals.task_id = attempts.task_id "
+        "LEFT JOIN runtime_configuration_bindings AS runtime ON runtime.task_id = attempts.task_id "
         "ORDER BY attempts.attempt_id"
     ).fetchall()
     for (
         attempt_id, task_id, profile_identity, attempt_configuration,
         subset_task, candidate_sha, policy_digest, subset_configuration,
-        session_identity, turn_identity, claim_state,
+        session_identity, turn_identity, claim_state, task_base_sha, seal_base_sha,
+        seal_candidate_sha, state_identity, runtime_schema, runtime_configuration,
     ) in claims:
         if (
             not opaque(attempt_id) or not opaque(task_id)
@@ -1962,6 +1994,10 @@ def _migrate_dependency_review_evidence_bindings(connection: sqlite3.Connection)
             or not digest(attempt_configuration)
             or not isinstance(candidate_sha, str) or len(candidate_sha) != 40
             or any(character not in "0123456789abcdef" for character in candidate_sha)
+            or seal_base_sha != task_base_sha or seal_candidate_sha != candidate_sha
+            or not isinstance(state_identity, str) or not state_identity
+            or runtime_schema != "roundwright-runtime/v1"
+            or runtime_configuration != attempt_configuration
         ):
             raise StateError("legacy dependency review dispatch is unauthenticated")
         if claim_state == "pre-dispatch":
@@ -1992,33 +2028,20 @@ def _migrate_dependency_review_evidence_bindings(connection: sqlite3.Connection)
             (attempt_id,),
         ).fetchone()
         if existing is None:
-            connection.execute(
-                "INSERT INTO dependency_review_failure_admissions"
-                "(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, "
-                "authority_scope, provider_role, profile_identity, session_identity, attempt_identity) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (attempt_id, *expected),
-            )
+            if source_schema_version >= 74:
+                raise StateError("legacy dependency review admission is missing")
+            if attempt_id in authenticated_accepted:
+                connection.execute(
+                    "INSERT INTO dependency_review_failure_admissions"
+                    "(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, "
+                    "authority_scope, provider_role, profile_identity, session_identity, attempt_identity) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (attempt_id, *expected),
+                )
         elif existing != expected:
             raise StateError("legacy dependency review admission has drifted")
 
-    accepted = connection.execute(
-        "SELECT attempts.attempt_id, claims.session_identity, claims.turn_identity, claims.state, "
-        "outcomes.outcome, outcomes.output_digest, proposals.proposal_digest "
-        "FROM dependency_review_attempts AS attempts "
-        "LEFT JOIN dependency_review_dispatch_claims AS claims ON claims.attempt_id = attempts.attempt_id "
-        "LEFT JOIN dependency_review_validation_outcomes AS outcomes ON outcomes.attempt_id = attempts.attempt_id "
-        "LEFT JOIN dependency_review_proposals AS proposals ON proposals.attempt_id = attempts.attempt_id "
-        "WHERE attempts.state = 'accepted' ORDER BY attempts.attempt_id"
-    ).fetchall()
-    for attempt_id, session_identity, turn_identity, claim_state, outcome, output_digest, proposal_digest in accepted:
-        if (
-            claim_state != "turn-dispatched" or not opaque(session_identity)
-            or not opaque(turn_identity) or outcome != "accepted"
-            or not digest(output_digest) or output_digest != proposal_digest
-        ):
-            raise StateError("legacy accepted dependency evidence is unauthenticated")
-        expected = (session_identity, turn_identity, output_digest)
+    for attempt_id, expected in authenticated_accepted.items():
         existing = connection.execute(
             "SELECT session_identity, turn_identity, output_digest "
             "FROM dependency_review_accepted_result_dispatches WHERE attempt_id = ?",

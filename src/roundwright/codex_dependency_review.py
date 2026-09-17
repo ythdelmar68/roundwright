@@ -23,7 +23,8 @@ from .dependency_review import (
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .failure_recovery import (
     DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding,
-    FailureClass, FailureRole, FailureRecord, RecoveryAction, FailureRecoveryError, require_scope_open,
+    FailureClass, FailureRole, FailureRecord, RecoveryAction, FailureRecoveryError,
+    ScopeAdmissionDenied, require_scope_open,
     require_scope_effect_admission, admit_scope_effect_reservation,
     abandon_durable_recovery_route_reservation,
     begin_durable_recovery_route_reservation,
@@ -573,8 +574,11 @@ class DependencyReviewService:
                 store.accept_proposal(
                     repository, result.proposal, binding=binding,
                     task_identity=task_identity,
+                    observed_session_identity=result.session_identity,
+                    observed_turn_identity=result.turn_identity,
+                    observed_output_digest=result.output_digest,
                 )
-            except FailureRecoveryError:
+            except ScopeAdmissionDenied:
                 if task_identity is None:
                     raise
                 store.record_scope_denied(
@@ -605,7 +609,7 @@ class DependencyReviewService:
             )
             try:
                 store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="prebound-transient-route", task_identity=task_identity, binding=binding if task_identity is not None else None)
-            except FailureRecoveryError:
+            except ScopeAdmissionDenied:
                 assert task_identity is not None
                 store.record_scope_denied(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, task_identity=task_identity, binding=binding)
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.BLOCKED, result.session_identity, result.turn_identity, None, result.output_digest, "scope-stopped", result.failure)
@@ -614,14 +618,14 @@ class DependencyReviewService:
             # blocked predecessor that a successor can consume as a retry.
             try:
                 store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="reconcile-required", task_identity=task_identity, binding=binding if task_identity is not None else None)
-            except FailureRecoveryError:
+            except ScopeAdmissionDenied:
                 assert task_identity is not None
                 store.record_scope_denied(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, task_identity=task_identity, binding=binding)
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.BLOCKED, result.session_identity, result.turn_identity, None, result.output_digest, "scope-stopped", CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
         else:
             try:
                 store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, task_identity=task_identity, binding=binding if task_identity is not None else None)
-            except FailureRecoveryError:
+            except ScopeAdmissionDenied:
                 assert task_identity is not None
                 store.record_scope_denied(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, task_identity=task_identity, binding=binding)
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.BLOCKED, result.session_identity, result.turn_identity, None, result.output_digest, "scope-stopped", CodexFailure.SANDBOX_OR_APPROVAL_DENIED)

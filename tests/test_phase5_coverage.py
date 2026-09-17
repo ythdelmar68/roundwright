@@ -276,6 +276,13 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_dependency_review.DependencyReviewTests.test_graph_activation_rechecks_scope_immediately_before_mutation",
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_scope_storage_failure_never_becomes_verified_host_denial",
             "tests.test_dependency_review.DependencyReviewTests.test_schema67_dependency_evidence_migrates_with_original_dispatch",
+            "tests.test_dependency_review.DependencyReviewTests.test_scope_denial_requires_the_typed_admission_exception",
+            "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_acceptance_reconciliation_failure_is_not_reclassified_as_denial",
+            "tests.test_dependency_review.DependencyReviewTests.test_initial_acceptance_rejects_a_substituted_durable_turn",
+            "tests.test_dependency_review.DependencyReviewTests.test_schema83_missing_admission_is_not_reconstructed",
+            "tests.test_dependency_review.DependencyReviewTests.test_incomplete_schema67_claim_does_not_mint_admission_authority",
+            "tests.test_codex_supervisor.SupervisorTests.test_scope_denial_after_session_open_uses_pre_dispatch_admission",
+            "tests.test_dependency_review.DependencyReviewTests.test_terminal_snapshot_authenticates_one_database_snapshot",
         )
         self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
         self.assertEqual(tuple(test for test in coverage.SEMANTIC_TESTS if test in required), required)
@@ -315,6 +322,10 @@ class Phase5CoverageTests(unittest.TestCase):
         self.assertEqual(
             tuple(coverage.ISSUE_132_E1R18_FINDING_REQUIREMENTS),
             ("E1R18-01", "E1R18-02", "E1R18-03", "E1R18-04", "E1R18-05", "E1R18-06"),
+        )
+        self.assertEqual(
+            tuple(coverage.ISSUE_132_E1R19_FINDING_REQUIREMENTS),
+            ("E1R19-01", "E1R19-02", "E1R19-03", "E1R19-04", "E1R19-05"),
         )
 
     def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:
@@ -374,6 +385,10 @@ class Phase5CoverageTests(unittest.TestCase):
         e1r18 = dict(coverage.ISSUE_132_E1R18_FINDING_REQUIREMENTS)
         e1r18.pop("E1R18-06")
         with patch.object(coverage, "ISSUE_132_E1R18_FINDING_REQUIREMENTS", e1r18), self.assertRaisesRegex(coverage.CoverageError, "E1R18 finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+        e1r19 = dict(coverage.ISSUE_132_E1R19_FINDING_REQUIREMENTS)
+        e1r19.pop("E1R19-05")
+        with patch.object(coverage, "ISSUE_132_E1R19_FINDING_REQUIREMENTS", e1r19), self.assertRaisesRegex(coverage.CoverageError, "E1R19 finding mapping"):
             coverage._validate_issue_132_semantic_tests()
 
     def test_issue_132_affected_module_inventory_rejects_candidate_review_omission(self) -> None:

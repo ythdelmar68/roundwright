@@ -908,6 +908,39 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 )
             self.assertEqual(len(backend.sessions), 1)
 
+    def test_acceptance_reconciliation_failure_is_not_reclassified_as_denial(self) -> None:
+        """Only ScopeAdmissionDenied can produce the scope-stopped terminal."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116"),
+            ))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            with patch.object(
+                DependencyReviewStore, "accept_proposal",
+                side_effect=FailureRecoveryError("malformed recovery evidence"),
+            ), patch.object(DependencyReviewStore, "record_scope_denied") as denied, self.assertRaisesRegex(
+                FailureRecoveryError, "malformed recovery evidence",
+            ):
+                DependencyReviewService().run(
+                    repository, subset, attempt_id="attempt-116", binding=binding,
+                    adapter=adapter, checkpoint_session=lambda _: None,
+                    checkpoint_turn=lambda *_: None, task_identity=identity,
+                    **self.effect_kwargs(
+                        repository, subset, binding, adapter, attempt_id="attempt-116",
+                    ),
+                )
+            denied.assert_not_called()
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-116'"
+                ).fetchone(), ("prepared",))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM dependency_review_validation_outcomes"
+                ).fetchone(), (0,))
+
     def test_default_acceptance_derives_production_task_and_rechecks_stopped_scope_after_restart(self) -> None:
         """Omitting the optional identity cannot bypass a durable production stop."""
 
@@ -999,6 +1032,11 @@ class DependencyReviewServiceTests(unittest.TestCase):
                     store.accept_proposal(
                         repository, DependencyProposal.parse(self.proposal(attempt_id)),
                         binding=binding,
+                        observed_session_identity="release-session",
+                        observed_turn_identity="release-turn",
+                        observed_output_digest=DependencyProposal.parse(
+                            self.proposal(attempt_id)
+                        ).proposal_digest,
                     )
                 with self.assertRaisesRegex(FailureRecoveryError, "reservation has drifted"):
                     release_unused_provider_effect_reservation(

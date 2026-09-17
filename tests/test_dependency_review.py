@@ -26,7 +26,7 @@ from roundwright.dependency_graph import (
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.failure_recovery import FailureRecoveryError, ScopeAdmissionDenied
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
+from roundwright.state import SourceSnapshot, StateError, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
 
 
 def digest(character: str) -> str:
@@ -74,7 +74,12 @@ class DependencyReviewTests(unittest.TestCase):
             store.claim_pre_dispatch(repository, attempt_id=proposal.attempt_id, task_identity=identity, binding=binding)
             store.claim_session(repository, attempt_id=proposal.attempt_id, session_identity="session-" + proposal.attempt_id, task_identity=identity, binding=binding)
             store.claim_turn(repository, attempt_id=proposal.attempt_id, session_identity="session-" + proposal.attempt_id, turn_identity="turn-" + proposal.attempt_id)
-        return store.accept_proposal(repository, proposal, binding=binding, task_identity=identity)
+        return store.accept_proposal(
+            repository, proposal, binding=binding, task_identity=identity,
+            observed_session_identity="session-" + proposal.attempt_id,
+            observed_turn_identity="turn-" + proposal.attempt_id,
+            observed_output_digest=proposal.proposal_digest,
+        )
 
     def proposal(self, attempt_id: str, *, semantic: bool = False) -> DependencyProposal:
         kind = EdgeKind.SEMANTIC_INFERRED if semantic else EdgeKind.EXPLICIT
@@ -94,6 +99,34 @@ class DependencyReviewTests(unittest.TestCase):
             SourceOwnedRelation(edge.kind, edge.direction, edge.subject_member_id, edge.object_member_id, edge.rationale_digest, edge.confidence, edge.conflicts_digest)
             for edge in proposal.edges if edge.kind is not EdgeKind.SEMANTIC_INFERRED
         )
+
+    def replace_with_schema(self, repository: RepositoryIdentity, version: int) -> None:
+        """Project current fixture rows into one exact historical schema."""
+
+        from roundwright.state import MIGRATIONS, _apply_migrations
+
+        path = database_path(repository)
+        legacy_path = path.with_name(f"dependency-schema-{version}.sqlite")
+        with closing(sqlite3.connect(legacy_path)) as connection, connection:
+            _apply_migrations(connection, MIGRATIONS[:version])
+            connection.execute("ATTACH DATABASE ? AS current", (str(path),))
+            tables = [row[0] for row in connection.execute(
+                "SELECT name FROM main.sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )]
+            for table in tables:
+                if table == "schema_migrations":
+                    continue
+                columns = [row[1] for row in connection.execute(
+                    f'PRAGMA main.table_info("{table}")'
+                )]
+                names = ",".join('"' + name + '"' for name in columns)
+                connection.execute(f'DELETE FROM main."{table}"')
+                connection.execute(
+                    f'INSERT INTO main."{table}" ({names}) '
+                    f'SELECT {names} FROM current."{table}"'
+                )
+        legacy_path.replace(path)
 
     def test_default_role_and_input_are_exact_and_public_safe(self) -> None:
         configuration = load_configuration(cwd=Path.cwd(), environment={}, home=Path.cwd() / "missing-home")
@@ -153,7 +186,12 @@ class DependencyReviewTests(unittest.TestCase):
                 session_identity="acceptance-session", turn_identity="acceptance-turn",
             )
             self.assertEqual(
-                store.accept_proposal(repository, proposal, binding=binding),
+                store.accept_proposal(
+                    repository, proposal, binding=binding,
+                    observed_session_identity="acceptance-session",
+                    observed_turn_identity="acceptance-turn",
+                    observed_output_digest=proposal.proposal_digest,
+                ),
                 proposal.proposal_digest,
             )
 
@@ -181,6 +219,123 @@ class DependencyReviewTests(unittest.TestCase):
                 self.assertEqual(connection.execute(
                     "SELECT 1 FROM dependency_review_dispatch_claims WHERE attempt_id='claim-scope'"
                 ).fetchone(), None)
+
+    def test_scope_denial_requires_the_typed_admission_exception(self) -> None:
+        """Malformed recovery evidence cannot be relabeled as a host denial."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            store.start_attempt(repository, subset, attempt_id="denial-provenance", binding=binding)
+            identity = TaskIdentity(
+                "task-113", "source-113", "repo-113", "codex/113",
+                "C:/review-113", "a" * 40,
+            )
+            with mock.patch(
+                "roundwright.dependency_review.require_scope_open",
+                side_effect=FailureRecoveryError("malformed recovery evidence"),
+            ), self.assertRaisesRegex(FailureRecoveryError, "malformed recovery evidence"):
+                store.record_scope_denied(
+                    repository, attempt_id="denial-provenance", output_digest=digest("a"),
+                    task_identity=identity, binding=binding,
+                )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id='denial-provenance'"
+                ).fetchone(), ("prepared",))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM dependency_review_validation_outcomes"
+                ).fetchone(), (0,))
+
+    def test_initial_acceptance_rejects_a_substituted_durable_turn(self) -> None:
+        """Adapter-observed identity must match the claim in the acceptance transaction."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            proposal = self.proposal("acceptance-turn-race")
+            identity = TaskIdentity(
+                "task-113", "source-113", "repo-113", "codex/113",
+                "C:/review-113", "a" * 40,
+            )
+            store.start_attempt(
+                repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                source_owned_relations=self.source_owned_relations(proposal),
+            )
+            store.claim_pre_dispatch(
+                repository, attempt_id=proposal.attempt_id,
+                task_identity=identity, binding=binding,
+            )
+            store.claim_session(
+                repository, attempt_id=proposal.attempt_id,
+                session_identity="observed-session", task_identity=identity, binding=binding,
+            )
+            store.claim_turn(
+                repository, attempt_id=proposal.attempt_id,
+                session_identity="observed-session", turn_identity="observed-turn",
+            )
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                connection.execute(
+                    "UPDATE dependency_review_dispatch_claims SET turn_identity='substituted-turn' "
+                    "WHERE attempt_id=?", (proposal.attempt_id,),
+                )
+            with self.assertRaisesRegex(DependencyReviewError, "dispatch has drifted"):
+                store.accept_proposal(
+                    repository, proposal, binding=binding, task_identity=identity,
+                    observed_session_identity="observed-session",
+                    observed_turn_identity="observed-turn",
+                    observed_output_digest=proposal.proposal_digest,
+                )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id=?",
+                    (proposal.attempt_id,),
+                ).fetchone(), ("prepared",))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM dependency_review_accepted_result_dispatches"
+                ).fetchone(), (0,))
+
+    def test_terminal_snapshot_authenticates_one_database_snapshot(self) -> None:
+        """A concurrent outcome replacement cannot be combined with earlier auth rows."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            proposal = self.proposal("terminal-snapshot-race")
+            store.start_attempt(
+                repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                source_owned_relations=self.source_owned_relations(proposal),
+            )
+            self.accept(store, repository, proposal, binding=binding)
+            path = database_path(repository)
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+            authenticate = DependencyReviewStore._require_authenticated_dispatch
+
+            def replace_after_authentication(*args, **kwargs):
+                result = authenticate(*args, **kwargs)
+                with closing(sqlite3.connect(path)) as writer, writer:
+                    writer.execute(
+                        "UPDATE dependency_review_validation_outcomes SET output_digest=? "
+                        "WHERE attempt_id=?", (digest("0"), proposal.attempt_id),
+                    )
+                return result
+
+            with mock.patch.object(
+                DependencyReviewStore, "_require_authenticated_dispatch",
+                side_effect=replace_after_authentication,
+            ):
+                snapshot = store.terminal_snapshot(
+                    repository, attempt_id=proposal.attempt_id, binding=binding,
+                )
+            self.assertEqual(snapshot["output_digest"], proposal.proposal_digest)
+            with self.assertRaises(DependencyReviewError):
+                store.terminal_snapshot(
+                    repository, attempt_id=proposal.attempt_id, binding=binding,
+                )
 
     def test_all_dependency_consumers_share_exact_dispatch_authentication(self) -> None:
         """Acceptance, terminal read-back, and graph replay reject the same drift."""
@@ -282,27 +437,7 @@ class DependencyReviewTests(unittest.TestCase):
                 graph_version_id="graph-migration-dispatch",
             )
             path = database_path(repository)
-            legacy_path = path.with_name("dependency-schema-67.sqlite")
-            with closing(sqlite3.connect(legacy_path)) as connection, connection:
-                _apply_migrations(connection, MIGRATIONS[:67])
-                connection.execute("ATTACH DATABASE ? AS current", (str(path),))
-                tables = [row[0] for row in connection.execute(
-                    "SELECT name FROM main.sqlite_master "
-                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                )]
-                for table in tables:
-                    if table == "schema_migrations":
-                        continue
-                    columns = [row[1] for row in connection.execute(
-                        f'PRAGMA main.table_info("{table}")'
-                    )]
-                    names = ",".join('"' + name + '"' for name in columns)
-                    connection.execute(f'DELETE FROM main."{table}"')
-                    connection.execute(
-                        f'INSERT INTO main."{table}" ({names}) '
-                        f'SELECT {names} FROM current."{table}"'
-                    )
-            legacy_path.replace(path)
+            self.replace_with_schema(repository, 67)
             self.assertEqual(initialize(repository).version, len(MIGRATIONS))
             self.assertEqual(
                 store.accept_proposal(repository, proposal, binding=binding),
@@ -338,6 +473,73 @@ class DependencyReviewTests(unittest.TestCase):
                     "SELECT session_identity FROM dependency_review_failure_admissions "
                     "WHERE attempt_id=?", (proposal.attempt_id,),
                 ).fetchone(), ("session-" + proposal.attempt_id,))
+
+    def test_schema83_missing_admission_is_not_reconstructed(self) -> None:
+        """A schema that required admission cannot heal deletion at v84."""
+
+        from roundwright.state import MIGRATIONS
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            proposal = self.proposal("schema83-admission-gap")
+            store.start_attempt(
+                repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                source_owned_relations=self.source_owned_relations(proposal),
+            )
+            self.accept(store, repository, proposal, binding=binding)
+            path = database_path(repository)
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute("DROP TABLE dependency_review_accepted_result_dispatches")
+                connection.execute("DELETE FROM schema_migrations WHERE version=84")
+                connection.execute(
+                    "DELETE FROM dependency_review_failure_admissions WHERE attempt_id=?",
+                    (proposal.attempt_id,),
+                )
+            with self.assertRaisesRegex(StateError, "admission is missing"):
+                initialize(repository)
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone(), (83,))
+                self.assertEqual(len(MIGRATIONS), 84)
+
+    def test_incomplete_schema67_claim_does_not_mint_admission_authority(self) -> None:
+        """Only complete accepted legacy evidence receives a historical binding."""
+
+        from roundwright.state import MIGRATIONS
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            identity = TaskIdentity(
+                "task-113", "source-113", "repo-113", "codex/113",
+                "C:/review-113", "a" * 40,
+            )
+            store.start_attempt(
+                repository, subset, attempt_id="schema67-incomplete", binding=binding,
+            )
+            store.claim_pre_dispatch(
+                repository, attempt_id="schema67-incomplete",
+                task_identity=identity, binding=binding,
+            )
+            store.claim_session(
+                repository, attempt_id="schema67-incomplete",
+                session_identity="legacy-session", task_identity=identity, binding=binding,
+            )
+            store.claim_turn(
+                repository, attempt_id="schema67-incomplete",
+                session_identity="legacy-session", turn_identity="legacy-turn",
+            )
+            self.replace_with_schema(repository, 67)
+            self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM dependency_review_failure_admissions "
+                    "WHERE attempt_id='schema67-incomplete'"
+                ).fetchone(), (0,))
 
     def test_graph_requires_the_pre_dispatch_relation_identity_not_caller_scalars(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

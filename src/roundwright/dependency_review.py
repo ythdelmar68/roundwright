@@ -16,7 +16,8 @@ from enum import StrEnum
 from .configuration import RepositoryIdentity
 from .state import TaskIdentity, _open_writable_connection, _require_matching_task
 from .failure_recovery import (
-    FailureRecoveryError, FailureRole, pre_dispatch_failure_identity,
+    FailureRecoveryError, FailureRole, ScopeAdmissionDenied,
+    pre_dispatch_failure_identity,
     require_scope_open,
 )
 
@@ -515,8 +516,25 @@ class DependencyReviewStore:
         for attempt_id in visited:
             DependencyReviewStore._read_attempt(connection, attempt_id)
 
-    def accept_proposal(self, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyReviewBinding, task_identity: TaskIdentity | None = None) -> str:
-        if type(binding) is not DependencyReviewBinding or (task_identity is not None and type(task_identity) is not TaskIdentity):
+    def accept_proposal(
+        self, repository: RepositoryIdentity, proposal: DependencyProposal, *,
+        binding: DependencyReviewBinding, task_identity: TaskIdentity | None = None,
+        observed_session_identity: str | None = None,
+        observed_turn_identity: str | None = None,
+        observed_output_digest: str | None = None,
+    ) -> str:
+        if (
+            type(binding) is not DependencyReviewBinding
+            or (task_identity is not None and type(task_identity) is not TaskIdentity)
+            or any(value is not None for value in (
+                observed_session_identity, observed_turn_identity, observed_output_digest,
+            )) != all(value is not None for value in (
+                observed_session_identity, observed_turn_identity, observed_output_digest,
+            ))
+            or (observed_session_identity is not None and not _opaque_identity(observed_session_identity))
+            or (observed_turn_identity is not None and not _opaque_identity(observed_turn_identity))
+            or (observed_output_digest is not None and not _digest(observed_output_digest))
+        ):
             raise DependencyReviewError("dependency review binding is invalid")
         connection = _open_writable_connection(repository)
         try:
@@ -553,6 +571,11 @@ class DependencyReviewStore:
                     raise DependencyReviewError("dependency proposal acceptance has drifted")
                 connection.commit()
                 return proposal.proposal_digest
+            if (
+                observed_session_identity is None or observed_turn_identity is None
+                or observed_output_digest != proposal.proposal_digest
+            ):
+                raise DependencyReviewError("dependency review acceptance evidence is unavailable")
             if existing is None and stored is None:
                 collision = connection.execute("SELECT proposal_id FROM dependency_review_proposals WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone()
                 if collision is not None:
@@ -565,6 +588,8 @@ class DependencyReviewStore:
             connection.execute("INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, ?, ?, ?, ?)", (proposal.attempt_id, *outcome))
             self._bind_accepted_result_dispatch(
                 connection, proposal.attempt_id, proposal.proposal_digest,
+                observed_session_identity=observed_session_identity,
+                observed_turn_identity=observed_turn_identity,
             )
             connection.execute("UPDATE dependency_review_attempts SET state = 'accepted' WHERE attempt_id = ?", (proposal.attempt_id,))
             if connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone() != ("accepted",):
@@ -683,7 +708,7 @@ class DependencyReviewStore:
                     connection, task_identity.task_id,
                     "dependency-review:" + task_identity.task_id,
                 )
-            except FailureRecoveryError:
+            except ScopeAdmissionDenied:
                 pass
             else:
                 raise DependencyReviewError("dependency review scope denial is unavailable")
@@ -719,6 +744,7 @@ class DependencyReviewStore:
             raise DependencyReviewError("dependency review snapshot is invalid")
         connection = _open_writable_connection(repository)
         try:
+            connection.execute("BEGIN")
             row, subset = self._read_attempt(connection, attempt_id)
             self._require_authenticated_dispatch(
                 connection, attempt_id, row, subset, binding,
@@ -739,7 +765,7 @@ class DependencyReviewStore:
             if proposal_count is None:
                 raise DependencyReviewError("dependency review snapshot is unavailable")
             result_kind = "ambiguous" if outcome[0] == "blocked" and outcome[1] == "uncertain-provider-turn" else outcome[0]
-            return {
+            snapshot = {
                 "attempt_id": attempt_id,
                 "input_digest": row[4],
                 "output_digest": outcome[2],
@@ -750,6 +776,11 @@ class DependencyReviewStore:
                 "mutation_count": 0,
                 "credential_exposure_count": 0,
             }
+            connection.commit()
+            return snapshot
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -981,7 +1012,8 @@ class DependencyReviewStore:
 
     @staticmethod
     def _bind_accepted_result_dispatch(
-        connection: object, attempt_id: str, output_digest: str,
+        connection: object, attempt_id: str, output_digest: str, *,
+        observed_session_identity: str, observed_turn_identity: str,
     ) -> None:
         """Seal the exact native turn that produced one accepted result."""
 
@@ -996,7 +1028,9 @@ class DependencyReviewStore:
             or not _digest(output_digest)
         ):
             raise DependencyReviewError("dependency review accepted result dispatch is unavailable")
-        expected = (claim[0], claim[1], output_digest)
+        expected = (observed_session_identity, observed_turn_identity, output_digest)
+        if expected != (claim[0], claim[1], output_digest):
+            raise DependencyReviewError("dependency review accepted result dispatch has drifted")
         existing = connection.execute(
             "SELECT session_identity, turn_identity, output_digest "
             "FROM dependency_review_accepted_result_dispatches WHERE attempt_id = ?",

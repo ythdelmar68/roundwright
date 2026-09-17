@@ -1026,11 +1026,32 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         if result.kind is SupervisorResultKind.BLOCKED:
             if result.session_identity is None or result.failure is None:
                 raise SupervisorShadowError("Supervisor typed blocked source is incomplete")
+            connection = _open_writable_connection(repository)
+            try:
+                admission = connection.execute(
+                    "SELECT task_id, candidate_sha, policy_digest, configuration_digest, "
+                    "authority_scope, provider_role, profile_identity, session_identity, attempt_identity "
+                    "FROM provider_failure_admissions WHERE attempt_id=?",
+                    (request.provider_attempt_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+            if (
+                admission is None or tuple(admission[:7]) != (
+                    task_identity.task_id, binding.candidate_sha,
+                    resolved_policy.policy_digest, resolved_policy.configuration_digest,
+                    "supervisor:" + binding.task_id, FailureRole.SUPERVISOR.value,
+                    request.selected_profile_identity,
+                )
+                or not _token(admission[7])
+                or admission[8] != request.provider_attempt_id
+            ):
+                raise SupervisorShadowError("Supervisor blocked source admission has drifted")
             failure_binding = FailureBinding(
                 binding.candidate_sha, resolved_policy.policy_digest,
                 resolved_policy.configuration_digest, "supervisor:" + binding.task_id,
                 FailureRole.SUPERVISOR, request.selected_profile_identity,
-                result.session_identity, request.provider_attempt_id,
+                admission[7], request.provider_attempt_id,
             )
             decision = classify_native_failure(FailureRole.SUPERVISOR, failure_binding, result.failure)
             decision_digest = record_durable_failure(repository, task_identity, decision, now=evidence_time)

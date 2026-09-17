@@ -21,6 +21,7 @@ from enum import StrEnum
 from typing import Callable, Mapping, Protocol
 
 from .configuration import ProviderProfile
+from .failure_recovery import FailureRole, pre_dispatch_failure_identity
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import ProviderRole
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedRoleEffectReservation, require_worker_tool_capability
@@ -355,7 +356,7 @@ class CodexWorkerResult:
             if type(self.output) is not dict or type(self.output_fingerprint) is not str or not _DIGEST.fullmatch(self.output_fingerprint) or self.failure is not None or self.blocker is not None or self.diagnostic is not None or self.outcome_source is not None or self.sdk_error_category is not None or self.session_identity is None or self.turn_identity is None:
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind is WorkerResultKind.BLOCKED:
-            if self.output is not None or self.output_fingerprint is not None or type(self.failure) is not CodexFailure or type(self.blocker) is not str or not _TOKEN.fullmatch(self.blocker) or self.diagnostic is not None or type(self.outcome_source) is not WorkerOutcomeSource or ((self.outcome_source is WorkerOutcomeSource.SDK_TURN_FAILED and type(self.sdk_error_category) is not WorkerSdkTurnErrorCategory) or (self.outcome_source is WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED and self.sdk_error_category is not None)) or self.session_identity is None or self.turn_identity is None:
+            if self.output is not None or self.output_fingerprint is not None or type(self.failure) is not CodexFailure or type(self.blocker) is not str or not _TOKEN.fullmatch(self.blocker) or self.diagnostic is not None or type(self.outcome_source) is not WorkerOutcomeSource or ((self.outcome_source is WorkerOutcomeSource.SDK_TURN_FAILED and type(self.sdk_error_category) is not WorkerSdkTurnErrorCategory) or (self.outcome_source is WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED and self.sdk_error_category is not None)) or self.session_identity is None or (self.outcome_source is WorkerOutcomeSource.PROVIDER_STRUCTURED_BLOCKED and self.turn_identity is None):
                 raise CodexWorkerError("Worker result is invalid")
         elif self.kind is WorkerResultKind.INVALID:
             if self.output is not None or self.output_fingerprint is not None or self.failure is not None or self.blocker is not None or type(self.diagnostic) is not WorkerParserDiagnostic or self.outcome_source is not None or self.sdk_error_category is not None or self.session_identity is None or self.turn_identity is None:
@@ -516,9 +517,15 @@ class CodexWorkerAdapter:
                 return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
             admit()
             checkpoint_session(session_identity)
-        except CodexAdapterError:
+        except CodexAdapterError as error:
             _close_session(session)
-            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, None, None, None, None)
+            return CodexWorkerResult(
+                WorkerResultKind.BLOCKED,
+                session_identity or pre_dispatch_failure_identity(FailureRole.WORKER, request.attempt_id),
+                None, None, None, error.failure, "sdk-turn-failed",
+                outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED,
+                sdk_error_category=_sdk_error_category(error.failure),
+            )
         except CodexWorkerError:
             _close_session(session)
             raise
@@ -531,9 +538,15 @@ class CodexWorkerAdapter:
             turn_identity = _identity(turn, "turn")
             admit()
             checkpoint_turn(session_identity, turn_identity)
-        except CodexAdapterError:
+        except CodexAdapterError as error:
             _abort_turn(turn); _close_session(session)
-            return CodexWorkerResult(WorkerResultKind.AMBIGUOUS, session_identity, turn_identity, None, None, None)
+            return CodexWorkerResult(
+                WorkerResultKind.BLOCKED,
+                session_identity or pre_dispatch_failure_identity(FailureRole.WORKER, request.attempt_id),
+                turn_identity, None, None, error.failure, "sdk-turn-failed",
+                outcome_source=WorkerOutcomeSource.SDK_TURN_FAILED,
+                sdk_error_category=_sdk_error_category(error.failure),
+            )
         except CodexWorkerError:
             _abort_turn(turn); _close_session(session)
             raise

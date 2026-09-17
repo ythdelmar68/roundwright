@@ -18,7 +18,7 @@ from roundwright.coding_tools import BoundedCodingCapability, BoundedCodingTools
 from roundwright.coding_worker_state import CodingToolEventStore
 from roundwright.configuration import ProviderProfile, ReasoningEffort
 from roundwright.provider_recovery import ProviderRole, prepare_attempt
-from roundwright.provider_health import CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
 from roundwright.role_capability_policy import AdvisoryRole, RoleCapability, RoleScope, ScopeKind, ScopedDescriptor
 from tests.role_admission_fixture import sealed_execution_for_effect, trusted_execution_host
 from roundwright.worker_toolbox import CODING_RUNTIME_REGISTRY, CodingDispatchReceipt, CodingWorkerRuntimeDescriptor, ProductionCodingWorkerEntrypointInputs, ProductionCodingWorkerRuntime, ProductionWorkerFailureLifecycle, run_production_coding_worker, run_registered_production_coding_worker
@@ -26,6 +26,7 @@ from roundwright.worker_shadow import WorkerShadowError
 from tests.test_provider_recovery import ProviderRecoveryTests
 from roundwright.failure_recovery import FailureClass, FailureRole, parse_failure_record
 from roundwright.provider_recovery import AttemptState, read_attempt
+from roundwright.state import database_path
 
 
 def digest(value: str | bytes) -> str: return "sha256:" + hashlib.sha256(value.encode() if isinstance(value,str) else value).hexdigest()
@@ -184,6 +185,44 @@ class ProductionRuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(WorkerShadowError, "not dispatchable"):
                     runtime.dispatch(request, checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertEqual(runtime._adapter._backend.calls, 1)
+
+    def test_pre_session_worker_denial_is_typed_durable_and_stops_restart(self):
+        class DeniedBackend:
+            calls = 0
+            def open_session(self, *_args, **_kwargs):
+                self.calls += 1
+                raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
+
+        with tempfile.TemporaryDirectory() as temp:
+            events = []
+            turn = Turn(events, ())
+            with self.hermetic_runtime(Path(temp), turn, events) as runtime:
+                backend = DeniedBackend()
+                runtime._adapter._backend = backend
+                request = self.request()
+                result = runtime.dispatch(
+                    request, checkpoint_session=lambda _: None,
+                    checkpoint_turn=lambda *_: None,
+                )
+                self.assertEqual((result.kind, result.failure, result.turn_identity, backend.calls), (
+                    WorkerResultKind.BLOCKED, CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+                    None, 1,
+                ))
+                assert result.session_identity is not None
+                self.assertTrue(result.session_identity.startswith("pre-dispatch-worker-"))
+                lifecycle = runtime._failure_lifecycle
+                with closing(sqlite3.connect(database_path(lifecycle.repository))) as connection:
+                    encoded = connection.execute(
+                        "SELECT record_json FROM failure_recovery_records WHERE task_id=?",
+                        (lifecycle.task_identity.task_id,),
+                    ).fetchone()[0]
+                record = parse_failure_record(json.loads(encoded))
+                self.assertEqual((record.failure, record.binding.session_identity), (
+                    FailureClass.HOST_SECURITY_DENIAL, result.session_identity,
+                ))
+                with self.assertRaisesRegex(WorkerShadowError, "scope is stopped|not dispatchable"):
+                    runtime.dispatch(request, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None)
+                self.assertEqual(backend.calls, 1)
 
     def test_fabricated_direct_runtime_dispatch_denies_before_any_effect(self):
         with tempfile.TemporaryDirectory() as temp:

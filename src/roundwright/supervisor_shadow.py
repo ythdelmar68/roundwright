@@ -12,14 +12,14 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
-from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorRequest, CodexSupervisorResult, SupervisorDiagnostic, SupervisorFailoverResult, SupervisorFallbackAuthorization, SupervisorResultKind, dispatch_ordered_supervisor_attempts
+from .codex_supervisor import CodexSupervisorAdapter, CodexSupervisorError, CodexSupervisorRequest, CodexSupervisorResult, SupervisorDiagnostic, SupervisorFailoverResult, SupervisorFallbackAuthorization, SupervisorResultKind, dispatch_ordered_supervisor_attempts
 from .shadow import CaptureMode, RecorderBinding, ShadowEvidenceProfile, ShadowProducer
 from .configuration import FileReviewAuthorityStore, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityEvidenceReceipt, ReviewAuthorityExpectation, ReviewPolicy
 from .runtime_binding import ExternalSupervisorRuntimeStore, FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBinding, SupervisorRuntimeBindingReceipt
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recover_role_effect_reservation, recovery_reservation_digest
 from .state import TaskIdentity, _open_writable_connection, _require_matching_task, database_path, require_runtime_binding
 from .provider_recovery import RecoveryContext
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, admit_scope_effect_reservation, begin_durable_recovery_route_reservation, classify_for_role, classify_native_failure, require_scope_effect_admission, require_scope_open, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, parse_failure_record, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, RecoveryAction, abandon_durable_recovery_route_reservation, admit_scope_effect_reservation, begin_durable_recovery_route_reservation, begin_provider_effect_reservation_intent, classify_for_role, classify_native_failure, pre_dispatch_failure_identity, require_scope_effect_admission, require_scope_open, commit_durable_recovery_route_successor_admission, issue_durable_recovery_route_authorization, parse_failure_record, read_durable_failure, read_durable_recovery_route_authorization, record_durable_failure
 
 
 SUPERVISOR_FAILOVER_PROFILE = "roundwright-shadow-profile/supervisor-review-failover/v1"
@@ -934,6 +934,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
     observed_attempts: list[SupervisorSequenceAttempt] = []
     prior = expected_receipt if not progress_receipts else progress_receipts[-1]
     source_decisions: dict[str, tuple[FailureBinding, str]] = {}
+    initial_reservation_digests: dict[str, tuple[str, str, str]] = {}
     # Reconstruct completed INVALID turns from their authenticated event and
     # repository checkpoints. A result digest is not itself a retry license.
     for ordinal, event in enumerate(progress_events, start=1):
@@ -984,6 +985,35 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
             if row != ("prepared", None, None, request.input_digest.removeprefix("sha256:")):
                 raise SupervisorShadowError("Supervisor dispatch is ambiguous or has drifted")
             connection.execute("INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)", (request.provider_attempt_id, task_identity.task_id, row[3], evidence_time))
+            admission = (
+                task_identity.task_id, binding.candidate_sha, resolved_policy.policy_digest,
+                resolved_policy.configuration_digest, "supervisor:" + task_identity.task_id,
+                "supervisor", request.selected_profile_identity,
+                pre_dispatch_failure_identity(FailureRole.SUPERVISOR, request.provider_attempt_id),
+                request.provider_attempt_id,
+            )
+            existing_admission = connection.execute(
+                "SELECT task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity FROM provider_failure_admissions WHERE attempt_id=?",
+                (request.provider_attempt_id,),
+            ).fetchone()
+            if existing_admission is None:
+                connection.execute(
+                    "INSERT INTO provider_failure_admissions(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (request.provider_attempt_id, *admission),
+                )
+            elif tuple(existing_admission) != admission:
+                raise SupervisorShadowError("Supervisor failure admission has drifted")
+            reservation_owner = initial_reservation_digests.pop(request.provider_attempt_id, None)
+            if reservation_owner is not None:
+                reservation_digest, reservation_repository_identity, reservation_task_identity = reservation_owner
+                deleted = connection.execute(
+                    "DELETE FROM provider_effect_reservation_intents WHERE attempt_id=? AND task_id=? AND repository_id=? AND authority_scope=? AND provider_role='supervisor' AND reservation_digest=? AND state='reserving' AND reservation_repository_identity=? AND reservation_task_identity=?",
+                    (request.provider_attempt_id, task_identity.task_id, task_identity.repository_id,
+                     "supervisor:" + task_identity.task_id, reservation_digest,
+                     reservation_repository_identity, reservation_task_identity),
+                ).rowcount
+                if deleted != 1:
+                    raise SupervisorShadowError("Supervisor reservation intent has drifted")
             connection.commit()
         except Exception as error:
             connection.rollback()
@@ -1239,6 +1269,25 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
         except Exception as error:
             raise RoleCapabilityError("Supervisor scoped reservation is denied") from error
 
+    def prepare_initial_reservation(request: CodexSupervisorRequest, reservation_digest: str) -> bool:
+        """Fence a non-fallback debit so a process restart can recover it."""
+
+        try:
+            created = begin_provider_effect_reservation_intent(
+                repository, task_identity, "supervisor:" + task_identity.task_id,
+                attempt_id=request.provider_attempt_id,
+                reservation_digest=reservation_digest,
+                reservation_repository_identity=execution_hosts[requests.index(request)].repository_identity,
+                reservation_task_identity=execution_hosts[requests.index(request)].task_identity,
+            )
+        except Exception as error:
+            raise CodexSupervisorError("Supervisor reservation intent is unavailable") from error
+        host = execution_hosts[requests.index(request)]
+        initial_reservation_digests[request.provider_attempt_id] = (
+            reservation_digest, host.repository_identity, host.task_identity,
+        )
+        return not created
+
     failover = dispatch_ordered_supervisor_attempts(
         requests, adapters, advisory_executions, execution_hosts,
         tuple(budget_ledger_path for _ in adapters),
@@ -1252,6 +1301,7 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
             repository, task_identity, "supervisor:" + task_identity.task_id,
         ),
         reservation_admission=reserve_with_scope,
+        prepare_initial_reservation=prepare_initial_reservation,
     )
     attempts = tuple(observed_attempts)
     try:

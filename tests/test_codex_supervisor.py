@@ -729,6 +729,8 @@ class SupervisorTests(unittest.TestCase):
                     inner.calls = 0
                 def open_fresh_session(inner, profile):
                     inner.calls += 1
+                    if inner.mode == "pre-session-denial":
+                        raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
                     class Handle:
                         id = "turn-" + inner.identity
                         def stream(handle):
@@ -869,6 +871,32 @@ class SupervisorTests(unittest.TestCase):
                         self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
                     self.assertEqual([a._backend.calls for a in fixture[0]], [1, 0])
                 self.qualify_fixture(fixture, _exercise=exercise)
+
+    def test_pre_session_native_denial_persists_typed_scope_stop_without_turn(self):
+        from roundwright.failure_recovery import FailureClass, FailureRecoveryError, parse_failure_record, require_scope_open
+
+        fixture = list(self.native_sequence(("pre-session-denial", "pass")))
+
+        def exercise(run, repository, budget):
+            result = run()
+            self.assertEqual((result.envelope.terminal.value, result.failover.result.turn_identity), ("blocked", None))
+            assert result.failover.result.session_identity is not None
+            self.assertTrue(result.failover.result.session_identity.startswith("pre-dispatch-supervisor-"))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                rows = connection.execute("SELECT record_json FROM failure_recovery_records").fetchall()
+                self.assertEqual(len(rows), 1)
+                decision = parse_failure_record(json.loads(rows[0][0]))
+                self.assertEqual((decision.failure, decision.binding.session_identity), (
+                    FailureClass.HOST_SECURITY_DENIAL,
+                    result.failover.result.session_identity,
+                ))
+                with self.assertRaises(FailureRecoveryError):
+                    require_scope_open(connection, self.context.task_id, "supervisor:" + self.context.task_id)
+            with self.assertRaises((FailureRecoveryError, SupervisorShadowError)):
+                run()
+            self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [1, 0])
+
+        self.qualify_fixture(fixture, _exercise=exercise)
 
     def test_real_qualification_entrypoint_rechecks_scope_after_session_checkpoint(self):
         """The repository-bound qualifier threads its guard into dispatch."""
@@ -1175,7 +1203,7 @@ class SupervisorTests(unittest.TestCase):
         import roundwright.codex_supervisor as dispatcher
 
         class ProcessDeath(BaseException): pass
-        for boundary in ("plan", "fence", "budget", "admission", "dispatch", "admission-drift", "budget-drift", "claim-drift"):
+        for boundary in ("plan", "initial-budget", "fence", "budget", "admission", "dispatch", "admission-drift", "budget-drift", "claim-drift"):
             with self.subTest(boundary=boundary), TemporaryDirectory() as directory:
                 adapters, requests, readiness, binding, policy, _, recorder = self.native_sequence(("shape", "pass"))
                 lifecycle = FileSupervisorLifecycle(Path(directory), digest("crash-lifecycle"))
@@ -1184,7 +1212,7 @@ class SupervisorTests(unittest.TestCase):
                         target, method = lifecycle, "prepare"
                     elif boundary == "fence":
                         target, method = shadow, "begin_durable_recovery_route_reservation"
-                    elif boundary == "budget":
+                    elif boundary in ("initial-budget", "budget"):
                         target, method = dispatcher, "reserve_role_effect"
                     elif boundary in ("admission", "admission-drift", "budget-drift", "claim-drift"):
                         target, method = shadow, "commit_durable_recovery_route_successor_admission"
@@ -1193,7 +1221,14 @@ class SupervisorTests(unittest.TestCase):
                     original = getattr(target, method)
                     def die(*args, **kwargs):
                         result = original(*args, **kwargs)
-                        if boundary != "budget" or kwargs["request_or_attempt_identity"] == requests[1].provider_attempt_id:
+                        dies_here = (
+                            boundary == "initial-budget"
+                            and kwargs["request_or_attempt_identity"] == requests[0].provider_attempt_id
+                        ) or (
+                            boundary == "budget"
+                            and kwargs["request_or_attempt_identity"] == requests[1].provider_attempt_id
+                        )
+                        if boundary not in ("initial-budget", "budget") or dies_here:
                             raise ProcessDeath()
                         return result
                     with patch.object(target, method, side_effect=die), self.assertRaises(ProcessDeath):
@@ -1220,7 +1255,7 @@ class SupervisorTests(unittest.TestCase):
                             run()
                         self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), calls)
                         return
-                    self.assertEqual(calls, (0, 0) if boundary == "plan" else (1, 0))
+                    self.assertEqual(calls, (0, 0) if boundary in ("plan", "initial-budget") else (1, 0))
                     result = run()
                     self.assertEqual(result.envelope.accepted_ordinal, 2)
                     self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 1))

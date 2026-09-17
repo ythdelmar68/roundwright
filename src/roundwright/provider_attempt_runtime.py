@@ -1234,6 +1234,8 @@ class DurableDiffReviewRunner:
                         "supervisor:" + self.identity.task_id,
                         attempt_id=selection.provider_attempt_id,
                         reservation_digest=reservation_intent_digest,
+                        reservation_repository_identity=entry.execution_host.repository_identity,
+                        reservation_task_identity=entry.execution_host.task_identity,
                     )
             except (FailureRecoveryError, RoleCapabilityError) as error:
                 raise ProviderAttemptRuntimeError(

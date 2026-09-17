@@ -31,7 +31,7 @@ from .failure_recovery import (
     classify_native_failure,
     issue_durable_recovery_route_authorization, parse_failure_record,
     read_durable_failure, read_durable_recovery_route_authorization,
-    record_durable_failure,
+    pre_dispatch_failure_identity, record_durable_failure,
 )
 from .state import TaskIdentity, _open_writable_connection
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recovery_reservation_digest, recover_role_effect_reservation, require_external_production_activation, reserve_role_effect, trusted_provider_launch_context
@@ -212,13 +212,14 @@ class CodexDependencyReviewAdapter:
             response = turn.read_response()
         except CodexAdapterError as error:
             _abort(turn)
-            if session_id is not None and turn_id is not None:
-                return DependencyReviewDispatchResult(
-                    DependencyReviewResultKind.BLOCKED, session_id, turn_id, None,
-                    _digest({"attempt_id": request.attempt_id, "status": "sdk-turn-failed", "failure": error.failure.value}),
-                    "sdk-turn-failed", error.failure,
-                )
-            return DependencyReviewDispatchResult(DependencyReviewResultKind.AMBIGUOUS, session_id, turn_id, None, _digest({"attempt_id": request.attempt_id, "session": session_id, "turn": turn_id, "status": "ambiguous"}), "uncertain-provider-turn")
+            durable_session = session_id or pre_dispatch_failure_identity(
+                FailureRole.DEPENDENCY_REVIEW, request.attempt_id,
+            )
+            return DependencyReviewDispatchResult(
+                DependencyReviewResultKind.BLOCKED, durable_session, turn_id, None,
+                _digest({"attempt_id": request.attempt_id, "status": "sdk-turn-failed", "failure": error.failure.value}),
+                "sdk-turn-failed", error.failure,
+            )
         except DependencyReviewDispatchError:
             _abort(turn)
             raise
@@ -262,6 +263,20 @@ class DependencyReviewService:
             raise DependencyReviewDispatchError("dependency review adapter profile has drifted")
         if type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.DEPENDENCY_REVIEW:
             raise DependencyReviewDispatchError("dependency review advisory admission is unavailable")
+        connection = _open_writable_connection(repository)
+        try:
+            durable_task = connection.execute(
+                "SELECT task_id, source_id, repository_id, branch, worktree, base_sha FROM tasks WHERE task_id = ?",
+                (subset.task_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if durable_task is None:
+            raise DependencyReviewDispatchError("dependency review task identity is unavailable")
+        derived_task_identity = TaskIdentity(*durable_task)
+        if task_identity is not None and task_identity != derived_task_identity:
+            raise DependencyReviewDispatchError("dependency review task identity has drifted")
+        task_identity = derived_task_identity
         store = DependencyReviewStore()
         input_material = store.model_input(
             subset, attempt_id=attempt_id,
@@ -271,11 +286,8 @@ class DependencyReviewService:
         request = DependencyReviewRequest(
             attempt_id, input_material, _digest(input_material), binding.profile_identity,
         )
-        if task_identity is not None:
-            store.require_current_authority(repository, task_identity, subset, binding)
+        store.require_current_authority(repository, task_identity, subset, binding)
         def require_effect_scope() -> None:
-            if task_identity is None:
-                return
             try:
                 require_scope_effect_admission(
                     repository, task_identity, "dependency-review:" + task_identity.task_id,
@@ -512,19 +524,18 @@ class DependencyReviewService:
                 store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code="proposal-rejected", task_identity=task_identity, binding=binding if task_identity is not None else None)
                 return DependencyReviewDispatchResult(DependencyReviewResultKind.INVALID, result.session_identity, result.turn_identity, None, result.output_digest, "proposal-rejected")
         elif result.kind is DependencyReviewResultKind.BLOCKED:
-            if task_identity is not None and (result.session_identity is None or result.failure is None):
+            if result.session_identity is None or result.failure is None:
                 raise DependencyReviewDispatchError("dependency review typed terminal failure is incomplete")
-            if task_identity is not None:
-                assert result.session_identity is not None and result.failure is not None
-                failure_binding = FailureBinding(
-                    binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
-                    "dependency-review:" + task_identity.task_id, FailureRole.DEPENDENCY_REVIEW,
-                    binding.profile_identity, result.session_identity, attempt.attempt_id,
-                )
-                record_durable_failure(
-                    repository, task_identity,
-                    classify_native_failure(FailureRole.DEPENDENCY_REVIEW, failure_binding, result.failure),
-                )
+            assert result.session_identity is not None and result.failure is not None
+            failure_binding = FailureBinding(
+                binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                "dependency-review:" + task_identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                binding.profile_identity, result.session_identity, attempt.attempt_id,
+            )
+            record_durable_failure(
+                repository, task_identity,
+                classify_native_failure(FailureRole.DEPENDENCY_REVIEW, failure_binding, result.failure),
+            )
             try:
                 store.record_blocked(repository, attempt_id=attempt.attempt_id, output_digest=result.output_digest, reason_code=result.reason_code, owner_route="prebound-transient-route", task_identity=task_identity, binding=binding if task_identity is not None else None)
             except FailureRecoveryError:

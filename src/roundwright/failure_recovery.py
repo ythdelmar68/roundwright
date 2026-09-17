@@ -201,6 +201,22 @@ def classify_native_failure(
     return classify_for_role(role, binding, failure, evidence)
 
 
+def pre_dispatch_failure_identity(role: FailureRole, attempt_identity: str) -> str:
+    """Return the durable session surrogate for a typed pre-session denial.
+
+    Native SDKs can return an authenticated error while constructing a session
+    or turn, before either provider identity exists.  The already-consumed
+    product dispatch claim is the only durable identity at that boundary.  A
+    domain-separated surrogate lets all three role adapters retain the typed
+    classification without pretending that the provider returned a session.
+    """
+
+    if type(role) is not FailureRole or not isinstance(attempt_identity, str) or not _TOKEN.fullmatch(attempt_identity):
+        raise FailureRecoveryError("pre-dispatch failure identity is invalid")
+    material = f"roundwright-pre-dispatch-failure/v1\x00{role.value}\x00{attempt_identity}"
+    return "pre-dispatch-" + role.value + "-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
 @dataclass(frozen=True)
 class FailureBinding:
     """Immutable identity shared with the #136 role-admission receipt."""
@@ -988,7 +1004,7 @@ def _require_attempt_admission(connection, identity, binding: FailureBinding) ->
         _require_dependency_review_admission(connection, identity, binding)
         return
     row = connection.execute(
-        "SELECT admissions.task_id, admissions.candidate_sha, admissions.policy_digest, admissions.configuration_digest, admissions.authority_scope, admissions.provider_role, admissions.profile_identity, admissions.session_identity, admissions.attempt_identity, attempts.task_id, attempts.provider_role, attempts.selected_profile_identity, attempts.session_identity, contexts.task_id, contexts.candidate_fingerprint, contexts.policy_fingerprint, contexts.configuration_digest FROM provider_failure_admissions AS admissions JOIN provider_attempts AS attempts ON attempts.attempt_id = admissions.attempt_id JOIN provider_attempt_contexts AS contexts ON contexts.attempt_id = admissions.attempt_id WHERE admissions.attempt_id = ?",
+        "SELECT admissions.task_id, admissions.candidate_sha, admissions.policy_digest, admissions.configuration_digest, admissions.authority_scope, admissions.provider_role, admissions.profile_identity, admissions.session_identity, admissions.attempt_identity, attempts.task_id, attempts.provider_role, attempts.selected_profile_identity, attempts.session_identity, contexts.task_id, contexts.candidate_fingerprint, contexts.policy_fingerprint, contexts.configuration_digest, attempts.input_fingerprint, claims.task_id, claims.claim_fingerprint FROM provider_failure_admissions AS admissions JOIN provider_attempts AS attempts ON attempts.attempt_id = admissions.attempt_id JOIN provider_attempt_contexts AS contexts ON contexts.attempt_id = admissions.attempt_id LEFT JOIN provider_dispatch_claims AS claims ON claims.attempt_id = admissions.attempt_id WHERE admissions.attempt_id = ?",
         (binding.attempt_identity,),
     ).fetchone()
     expected = (
@@ -1000,11 +1016,20 @@ def _require_attempt_admission(connection, identity, binding: FailureBinding) ->
         raise FailureRecoveryError("durable failure admission is unavailable or has drifted")
     if (
         row[9] != identity.task_id or row[10] != binding.role.value
-        or row[11] != binding.profile_identity or row[12] != binding.session_identity
+        or row[11] != binding.profile_identity
         or row[13] != identity.task_id
         or row[14] != hashlib.sha256(binding.candidate_sha.encode()).hexdigest()
         or row[15] != binding.policy_digest.removeprefix("sha256:")
         or row[16] != binding.configuration_digest
+    ):
+        raise FailureRecoveryError("durable failure admission is unavailable or has drifted")
+    pre_dispatch = pre_dispatch_failure_identity(binding.role, binding.attempt_identity)
+    if not (
+        row[12] == binding.session_identity
+        or (
+            row[12] is None and binding.session_identity == pre_dispatch
+            and tuple(row[18:20]) == (identity.task_id, row[17])
+        )
     ):
         raise FailureRecoveryError("durable failure admission is unavailable or has drifted")
     _require_current_admission_authority(connection, identity, binding)
@@ -1041,10 +1066,15 @@ def _require_dependency_review_admission(connection, identity, binding: FailureB
         raise FailureRecoveryError("dependency review failure admission is unavailable or has drifted")
     if (
         row[9] != identity.task_id or row[10] != binding.profile_identity
-        or row[11] != binding.configuration_digest or row[12] != binding.session_identity
-        or row[13] not in {"session-opened", "turn-dispatched"}
+        or row[11] != binding.configuration_digest
         or row[14] != identity.task_id or row[15] != binding.candidate_sha
         or row[16] != binding.policy_digest or row[17] != binding.configuration_digest
+    ):
+        raise FailureRecoveryError("dependency review failure admission is unavailable or has drifted")
+    pre_dispatch = pre_dispatch_failure_identity(FailureRole.DEPENDENCY_REVIEW, binding.attempt_identity)
+    if not (
+        (row[12] == binding.session_identity and row[13] in {"session-opened", "turn-dispatched"})
+        or (row[12] is None and row[13] == "pre-dispatch" and binding.session_identity == pre_dispatch)
     ):
         raise FailureRecoveryError("dependency review failure admission is unavailable or has drifted")
     _require_current_dependency_review_authority(connection, identity, binding)
@@ -1084,16 +1114,21 @@ def _require_current_admission_authority(connection, identity, binding: FailureB
         "current_context.supervisor_profile_identities, runtime.schema_version, "
         "runtime.resolved_digest, runtime.worker_profile_identity, "
         "runtime.supervisor_profile_identities, checkpoints.task_id, "
-        "checkpoints.attempt_id, checkpoints.session_identity "
+        "checkpoints.attempt_id, checkpoints.session_identity, checkpoints.identity_fingerprint, "
+        "dispatch.task_id, dispatch.claim_fingerprint, attempts.input_fingerprint, attempts.session_identity, "
+        "before_dispatch.task_id, before_dispatch.provider_role, before_dispatch.checkpoint_phase, before_dispatch.identity_fingerprint "
         "FROM candidate_seals AS seals "
         "JOIN provider_attempt_contexts AS current_context "
         "ON current_context.attempt_id = ? AND current_context.task_id = seals.task_id "
         "JOIN runtime_configuration_bindings AS runtime "
         "ON runtime.task_id = seals.task_id "
-        "JOIN provider_session_checkpoints AS checkpoints "
+        "LEFT JOIN provider_session_checkpoints AS checkpoints "
         "ON checkpoints.attempt_id = ? "
+        "JOIN provider_attempts AS attempts ON attempts.attempt_id = ? "
+        "LEFT JOIN provider_dispatch_claims AS dispatch ON dispatch.attempt_id = attempts.attempt_id "
+        "JOIN provider_checkpoints AS before_dispatch ON before_dispatch.checkpoint_id = attempts.attempt_id || ':before-dispatch' "
         "WHERE seals.task_id = ?",
-        (binding.attempt_identity, binding.attempt_identity, identity.task_id),
+        (binding.attempt_identity, binding.attempt_identity, binding.attempt_identity, identity.task_id),
     ).fetchone()
     if row is None:
         raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
@@ -1102,7 +1137,9 @@ def _require_current_admission_authority(connection, identity, binding: FailureB
         policy_fingerprint, configuration_digest, context_worker_profile,
         context_supervisor_profiles, runtime_schema, runtime_configuration,
         runtime_worker_profile, runtime_supervisor_profiles, checkpoint_task,
-        checkpoint_attempt, checkpoint_session,
+        checkpoint_attempt, checkpoint_session, checkpoint_fingerprint,
+        dispatch_task, dispatch_fingerprint, attempt_input_fingerprint, attempt_session,
+        before_task, before_role, before_phase, before_fingerprint,
     ) = row
     expected_fingerprint = hashlib.sha256(binding.candidate_sha.encode()).hexdigest()
     expected_policy = binding.policy_digest.removeprefix("sha256:")
@@ -1128,9 +1165,23 @@ def _require_current_admission_authority(connection, identity, binding: FailureB
         or runtime_configuration != binding.configuration_digest
         or expected_profile != binding.profile_identity
         or (binding.role is FailureRole.SUPERVISOR and binding.profile_identity not in runtime_supervisors)
-        or checkpoint_task != identity.task_id
+        or before_task != identity.task_id or before_role != binding.role.value
+        or before_phase != "before-dispatch"
+    ):
+        raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
+    pre_dispatch = pre_dispatch_failure_identity(binding.role, binding.attempt_identity)
+    if binding.session_identity == pre_dispatch:
+        if (
+            attempt_session is not None or checkpoint_task is not None
+            or (dispatch_task, dispatch_fingerprint) != (identity.task_id, attempt_input_fingerprint)
+        ):
+            raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
+    elif (
+        checkpoint_task != identity.task_id
         or checkpoint_attempt != binding.attempt_identity
         or checkpoint_session != binding.session_identity
+        or attempt_session != binding.session_identity
+        or checkpoint_fingerprint != before_fingerprint
     ):
         raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
 
@@ -1450,7 +1501,8 @@ def admit_scope_effect_reservation(
 
 def begin_provider_effect_reservation_intent(
     repository, identity, scope: str, *, attempt_id: str,
-    reservation_digest: str,
+    reservation_digest: str, reservation_repository_identity: str,
+    reservation_task_identity: str,
 ) -> bool:
     """Persist an exact non-route Supervisor debit intent before budget I/O.
 
@@ -1465,6 +1517,8 @@ def begin_provider_effect_reservation_intent(
         or scope != "supervisor:" + identity.task_id
         or not isinstance(attempt_id, str) or not attempt_id
         or not _DIGEST.fullmatch(reservation_digest)
+        or not _DIGEST.fullmatch(reservation_repository_identity)
+        or not _TOKEN.fullmatch(reservation_task_identity)
     ):
         raise FailureRecoveryError("provider effect reservation intent is invalid")
     connection = _open_writable_connection(repository)
@@ -1472,18 +1526,30 @@ def begin_provider_effect_reservation_intent(
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
         require_scope_open(connection, identity.task_id, scope)
+        successor = connection.execute(
+            "SELECT task_id, provider_role, state, session_identity, external_turn_identity, "
+            "output_pointer, completion_evidence_fingerprint, accepted_review_identity "
+            "FROM provider_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if successor is not None and successor != (
+            identity.task_id, "supervisor", "prepared", None, None, None, None, None,
+        ):
+            raise FailureRecoveryError("provider effect reservation already has a successor")
         if connection.execute(
-            "SELECT 1 FROM provider_attempts WHERE attempt_id = ?",
+            "SELECT 1 FROM provider_dispatch_claims WHERE attempt_id = ?",
             (attempt_id,),
         ).fetchone() is not None:
             raise FailureRecoveryError("provider effect reservation already has a successor")
         expected = (
             identity.task_id, identity.repository_id, scope, "supervisor",
-            reservation_digest, "reserving",
+            reservation_digest, "reserving", reservation_repository_identity,
+            reservation_task_identity,
         )
         row = connection.execute(
             "SELECT task_id, repository_id, authority_scope, provider_role, "
-            "reservation_digest, state FROM provider_effect_reservation_intents "
+            "reservation_digest, state, reservation_repository_identity, reservation_task_identity "
+            "FROM provider_effect_reservation_intents "
             "WHERE attempt_id = ?",
             (attempt_id,),
         ).fetchone()
@@ -1491,8 +1557,10 @@ def begin_provider_effect_reservation_intent(
             connection.execute(
                 "INSERT INTO provider_effect_reservation_intents("
                 "attempt_id, task_id, repository_id, authority_scope, provider_role, "
-                "reservation_digest, state) VALUES (?, ?, ?, ?, 'supervisor', ?, 'reserving')",
-                (attempt_id, identity.task_id, identity.repository_id, scope, reservation_digest),
+                "reservation_digest, state, reservation_repository_identity, reservation_task_identity) "
+                "VALUES (?, ?, ?, ?, 'supervisor', ?, 'reserving', ?, ?)",
+                (attempt_id, identity.task_id, identity.repository_id, scope, reservation_digest,
+                 reservation_repository_identity, reservation_task_identity),
             )
             connection.commit()
             return True
@@ -1589,13 +1657,15 @@ def release_unused_provider_effect_reservation(
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
         intent = connection.execute(
-            "SELECT task_id, repository_id, authority_scope, provider_role, reservation_digest, state "
+            "SELECT task_id, repository_id, authority_scope, provider_role, reservation_digest, state, "
+            "reservation_repository_identity, reservation_task_identity "
             "FROM provider_effect_reservation_intents WHERE attempt_id = ?",
             (attempt_id,),
         ).fetchone()
         expected_intent = (
             identity.task_id, identity.repository_id, scope, "supervisor",
             effect_reservation.recovery_digest, "reserving",
+            binding.repository_identity, binding.task_identity,
         )
         if intent != expected_intent:
             raise FailureRecoveryError("unused provider reservation intent has drifted")

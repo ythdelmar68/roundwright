@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -23,7 +24,8 @@ from roundwright.dependency_graph import (
     GraphDecision,
 )
 from roundwright.git_identity import acquire_transition_lease
-from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
+from roundwright.runtime_binding import RuntimeBinding
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
 
 
 def digest(character: str) -> str:
@@ -46,7 +48,32 @@ class DependencyReviewTests(unittest.TestCase):
             "subset-113", identity.task_id, "b" * 64, "c" * 40, digest("d"), digest("e"), digest("f"), "initial",
             (AffectedMember("member-a", digest("1"), digest("2")), AffectedMember("member-b", digest("3"), digest("4"))),
         )
+        with closing(sqlite3.connect(database_path(repository))) as connection:
+            connection.execute(
+                "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                (identity.task_id, identity.base_sha, subset.candidate_sha, "authority-113"),
+            )
+            connection.commit()
+        record_runtime_binding(
+            repository, identity,
+            RuntimeBinding("roundwright-runtime/v1", subset.configuration_digest, digest("8"), (digest("9"),)),
+        )
         return repository, subset
+
+    def accept(self, store: DependencyReviewStore, repository: RepositoryIdentity, proposal: DependencyProposal, *, binding: DependencyReviewBinding) -> str:
+        """Authenticate the provider turn before exercising proposal acceptance."""
+
+        identity = TaskIdentity("task-113", "source-113", "repo-113", "codex/113", "C:/review-113", "a" * 40)
+        with closing(sqlite3.connect(database_path(repository))) as connection:
+            claim = connection.execute(
+                "SELECT state FROM dependency_review_dispatch_claims WHERE attempt_id=?",
+                (proposal.attempt_id,),
+            ).fetchone()
+        if claim is None:
+            store.claim_pre_dispatch(repository, attempt_id=proposal.attempt_id, task_identity=identity, binding=binding)
+            store.claim_session(repository, attempt_id=proposal.attempt_id, session_identity="session-" + proposal.attempt_id, task_identity=identity, binding=binding)
+            store.claim_turn(repository, attempt_id=proposal.attempt_id, session_identity="session-" + proposal.attempt_id, turn_identity="turn-" + proposal.attempt_id)
+        return store.accept_proposal(repository, proposal, binding=binding, task_identity=identity)
 
     def proposal(self, attempt_id: str, *, semantic: bool = False) -> DependencyProposal:
         kind = EdgeKind.SEMANTIC_INFERRED if semantic else EdgeKind.EXPLICIT
@@ -87,8 +114,8 @@ class DependencyReviewTests(unittest.TestCase):
             attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             self.assertEqual(attempt.state, "prepared")
             proposal = self.proposal(attempt.attempt_id)
-            self.assertEqual(store.accept_proposal(repository, proposal, binding=self.binding(subset)), proposal.proposal_digest)
-            self.assertEqual(store.accept_proposal(repository, proposal, binding=self.binding(subset)), proposal.proposal_digest)
+            self.assertEqual(self.accept(store, repository, proposal, binding=self.binding(subset)), proposal.proposal_digest)
+            self.assertEqual(self.accept(store, repository, proposal, binding=self.binding(subset)), proposal.proposal_digest)
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-113'").fetchone(), ("accepted",))
@@ -97,6 +124,37 @@ class DependencyReviewTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM dependency_review_successors").fetchone(), (0,))
             finally:
                 connection.close()
+
+    def test_acceptance_requires_complete_dispatch_identity_evidence(self) -> None:
+        """Prepared or session-only attempts cannot be accepted by a direct caller."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            proposal = self.proposal("acceptance-evidence")
+            store.start_attempt(
+                repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                source_owned_relations=self.source_owned_relations(proposal),
+            )
+            with self.assertRaisesRegex(DependencyReviewError, "acceptance evidence"):
+                store.accept_proposal(repository, proposal, binding=binding)
+            identity = TaskIdentity("task-113", "source-113", "repo-113", "codex/113", "C:/review-113", "a" * 40)
+            store.claim_pre_dispatch(repository, attempt_id=proposal.attempt_id, task_identity=identity, binding=binding)
+            store.claim_session(
+                repository, attempt_id=proposal.attempt_id,
+                session_identity="acceptance-session", task_identity=identity, binding=binding,
+            )
+            with self.assertRaisesRegex(DependencyReviewError, "acceptance evidence"):
+                store.accept_proposal(repository, proposal, binding=binding)
+            store.claim_turn(
+                repository, attempt_id=proposal.attempt_id,
+                session_identity="acceptance-session", turn_identity="acceptance-turn",
+            )
+            self.assertEqual(
+                store.accept_proposal(repository, proposal, binding=binding),
+                proposal.proposal_digest,
+            )
 
     def test_graph_requires_the_pre_dispatch_relation_identity_not_caller_scalars(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -109,7 +167,7 @@ class DependencyReviewTests(unittest.TestCase):
             attempt = reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=(relation,))
             model_input = reviews.model_input(subset, attempt_id=attempt.attempt_id, profile_identity=self.binding(subset).profile_identity, source_owned_relations=(relation,))
             self.assertEqual(model_input["trusted_relations"][0]["trusted_relation_digest"], relation.relation_digest)
-            reviews.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(reviews, repository, proposal, binding=self.binding(subset))
             result = DependencyGraphStore().activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(self.binding(subset)), graph_version_id="graph-113")
             self.assertEqual((result.decision, result.reason_code), (GraphDecision.REJECTED, "provenance-unavailable"))
 
@@ -122,13 +180,13 @@ class DependencyReviewTests(unittest.TestCase):
                 DependencyProposal.parse({"schema": "roundwright-dependency-review-proposal/v1"})
             missing = DependencyProposal("proposal-113", attempt.attempt_id, RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "missing", digest("5"), Confidence.HIGH, digest("6")),))
             with self.assertRaises(DependencyReviewError):
-                store.accept_proposal(repository, missing, binding=self.binding(subset))
+                self.accept(store, repository, missing, binding=self.binding(subset))
             changed = AffectedSubset(subset.snapshot_id, subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, digest("0"), subset.creation_reason, subset.members)
             with self.assertRaises(DependencyReviewError):
                 store.start_attempt(repository, changed, attempt_id="attempt-113", binding=self.binding(subset))
             store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
             with self.assertRaises(DependencyReviewError):
-                store.accept_proposal(repository, self.proposal(attempt.attempt_id), binding=self.binding(subset))
+                self.accept(store, repository, self.proposal(attempt.attempt_id), binding=self.binding(subset))
 
     def test_semantic_edges_require_owner_routing_and_retries_are_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -140,7 +198,7 @@ class DependencyReviewTests(unittest.TestCase):
             store.record_invalid(repository, attempt_id=first.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
             retry_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
             retry = store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), supersedes_attempt_id=first.attempt_id)
-            self.assertEqual(store.accept_proposal(repository, self.proposal(retry.attempt_id, semantic=True), binding=self.binding(retry_subset)), self.proposal(retry.attempt_id, semantic=True).proposal_digest)
+            self.assertEqual(self.accept(store, repository, self.proposal(retry.attempt_id, semantic=True), binding=self.binding(retry_subset)), self.proposal(retry.attempt_id, semantic=True).proposal_digest)
 
     def test_acceptance_rejects_current_binding_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -155,8 +213,8 @@ class DependencyReviewTests(unittest.TestCase):
             ):
                 with self.subTest(binding=binding):
                     with self.assertRaises(DependencyReviewError):
-                        store.accept_proposal(repository, self.proposal(attempt.attempt_id), binding=binding)
-            self.assertEqual(store.accept_proposal(repository, self.proposal(attempt.attempt_id), binding=self.binding(subset)), self.proposal(attempt.attempt_id).proposal_digest)
+                        self.accept(store, repository, self.proposal(attempt.attempt_id), binding=binding)
+            self.assertEqual(self.accept(store, repository, self.proposal(attempt.attempt_id), binding=self.binding(subset)), self.proposal(attempt.attempt_id).proposal_digest)
 
     def test_subset_order_is_normalized_and_retry_lineage_is_task_terminal_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -220,7 +278,7 @@ class DependencyReviewTests(unittest.TestCase):
             store = DependencyReviewStore()
             attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             proposal = self.proposal(attempt.attempt_id)
-            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(store, repository, proposal, binding=self.binding(subset))
             return repository, subset, store, proposal
         repository, subset, store, proposal = accepted()
         connection = sqlite3.connect(database_path(repository))
@@ -230,7 +288,7 @@ class DependencyReviewTests(unittest.TestCase):
         finally:
             connection.close()
         with self.assertRaises(DependencyReviewError):
-            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(store, repository, proposal, binding=self.binding(subset))
         repository, subset, store, proposal = accepted()
         connection = sqlite3.connect(database_path(repository))
         try:
@@ -239,7 +297,7 @@ class DependencyReviewTests(unittest.TestCase):
         finally:
             connection.close()
         with self.assertRaises(DependencyReviewError):
-            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(store, repository, proposal, binding=self.binding(subset))
 
     def test_terminal_replays_never_repair_missing_or_extra_outcomes(self) -> None:
         def accepted() -> tuple[RepositoryIdentity, AffectedSubset, DependencyReviewStore, DependencyProposal]:
@@ -249,7 +307,7 @@ class DependencyReviewTests(unittest.TestCase):
             store = DependencyReviewStore()
             attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             proposal = self.proposal(attempt.attempt_id)
-            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(store, repository, proposal, binding=self.binding(subset))
             return repository, subset, store, proposal
         repository, subset, store, proposal = accepted()
         connection = sqlite3.connect(database_path(repository))
@@ -259,7 +317,7 @@ class DependencyReviewTests(unittest.TestCase):
         finally:
             connection.close()
         with self.assertRaises(DependencyReviewError):
-            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(store, repository, proposal, binding=self.binding(subset))
         repository, subset, store, proposal = accepted()
         connection = sqlite3.connect(database_path(repository))
         try:
@@ -268,7 +326,7 @@ class DependencyReviewTests(unittest.TestCase):
         finally:
             connection.close()
         with self.assertRaises(DependencyReviewError):
-            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(store, repository, proposal, binding=self.binding(subset))
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
             store = DependencyReviewStore()
@@ -280,7 +338,7 @@ class DependencyReviewTests(unittest.TestCase):
             finally:
                 connection.close()
             with self.assertRaises(DependencyReviewError):
-                store.accept_proposal(repository, self.proposal(attempt.attempt_id), binding=self.binding(subset))
+                self.accept(store, repository, self.proposal(attempt.attempt_id), binding=self.binding(subset))
             with self.assertRaises(DependencyReviewError):
                 store.record_invalid(repository, attempt_id=attempt.attempt_id, output_digest=digest("8"), reason_code="malformed-response")
 
@@ -310,7 +368,7 @@ class DependencyReviewTests(unittest.TestCase):
             successor = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
             second = store.start_attempt(repository, successor, attempt_id="attempt-114", binding=self.binding(successor), supersedes_attempt_id=first.attempt_id)
             proposal = self.proposal(second.attempt_id)
-            store.accept_proposal(repository, proposal, binding=self.binding(successor))
+            self.accept(store, repository, proposal, binding=self.binding(successor))
             connection = sqlite3.connect(database_path(repository))
             try:
                 connection.execute("UPDATE dependency_review_attempts SET supersedes_attempt_id = NULL WHERE attempt_id = ?", (second.attempt_id,))
@@ -318,7 +376,7 @@ class DependencyReviewTests(unittest.TestCase):
             finally:
                 connection.close()
             with self.assertRaises(DependencyReviewError):
-                store.accept_proposal(repository, proposal, binding=self.binding(successor))
+                self.accept(store, repository, proposal, binding=self.binding(successor))
 
     def test_invalid_terminal_replay_and_successor_require_complete_evidence(self) -> None:
         def invalid_terminal() -> tuple[RepositoryIdentity, AffectedSubset, DependencyReviewStore, object]:
@@ -380,7 +438,7 @@ class DependencyReviewTests(unittest.TestCase):
             second_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
             second = store.start_attempt(repository, second_subset, attempt_id="attempt-114", binding=self.binding(second_subset), supersedes_attempt_id=first.attempt_id)
             proposal = self.proposal(second.attempt_id)
-            store.accept_proposal(repository, proposal, binding=self.binding(second_subset))
+            self.accept(store, repository, proposal, binding=self.binding(second_subset))
             connection = sqlite3.connect(database_path(repository))
             try:
                 connection.execute("UPDATE dependency_review_successors SET successor_attempt_id = ? WHERE predecessor_attempt_id = ?", ("missing-attempt", first.attempt_id))
@@ -388,7 +446,7 @@ class DependencyReviewTests(unittest.TestCase):
             finally:
                 connection.close()
             with self.assertRaises(DependencyReviewError):
-                store.accept_proposal(repository, proposal, binding=self.binding(second_subset))
+                self.accept(store, repository, proposal, binding=self.binding(second_subset))
 
     def test_accepted_predecessor_rejects_proposal_edge_ordinal_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -399,7 +457,7 @@ class DependencyReviewTests(unittest.TestCase):
             second_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
             second = store.start_attempt(repository, second_subset, attempt_id="attempt-114", binding=self.binding(second_subset), supersedes_attempt_id=first.attempt_id)
             proposal = self.proposal(second.attempt_id)
-            store.accept_proposal(repository, proposal, binding=self.binding(second_subset))
+            self.accept(store, repository, proposal, binding=self.binding(second_subset))
             connection = sqlite3.connect(database_path(repository))
             try:
                 connection.execute("UPDATE dependency_review_proposal_edges SET ordinal = 5 WHERE proposal_id = ?", (proposal.proposal_id,))
@@ -416,7 +474,7 @@ class DependencyReviewTests(unittest.TestCase):
             review_store = DependencyReviewStore()
             proposal = self.proposal("attempt-113")
             attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=self.source_owned_relations(proposal))
-            review_store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(review_store, repository, proposal, binding=self.binding(subset))
             graph_binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             graph_store = DependencyGraphStore()
             result = graph_store.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
@@ -434,7 +492,7 @@ class DependencyReviewTests(unittest.TestCase):
             reviews = DependencyReviewStore()
             proposal = self.proposal("attempt-113")
             attempt = reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=self.source_owned_relations(proposal))
-            reviews.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(reviews, repository, proposal, binding=self.binding(subset))
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             graph = DependencyGraphStore()
             with mock.patch.object(DependencyGraphStore, "_write_version", side_effect=RuntimeError("injected")):
@@ -455,7 +513,7 @@ class DependencyReviewTests(unittest.TestCase):
             graph_binding = DependencyGraphBinding.from_review_binding(binding)
             first = self.proposal("attempt-113")
             reviews.start_attempt(repository, subset, attempt_id="attempt-113", binding=binding, source_owned_relations=self.source_owned_relations(first))
-            reviews.accept_proposal(repository, first, binding=binding)
+            self.accept(reviews, repository, first, binding=binding)
             graph = DependencyGraphStore()
             self.assertEqual(graph.activate(repository, first, binding=graph_binding, graph_version_id="graph-113").decision, GraphDecision.ACCEPTED)
             successor_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", (*subset.members, AffectedMember("member-c", digest("9"), digest("a"))))
@@ -470,7 +528,7 @@ class DependencyReviewTests(unittest.TestCase):
                 ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-b", "member-c", digest("b"), Confidence.HIGH, digest("c"), relations[2].relation_digest),
             ))
             reviews.start_attempt(repository, successor_subset, attempt_id="attempt-114", binding=self.binding(successor_subset), source_owned_relations=relations, supersedes_attempt_id="attempt-113")
-            reviews.accept_proposal(repository, proposal, binding=self.binding(successor_subset))
+            self.accept(reviews, repository, proposal, binding=self.binding(successor_subset))
             result = graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-114")
             self.assertEqual((result.decision, result.reason_code), (GraphDecision.REJECTED, "duplicate-or-conflicting-edge"))
             self.assertEqual(graph.current(repository, binding=graph_binding).graph_version_id, "graph-113")
@@ -484,14 +542,14 @@ class DependencyReviewTests(unittest.TestCase):
             graph_binding = DependencyGraphBinding.from_review_binding(binding)
             semantic_attempt = review_store.start_attempt(repository, subset, attempt_id="attempt-113", binding=binding)
             semantic = self.proposal(semantic_attempt.attempt_id, semantic=True)
-            review_store.accept_proposal(repository, semantic, binding=binding)
+            self.accept(review_store, repository, semantic, binding=binding)
             pending = graph_store.activate(repository, semantic, binding=graph_binding, graph_version_id="graph-113")
             self.assertEqual((pending.decision, pending.graph_version_id), (GraphDecision.PENDING_OWNER, None))
             retry_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", (*subset.members, AffectedMember("member-c", digest("9"), digest("a"))))
             relation = SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
             incomplete = DependencyProposal("proposal-114", "attempt-114", RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), relation.relation_digest),))
             attempt = review_store.start_attempt(repository, retry_subset, attempt_id="attempt-114", binding=self.binding(retry_subset), source_owned_relations=(relation,), supersedes_attempt_id=semantic_attempt.attempt_id)
-            review_store.accept_proposal(repository, incomplete, binding=self.binding(retry_subset))
+            self.accept(review_store, repository, incomplete, binding=self.binding(retry_subset))
             self.assertEqual(graph_store.activate(repository, incomplete, binding=graph_binding, graph_version_id="graph-114").reason_code, "affected-subset-incomplete")
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset = self.setup_review(Path(temporary))
@@ -503,7 +561,7 @@ class DependencyReviewTests(unittest.TestCase):
                 ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), first_relation.relation_digest),
                 ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8"), second_relation.relation_digest),
             ))
-            review_store.accept_proposal(repository, cycle, binding=self.binding(subset))
+            self.accept(review_store, repository, cycle, binding=self.binding(subset))
             graph_binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             result = DependencyGraphStore().activate(repository, cycle, binding=graph_binding, graph_version_id="graph-113")
             self.assertEqual(result.decision, GraphDecision.REJECTED)
@@ -519,7 +577,7 @@ class DependencyReviewTests(unittest.TestCase):
             incomplete = DependencyProposal("proposal-113", "attempt-113", RequestedDisposition.OWNER_REVIEW, "owner-review", (
                 ProposedEdge(EdgeKind.SEMANTIC_INFERRED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),
             ))
-            reviews.accept_proposal(repository, incomplete, binding=binding)
+            self.accept(reviews, repository, incomplete, binding=binding)
             result = DependencyGraphStore().activate(repository, incomplete, binding=DependencyGraphBinding.from_review_binding(binding), graph_version_id="graph-113")
             self.assertEqual((result.decision, result.reason_code), (GraphDecision.REJECTED, "affected-subset-incomplete"))
         with tempfile.TemporaryDirectory() as temporary:
@@ -531,7 +589,7 @@ class DependencyReviewTests(unittest.TestCase):
                 ProposedEdge(EdgeKind.SEMANTIC_INFERRED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),
                 ProposedEdge(EdgeKind.SEMANTIC_INFERRED, EdgeDirection.DEPENDS_ON, "member-b", "member-a", digest("7"), Confidence.HIGH, digest("8")),
             ))
-            reviews.accept_proposal(repository, cyclic, binding=binding)
+            self.accept(reviews, repository, cyclic, binding=binding)
             result = DependencyGraphStore().activate(repository, cyclic, binding=DependencyGraphBinding.from_review_binding(binding), graph_version_id="graph-113")
             self.assertEqual((result.decision, result.reason_code), (GraphDecision.REJECTED, "cycle-detected"))
 
@@ -543,14 +601,14 @@ class DependencyReviewTests(unittest.TestCase):
             graph_binding = DependencyGraphBinding.from_review_binding(review_binding)
             proposal = self.proposal("attempt-113")
             first = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=review_binding, source_owned_relations=self.source_owned_relations(proposal))
-            store.accept_proposal(repository, proposal, binding=review_binding)
+            self.accept(store, repository, proposal, binding=review_binding)
             graph = DependencyGraphStore()
             first_result = graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
             self.assertEqual(first_result.decision, GraphDecision.ACCEPTED)
             successor_subset = AffectedSubset("subset-114", subset.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", subset.members)
             replacement = DependencyProposal("proposal-114", "attempt-114", RequestedDisposition.AUTO_ACTIVATE, "not-required", proposal.edges)
             successor = store.start_attempt(repository, successor_subset, attempt_id="attempt-114", binding=self.binding(successor_subset), source_owned_relations=self.source_owned_relations(replacement), supersedes_attempt_id=first.attempt_id)
-            store.accept_proposal(repository, replacement, binding=self.binding(successor_subset))
+            self.accept(store, repository, replacement, binding=self.binding(successor_subset))
             with self.assertRaisesRegex(DependencyGraphError, "superseded"):
                 graph.activate(repository, proposal, binding=graph_binding, graph_version_id="graph-113")
             result = graph.activate(repository, replacement, binding=graph_binding, graph_version_id="graph-114")
@@ -561,7 +619,7 @@ class DependencyReviewTests(unittest.TestCase):
             store = DependencyReviewStore()
             attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             proposal = self.proposal(attempt.attempt_id)
-            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(store, repository, proposal, binding=self.binding(subset))
             self.assertEqual(DependencyGraphStore().activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(self.binding(subset)), graph_version_id="graph-113").reason_code, "provenance-unavailable")
 
     def test_graph_provenance_and_persisted_decision_tampering_fail_closed(self) -> None:
@@ -570,7 +628,7 @@ class DependencyReviewTests(unittest.TestCase):
             store = DependencyReviewStore()
             attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset))
             proposal = self.proposal(attempt.attempt_id)
-            store.accept_proposal(repository, proposal, binding=self.binding(subset))
+            self.accept(store, repository, proposal, binding=self.binding(subset))
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             self.assertEqual(DependencyGraphStore().activate(repository, proposal, binding=binding, graph_version_id="graph-113").reason_code, "provenance-unavailable")
         with tempfile.TemporaryDirectory() as temporary:
@@ -579,7 +637,7 @@ class DependencyReviewTests(unittest.TestCase):
             relation = SourceOwnedRelation(EdgeKind.POLICY_DERIVED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
             policy = DependencyProposal("proposal-114", "attempt-113", RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.POLICY_DERIVED, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"), relation.relation_digest),))
             attempt = store.start_attempt(repository, subset, attempt_id="attempt-113", binding=self.binding(subset), source_owned_relations=(relation,))
-            store.accept_proposal(repository, policy, binding=self.binding(subset))
+            self.accept(store, repository, policy, binding=self.binding(subset))
             binding = DependencyGraphBinding.from_review_binding(self.binding(subset))
             graph = DependencyGraphStore()
             self.assertEqual(graph.activate(repository, policy, binding=binding, graph_version_id="graph-113").decision, GraphDecision.ACCEPTED)

@@ -923,7 +923,6 @@ class ProductionWorkerFailureLifecycle:
     def record_terminal_failure(self, request: CodexWorkerRequest, result) -> None:
         if (
             result.failure is None or result.session_identity is None
-            or result.turn_identity is None
         ):
             raise WorkerShadowError("production Worker terminal failure is incomplete")
         try:
@@ -955,7 +954,12 @@ class ProductionWorkerFailureLifecycle:
             raise
         except Exception as error:
             raise WorkerShadowError("production Worker terminal failure persistence failed") from error
-        if recovered.state is not AttemptState.AMBIGUOUS:
+        expected_state = (
+            AttemptState.BLOCKED
+            if result.turn_identity is None
+            else AttemptState.AMBIGUOUS
+        )
+        if recovered.state is not expected_state:
             raise WorkerShadowError("production Worker terminal failure recovery is incomplete")
 
 

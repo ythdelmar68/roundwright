@@ -1005,10 +1005,10 @@ class ProviderRecoveryTests(unittest.TestCase):
     def test_cleared_scope_effect_reauthenticates_original_admission_and_session(self) -> None:
         """Evidence removed after clearance cannot authorize a successor debit."""
 
-        for table in ("provider_failure_admissions", "provider_session_checkpoints"):
-            with self.subTest(missing=table), tempfile.TemporaryDirectory() as temporary:
+        for mutation in ("missing-admission", "missing-session", "session-fingerprint"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 repository = self.repository(Path(temporary)); initialize(repository)
-                lease = self.lease(repository); identity = self.identity("clearance-loss-" + table)
+                lease = self.lease(repository); identity = self.identity("clearance-loss-" + mutation)
                 self.admit(repository, identity, lease)
                 candidate = "c" * 40
                 self.seal_candidate(repository, identity, lease, candidate)
@@ -1045,10 +1045,21 @@ class ProviderRecoveryTests(unittest.TestCase):
                 ), "reserved")
                 called.clear()
                 with closing(sqlite3.connect(database_path(repository))) as connection, connection:
-                    connection.execute(
-                        f"DELETE FROM {table} WHERE attempt_id = ?",
-                        (binding.attempt_identity,),
-                    )
+                    if mutation == "missing-admission":
+                        connection.execute(
+                            "DELETE FROM provider_failure_admissions WHERE attempt_id = ?",
+                            (binding.attempt_identity,),
+                        )
+                    elif mutation == "missing-session":
+                        connection.execute(
+                            "DELETE FROM provider_session_checkpoints WHERE attempt_id = ?",
+                            (binding.attempt_identity,),
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE provider_session_checkpoints SET identity_fingerprint = ? WHERE attempt_id = ?",
+                            ("0" * 64, binding.attempt_identity),
+                        )
                 with self.assertRaisesRegex(FailureRecoveryError, "authority|admission"):
                     admit_scope_effect_reservation(
                         repository, identity, binding.authority_scope,

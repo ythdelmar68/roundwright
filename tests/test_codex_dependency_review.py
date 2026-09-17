@@ -38,7 +38,7 @@ from roundwright.provider_health import CodexAdapterError, CodexCapability, Code
 from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect, trusted_provider_launch_context
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, classify, read_durable_failure, record_durable_failure, read_durable_recovery_route_authorization, release_durable_recovery_route_authorization, release_unused_provider_effect_reservation
+from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, classify, read_durable_failure, record_durable_failure, read_durable_recovery_route_authorization, release_durable_recovery_route_authorization, release_unused_provider_effect_reservation, require_scope_open
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
 from tests.role_admission_fixture import independent_execution, sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
@@ -137,6 +137,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
         binding = DependencyReviewBinding(subset.candidate_sha, subset.policy_digest, subset.configuration_digest, digest("7"))
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile, binding.profile_identity)
+        self.bind_current_authority(repository, binding)
         return repository, subset, binding, profile, audit
 
     def task_identity(self) -> TaskIdentity:
@@ -148,10 +149,18 @@ class DependencyReviewServiceTests(unittest.TestCase):
         identity = self.task_identity()
         connection = sqlite3.connect(database_path(repository))
         try:
-            connection.execute(
-                "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
-                (identity.task_id, identity.base_sha, binding.candidate_sha, "authority-116"),
-            )
+            expected = (identity.base_sha, binding.candidate_sha, "authority-116")
+            existing = connection.execute(
+                "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id=?",
+                (identity.task_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                    (identity.task_id, *expected),
+                )
+            elif existing != expected:
+                raise AssertionError("test dependency authority drifted")
             connection.commit()
         finally:
             connection.close()
@@ -294,6 +303,30 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 },
             )
 
+    def test_service_derives_durable_task_identity_and_rejects_missing_authority_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("identity-required"),
+            ))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                connection.execute(
+                    "DELETE FROM runtime_configuration_bindings WHERE task_id=?",
+                    (subset.task_id,),
+                )
+            effect = self.effect_kwargs(
+                repository, subset, binding, adapter, attempt_id="identity-required",
+            )
+            with self.assertRaisesRegex(Exception, "current authority"):
+                DependencyReviewService().run(
+                    repository, subset, attempt_id="identity-required", binding=binding,
+                    adapter=adapter, checkpoint_session=lambda _: None,
+                    checkpoint_turn=lambda *_: None, **effect,
+                )
+            self.assertEqual(backend.sessions, [])
+            self.assertFalse(effect["budget_ledger_path"].exists())
+
     def test_observed_tool_event_is_durable_terminal_and_ineligible(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
@@ -386,6 +419,44 @@ class DependencyReviewServiceTests(unittest.TestCase):
                     )
                 self.assertEqual(snapshot(), before)
                 self.assertEqual(len(backend.sessions), 1)
+
+    def test_pre_session_typed_denial_records_dispatch_bound_stop(self) -> None:
+        """A typed SDK denial before a session exists remains verified and durable."""
+
+        class DeniedBackend:
+            calls = 0
+            def open_fresh_session(self, _profile):
+                self.calls += 1
+                raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = DeniedBackend()
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="pre-session-denial", binding=binding,
+                adapter=adapter, checkpoint_session=lambda _: None,
+                checkpoint_turn=lambda *_: None,
+                **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="pre-session-denial"),
+            )
+            self.assertEqual((result.kind, result.failure, result.turn_identity, backend.calls), (
+                DependencyReviewResultKind.BLOCKED,
+                CodexFailure.SANDBOX_OR_APPROVAL_DENIED, None, 1,
+            ))
+            assert result.session_identity is not None
+            self.assertTrue(result.session_identity.startswith("pre-dispatch-dependency-review-"))
+            identity = self.task_identity()
+            expected = classify(
+                FailureBinding(
+                    binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                    "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                    binding.profile_identity, result.session_identity, "pre-session-denial",
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST,
+            )
+            self.assertEqual(read_durable_failure(repository, identity, expected.digest), expected)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                with self.assertRaisesRegex(FailureRecoveryError, "scope remains stopped"):
+                    require_scope_open(connection, identity.task_id, "dependency-review:" + identity.task_id)
 
     def test_prepared_dependency_retry_denial_is_inert_across_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

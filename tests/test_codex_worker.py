@@ -234,11 +234,12 @@ class CodexWorkerAdapterTests(unittest.TestCase):
     def test_pre_session_failure_has_no_fabricated_turn_identity(self) -> None:
         events: list[str] = []
         result = self.dispatch(self.adapter(FakeBackend(CodexAdapterError(CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE)), events), self.request(), events)
-        self.assertEqual((result.kind, result.session_identity, result.turn_identity), (WorkerResultKind.AMBIGUOUS, None, None))
+        self.assertEqual((result.kind, result.failure, result.turn_identity), (WorkerResultKind.BLOCKED, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, None))
+        self.assertTrue(result.session_identity.startswith("pre-dispatch-worker-"))
         events = []
         backend = FakeBackend(CodexAdapterError(CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE))
         result = self.dispatch(self.adapter(backend, events), self.request(resume="thread-43"), events)
-        self.assertEqual((result.kind, result.failure), (WorkerResultKind.AMBIGUOUS, None))
+        self.assertEqual((result.kind, result.failure, result.turn_identity), (WorkerResultKind.BLOCKED, CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, None))
 
     def test_request_digest_binds_every_immutable_request_field(self) -> None:
         request = self.request()

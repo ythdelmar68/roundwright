@@ -995,6 +995,14 @@ MIGRATIONS = (
         ),
         (("provider_effect_reservation_intents", "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'supervisor'), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), UNIQUE(task_id, reservation_digest))"),),
     ),
+    Migration(
+        82,
+        (
+            "ALTER TABLE provider_effect_reservation_intents ADD COLUMN reservation_repository_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_effect_reservation_intents ADD COLUMN reservation_task_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (("provider_effect_reservation_intents", "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'supervisor'), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), reservation_repository_identity TEXT NOT NULL DEFAULT '', reservation_task_identity TEXT NOT NULL DEFAULT '', UNIQUE(task_id, reservation_digest))"),),
+    ),
 )
 
 

@@ -520,25 +520,24 @@ class DependencyReviewStore:
             connection.execute("BEGIN IMMEDIATE")
             attempt, subset = self._read_attempt(connection, proposal.attempt_id)
             dispatch_claim = connection.execute(
-                "SELECT state FROM dependency_review_dispatch_claims WHERE attempt_id = ?",
+                "SELECT session_identity, turn_identity, state FROM dependency_review_dispatch_claims WHERE attempt_id = ?",
                 (proposal.attempt_id,),
             ).fetchone()
-            if task_identity is not None or dispatch_claim is not None:
-                durable_task = connection.execute(
-                    "SELECT task_id, source_id, repository_id, branch, worktree, base_sha "
-                    "FROM tasks WHERE task_id = ?",
-                    (attempt[0],),
-                ).fetchone()
-                if durable_task is None:
-                    raise DependencyReviewError("dependency review task authority is unavailable")
-                derived_identity = TaskIdentity(*durable_task)
-                if task_identity is not None and task_identity != derived_identity:
-                    raise DependencyReviewError("dependency review task authority has drifted")
-                self._require_current_authority(connection, derived_identity, subset, binding)
-                require_scope_open(
-                    connection, derived_identity.task_id,
-                    "dependency-review:" + derived_identity.task_id,
-                )
+            durable_task = connection.execute(
+                "SELECT task_id, source_id, repository_id, branch, worktree, base_sha "
+                "FROM tasks WHERE task_id = ?",
+                (attempt[0],),
+            ).fetchone()
+            if durable_task is None or dispatch_claim is None or dispatch_claim[2] != "turn-dispatched" or any(type(value) is not str for value in dispatch_claim[:2]):
+                raise DependencyReviewError("dependency review acceptance evidence is unavailable")
+            derived_identity = TaskIdentity(*durable_task)
+            if task_identity is not None and task_identity != derived_identity:
+                raise DependencyReviewError("dependency review task authority has drifted")
+            self._require_current_authority(connection, derived_identity, subset, binding)
+            require_scope_open(
+                connection, derived_identity.task_id,
+                "dependency-review:" + derived_identity.task_id,
+            )
             if attempt[6] not in {"prepared", "accepted"} or (attempt[2], attempt[3]) != (binding.profile_identity, binding.configuration_digest):
                 raise DependencyReviewError("dependency review attempt is not available")
             self._verify_task_lineage(connection, attempt[0])
@@ -774,6 +773,7 @@ class DependencyReviewStore:
                 raise DependencyReviewError("dependency review dispatch claim is already consumed")
             if task_identity is not None:
                 assert binding is not None
+                from .failure_recovery import FailureRole, pre_dispatch_failure_identity
                 admission = (
                     task_identity.task_id, binding.candidate_sha, binding.policy_digest,
                     binding.configuration_digest, "dependency-review:" + task_identity.task_id,
@@ -783,10 +783,16 @@ class DependencyReviewStore:
                     "SELECT task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity FROM dependency_review_failure_admissions WHERE attempt_id = ?",
                     (attempt_id,),
                 ).fetchone()
+                placeholder = pre_dispatch_failure_identity(FailureRole.DEPENDENCY_REVIEW, attempt_id)
                 if existing_admission is None:
                     connection.execute(
                         "INSERT INTO dependency_review_failure_admissions(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (attempt_id, *admission),
+                    )
+                elif tuple(existing_admission) == (*admission[:7], placeholder, attempt_id):
+                    connection.execute(
+                        "UPDATE dependency_review_failure_admissions SET session_identity = ? WHERE attempt_id = ? AND session_identity = ?",
+                        (session_identity, attempt_id, placeholder),
                     )
                 elif tuple(existing_admission) != admission:
                     raise DependencyReviewError("dependency review failure admission has drifted")
@@ -812,6 +818,26 @@ class DependencyReviewStore:
             if row[6] != "prepared" or existing is not None:
                 raise DependencyReviewError("dependency review dispatch claim is unavailable")
             connection.execute("INSERT INTO dependency_review_dispatch_claims(attempt_id, session_identity, turn_identity, state) VALUES (?, NULL, NULL, 'pre-dispatch')", (attempt_id,))
+            if task_identity is not None:
+                assert binding is not None
+                from .failure_recovery import FailureRole, pre_dispatch_failure_identity
+                session_identity = pre_dispatch_failure_identity(FailureRole.DEPENDENCY_REVIEW, attempt_id)
+                admission = (
+                    task_identity.task_id, binding.candidate_sha, binding.policy_digest,
+                    binding.configuration_digest, "dependency-review:" + task_identity.task_id,
+                    "dependency-review", binding.profile_identity, session_identity, attempt_id,
+                )
+                existing_admission = connection.execute(
+                    "SELECT task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity FROM dependency_review_failure_admissions WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if existing_admission is None:
+                    connection.execute(
+                        "INSERT INTO dependency_review_failure_admissions(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (attempt_id, *admission),
+                    )
+                elif tuple(existing_admission) != admission:
+                    raise DependencyReviewError("dependency review failure admission has drifted")
             connection.commit()
         except Exception:
             connection.rollback()

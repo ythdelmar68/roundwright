@@ -19,7 +19,7 @@ from .configuration import RepositoryIdentity
 from .git_identity import TransitionLease, _require_current_lease
 from .runtime_binding import RuntimeBinding
 from .state import StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_runtime_binding, require_runtime_binding
-from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, classify_native_failure, record_durable_failure, require_scope_open
+from .failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, classify_native_failure, pre_dispatch_failure_identity, record_durable_failure, require_scope_open
 
 
 class ProviderRecoveryError(StateError):
@@ -623,6 +623,11 @@ def claim_supervisor_dispatch(
             "INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)",
             (attempt_id, identity.task_id, row.input_fingerprint, observed),
         )
+        _persist_failure_admission(
+            connection, identity, row, context,
+            pre_dispatch_failure_identity(FailureRole.SUPERVISOR, attempt_id),
+            create=True,
+        )
         connection.commit()
     except sqlite3.IntegrityError as error:
         connection.rollback()
@@ -670,6 +675,11 @@ def claim_worker_dispatch(
         connection.execute(
             "INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)",
             (attempt_id, identity.task_id, row.input_fingerprint, observed),
+        )
+        _persist_failure_admission(
+            connection, identity, row, context,
+            pre_dispatch_failure_identity(FailureRole.WORKER, attempt_id),
+            create=True,
         )
         connection.commit()
     except sqlite3.IntegrityError as error:
@@ -1704,6 +1714,14 @@ def _persist_failure_admission(connection, identity: TaskIdentity, row: Provider
             "INSERT INTO provider_failure_admissions(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, provider_role, profile_identity, session_identity, attempt_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (row.attempt_id, *expected),
         )
+    elif create and existing == (
+        *expected[:7], pre_dispatch_failure_identity(failure_role, row.attempt_id), row.attempt_id,
+    ):
+        if connection.execute(
+            "UPDATE provider_failure_admissions SET session_identity = ? WHERE attempt_id = ? AND session_identity = ?",
+            (session_identity, row.attempt_id, pre_dispatch_failure_identity(failure_role, row.attempt_id)),
+        ).rowcount != 1:
+            raise ProviderRecoveryError("failure recovery admission has drifted")
     elif existing != expected:
         raise ProviderRecoveryError("failure recovery admission has drifted")
 

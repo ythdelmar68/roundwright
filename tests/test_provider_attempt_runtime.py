@@ -848,6 +848,58 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     "SELECT sum(calls), sum(duration_seconds), sum(tokens) FROM role_budget_usage"
                 ).fetchone(), (1, 60, 4000))
 
+    def test_unused_correction_refund_rejects_foreign_reservation_owner(self) -> None:
+        """A product intent cannot refund a debit rebound to another repository."""
+
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, _recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            selection = replace(
+                runner.selection, diff_review_attempt_id="foreign-refund-review",
+                provider_attempt_id="foreign-refund-provider", message_identity="foreign-refund-message",
+                process_lease_id="foreign-refund-lease", physical_format_output_ordinal=1,
+            )
+            correction = replace(runner, sequence=(first, self.sequence_entry(
+                runner, selection=selection,
+                backend=Backend("foreign-refund-correction", NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                ), []),
+            )))
+            original = provider_attempt_runtime.prepare_attempt
+
+            def reject_after_owner_substitution(*args, **kwargs):
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    with closing(sqlite3.connect(database_path(repository))) as connection:
+                        connection.execute(
+                            "UPDATE provider_effect_reservation_intents "
+                            "SET reservation_repository_identity=? WHERE attempt_id=?",
+                            (digest("foreign-repository"), selection.provider_attempt_id),
+                        )
+                        connection.commit()
+                    raise ProviderRecoveryError("injected preparation rejection")
+                return original(*args, **kwargs)
+
+            with patch.object(
+                provider_attempt_runtime, "prepare_attempt",
+                side_effect=reject_after_owner_substitution,
+            ), self.assertRaisesRegex(
+                ProviderAttemptRuntimeError, "unused provider reservation recovery failed",
+            ):
+                correction.execute()
+            with closing(sqlite3.connect(correction.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT sum(calls), sum(duration_seconds), sum(tokens) FROM role_budget_usage"
+                ).fetchone(), (2, 120, 8000))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT reservation_repository_identity FROM provider_effect_reservation_intents "
+                    "WHERE attempt_id=?", (selection.provider_attempt_id,),
+                ).fetchone(), (digest("foreign-repository"),))
+
     def test_stopped_scope_rejects_correction_before_any_state_or_budget_change(self) -> None:
         """A denied correction is inert across product and budget ledgers."""
 

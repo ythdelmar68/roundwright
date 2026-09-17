@@ -347,3 +347,21 @@ The five new semantic tests are appended to the independently ordered Issue
 #132 inventory; the extended clearance test retains its earlier position and
 both claim-writer races are required for E1R17-04. Windows declares no E1R17
 skip, and render/verify requires the exact candidate-bound execution receipt.
+
+## E1R18 denial-boundary and historical-evidence closure
+
+E1R18 closes the six final denial and evidence-consumption boundaries while
+preserving public-safe failure classification and fail-closed replay.
+
+| Finding | Durable invariant and semantic evidence |
+| --- | --- |
+| E1R18-01 | Supervisor scope admission at calls 4 and 6 propagates a typed denial through the session and turn checkpoint wrappers. The expanded `test_scope_denial_before_session_or_turn_is_durable_without_invented_turn` proves those denials remain durable scope stops instead of checkpoint errors. |
+| E1R18-02 | An authenticated native SDK sandbox or approval denial before a session or turn checkpoint is classified before generic checkpoint requirements. `test_native_security_denial_before_session_or_turn_is_durable` proves the attempt becomes durably blocked using the authentic session or pre-dispatch surrogate without inventing a turn. |
+| E1R18-03 | Accepted dependency evidence binds the exact dispatched session, turn, and output digest. The expanded `test_all_dependency_consumers_share_exact_dispatch_authentication` proves acceptance replay, terminal read-back, graph activation, and current-graph replay all reject a syntactically valid substituted turn. |
+| E1R18-04 | Dependency-graph activation rechecks the stopped scope in the same writer transaction immediately before mutation. `test_graph_activation_rechecks_scope_immediately_before_mutation` proves a concurrent durable denial leaves graph state unchanged. |
+| E1R18-05 | Storage or reconciliation failure during admission remains an unavailable-admission error and can never become verified host-denial evidence. `test_scope_storage_failure_never_becomes_verified_host_denial` proves a locked second admission check leaves the attempt prepared with no failure or recovery record. |
+| E1R18-06 | Schema-67 dependency evidence migrates only from exact durable dispatch history, preserving the original admission and accepted-result identity. `test_schema67_dependency_evidence_migrates_with_original_dispatch` proves accepted review, terminal snapshot, activation replay, and current-graph read-back remain valid after migration. |
+
+The four new E1R18 tests are appended to the ordered semantic inventory; the
+two extended tests retain their E1R17 positions. Windows declares no E1R18
+skip, and render/verify requires their exact candidate-bound execution receipt.

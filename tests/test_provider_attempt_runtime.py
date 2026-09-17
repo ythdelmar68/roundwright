@@ -36,7 +36,7 @@ from roundwright.provider_attempt_runtime import (
     install_host_runtime, provider_attempt_effect_material,
 )
 import roundwright.provider_attempt_runtime as provider_attempt_runtime
-from roundwright.provider_health import CodexFailure
+from roundwright.provider_health import CodexAdapterError, CodexFailure
 from roundwright.role_capability_policy import AdvisoryRole, DurableRoleBudgetLedger, RoleBudget, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.provider_recovery import (
     AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, SupervisorAccountingSnapshot,
@@ -461,11 +461,13 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
     def test_scope_denial_before_session_or_turn_is_durable_without_invented_turn(self) -> None:
         """Each pre-turn scope stop closes the claim with only authentic identity."""
 
-        from roundwright.failure_recovery import FailureRecoveryError, FailureRole, require_scope_open
+        from roundwright.failure_recovery import FailureRecoveryError, FailureRole, ScopeAdmissionDenied, require_scope_open
 
         for stage, denied_call, expected_session in (
             ("before-session", 2, None),
+            ("before-session-checkpoint", 4, None),
             ("before-turn", 5, "session-runtime-before-turn"),
+            ("before-turn-checkpoint", 6, "session-runtime-before-turn-checkpoint"),
         ):
             with self.subTest(stage=stage), TemporaryDirectory() as temporary:
                 runner, backend, repository, identity, recovery, _seal = self.durable_runner(
@@ -483,7 +485,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     nonlocal calls
                     calls += 1
                     if calls == denied_call:
-                        raise FailureRecoveryError("injected authoritative scope stop")
+                        raise ScopeAdmissionDenied("injected authoritative scope stop")
                     return original(*args, **kwargs)
 
                 with patch.object(
@@ -521,6 +523,126 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ProviderAttemptRuntimeError, "scope is stopped"):
                     runner.execute()
                 self.assertEqual(backend.calls, calls_before_restart)
+
+    def test_scope_storage_failure_never_becomes_verified_host_denial(self) -> None:
+        """A locked scope ledger remains a storage failure with zero provider calls."""
+
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED,
+                    {"verdict": "pass", "findings": []},
+                ),
+                suffix="scope-storage",
+            )
+            original = provider_attempt_runtime.require_scope_effect_admission
+            calls = 0
+
+            def fail_second(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise sqlite3.OperationalError("database is locked")
+                return original(*args, **kwargs)
+
+            with patch.object(
+                provider_attempt_runtime, "require_scope_effect_admission",
+                side_effect=fail_second,
+            ), self.assertRaisesRegex(
+                ProviderAttemptRuntimeError, "scope reconciliation is unavailable",
+            ):
+                runner.execute()
+            self.assertEqual(backend.calls, 0)
+            stored = read_attempt(
+                repository, identity, runner.selection.provider_attempt_id,
+                context=recovery,
+            )
+            self.assertEqual(stored.state, AttemptState.PREPARED)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM failure_recovery_records WHERE task_id=?",
+                    (identity.task_id,),
+                ).fetchone(), (0,))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM provider_recovery_outcomes WHERE attempt_id=?",
+                    (runner.selection.provider_attempt_id,),
+                ).fetchone(), (0,))
+
+    def test_native_security_denial_before_session_or_turn_is_durable(self) -> None:
+        """Authenticated SDK denial outranks generic missing-checkpoint recovery."""
+
+        from roundwright.failure_recovery import FailureRole
+
+        for stage in ("open-session", "start-turn"):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED,
+                        {"verdict": "pass", "findings": []},
+                    ),
+                    suffix="native-" + stage,
+                )
+
+                class DeniedSession:
+                    def identity(self) -> str:
+                        return "session-native-start-turn"
+                    def close(self) -> None:
+                        return None
+                    def start_turn(self, _request: object) -> object:
+                        raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
+
+                class DeniedBackend:
+                    def __init__(self) -> None:
+                        self.calls = 0
+                    def open_fresh_session(self, _profile: object) -> object:
+                        self.calls += 1
+                        if stage == "open-session":
+                            raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
+                        return DeniedSession()
+
+                backend = DeniedBackend()
+                denied = replace(
+                    runner, backend=backend,
+                    sequence=(self.sequence_entry(runner, backend=backend),),
+                )
+                with self.assertRaisesRegex(
+                    ProviderAttemptRuntimeError, "native security denial",
+                ):
+                    denied.execute()
+                stored = read_attempt(
+                    repository, identity, runner.selection.provider_attempt_id,
+                    context=recovery,
+                )
+                expected_session = (
+                    None if stage == "open-session" else "session-native-start-turn"
+                )
+                self.assertEqual(
+                    (stored.state, stored.session_identity, stored.external_turn_identity),
+                    (AttemptState.BLOCKED, expected_session, None),
+                )
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    payload = json.loads(connection.execute(
+                        "SELECT record_json FROM failure_recovery_records WHERE task_id=?",
+                        (identity.task_id,),
+                    ).fetchone()[0])
+                    self.assertEqual(
+                        (payload["failure"], payload["evidence"], payload["action"]),
+                        ("host-security-denial", "verified-host", "stop-scope"),
+                    )
+                    self.assertEqual(
+                        payload["binding"]["session_identity"],
+                        expected_session or provider_attempt_runtime.pre_dispatch_failure_identity(
+                            FailureRole.SUPERVISOR,
+                            runner.selection.provider_attempt_id,
+                        ),
+                    )
+                    self.assertEqual(connection.execute(
+                        "SELECT recovery_action, blocker FROM provider_recovery_outcomes "
+                        "WHERE attempt_id=?", (runner.selection.provider_attempt_id,),
+                    ).fetchone(), ("blocked-ambiguous-turn", "scope-stopped"))
+                self.assertEqual(backend.calls, 1)
 
     def test_readiness_and_execution_share_complete_accepted_state_validation(self) -> None:
         """Claims, coordinates, and formal acceptance are all mandatory."""

@@ -18,7 +18,7 @@ from typing import Callable, Mapping, Protocol
 from .configuration import ProviderProfile, ReviewMode
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
 from .provider_recovery import SupervisorAccountingSnapshot, SupervisorDispatchClaimState
-from .failure_recovery import EvidenceSource, FailureClass, FailureRole, native_failure_class, pre_dispatch_failure_identity
+from .failure_recovery import EvidenceSource, FailureClass, FailureRole, ScopeAdmissionDenied, native_failure_class, pre_dispatch_failure_identity
 from pathlib import Path
 
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, TrustedRoleEffectReservation, recover_role_effect_reservation, recovery_reservation_digest, reserve_role_effect
@@ -30,6 +30,10 @@ class CodexSupervisorError(ValueError):
 
 class _SupervisorScopeDenied(CodexSupervisorError):
     """Internal typed stop from the durable product-scope fence."""
+
+
+class CodexSupervisorScopeAdmissionError(CodexSupervisorError):
+    """The durable scope fence could not be reconciled with storage."""
 
 
 class SupervisorCheckpointStage(StrEnum):
@@ -336,8 +340,12 @@ class CodexSupervisorAdapter:
                 if scope_admission is not None:
                     try:
                         scope_admission()
-                    except Exception as error:
+                    except ScopeAdmissionDenied as error:
                         raise _SupervisorScopeDenied("Supervisor durable scope admission is denied") from error
+                    except Exception as error:
+                        raise CodexSupervisorScopeAdmissionError(
+                            "Supervisor durable scope admission is unavailable"
+                        ) from error
                 return receipt
 
             admit()
@@ -362,6 +370,10 @@ class CodexSupervisorAdapter:
             try:
                 admit()
                 checkpoint_session(session_identity)
+            except _SupervisorScopeDenied:
+                raise
+            except CodexSupervisorScopeAdmissionError:
+                raise
             except Exception:
                 raise CodexSupervisorCheckpointError(
                     SupervisorCheckpointStage.SESSION, session_present=True, turn_present=False,
@@ -372,6 +384,10 @@ class CodexSupervisorAdapter:
             try:
                 admit()
                 checkpoint_turn(session_identity, turn_identity)
+            except _SupervisorScopeDenied:
+                raise
+            except CodexSupervisorScopeAdmissionError:
+                raise
             except Exception:
                 raise CodexSupervisorCheckpointError(
                     SupervisorCheckpointStage.TURN, session_present=True, turn_present=True,

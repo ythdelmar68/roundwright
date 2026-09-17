@@ -29,6 +29,7 @@ from .dependency_review import (
     RequestedDisposition,
     SourceOwnedRelation,
 )
+from .failure_recovery import require_scope_open
 from .state import _open_writable_connection, database_path
 
 
@@ -388,7 +389,7 @@ class DependencyGraphStore:
                 raise DependencyGraphError("dependency proposal is not durably accepted")
             binding.require_subset(subset)
             try:
-                DependencyReviewStore._require_authenticated_dispatch(
+                derived_identity = DependencyReviewStore._require_authenticated_dispatch(
                     connection, proposal.attempt_id, attempt, subset,
                     DependencyReviewBinding(
                         binding.candidate_sha, binding.policy_digest,
@@ -425,6 +426,10 @@ class DependencyGraphStore:
                 return GraphActivation(proposal.proposal_id, decision, reason_code, decision_digest, version)
             provenance = self._trusted_provenance(connection, subset, binding, proposal.attempt_id)
             validation = DependencyGraphValidator.validate(proposal, subset, binding, active, provenance)
+            require_scope_open(
+                connection, derived_identity.task_id,
+                "dependency-review:" + derived_identity.task_id,
+            )
             version: str | None = None
             predecessor: str | None = None
             graph_digest: str | None = None

@@ -89,6 +89,10 @@ TESTS = (
     "tests.test_dependency_review.DependencyReviewTests.test_all_dependency_consumers_share_exact_dispatch_authentication",
     "tests.test_dependency_review.DependencyReviewTests.test_pre_dispatch_claim_rechecks_scope_in_its_writer_transaction",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_claim_rechecks_scope_inside_the_claim_transaction",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_native_security_denial_before_session_or_turn_is_durable",
+    "tests.test_dependency_review.DependencyReviewTests.test_graph_activation_rechecks_scope_immediately_before_mutation",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_scope_storage_failure_never_becomes_verified_host_denial",
+    "tests.test_dependency_review.DependencyReviewTests.test_schema67_dependency_evidence_migrates_with_original_dispatch",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

@@ -24,14 +24,15 @@ from .candidate_review import (
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
-    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorDiagnostic, SupervisorOutcomeSource, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
+    CodexSupervisorScopeAdmissionError,
+    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorDiagnostic, SupervisorOutcomeSource, SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory, SupervisorVerdict,
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
 from .failure_recovery import (
-    EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError,
+    EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, ScopeAdmissionDenied,
     RecoveryAction as FailureRecoveryAction, classify,
     abandon_durable_recovery_route_reservation,
     begin_durable_recovery_route_reservation,
@@ -1068,12 +1069,19 @@ class DurableDiffReviewRunner:
                 require_scope_effect_admission(
                     self.repository, self.identity, "supervisor:" + self.identity.task_id,
                 )
+            except ScopeAdmissionDenied:
+                raise
             except Exception as error:
-                raise ProviderAttemptRuntimeError("provider attempt dispatch scope is stopped") from error
+                raise ProviderAttemptRuntimeError("provider attempt scope reconciliation is unavailable") from error
 
         # A stopped correction is rejected before preflight can materialize an
         # attempt and before the separate budget ledger can record a debit.
-        require_effect_scope()
+        try:
+            require_effect_scope()
+        except ScopeAdmissionDenied as error:
+            raise ProviderAttemptRuntimeError(
+                "provider attempt dispatch scope is stopped"
+            ) from error
         existing_prepared = False
         try:
             existing = read_attempt(
@@ -1450,6 +1458,10 @@ class DurableDiffReviewRunner:
                 session_present=error.session_present,
                 turn_present=error.turn_present,
             ) from None
+        except CodexSupervisorScopeAdmissionError:
+            raise ProviderAttemptRuntimeError(
+                "provider attempt scope reconciliation is unavailable"
+            ) from None
         if (
             result.kind is SupervisorResultKind.BLOCKED
             and result.outcome_source is SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED
@@ -1467,6 +1479,25 @@ class DurableDiffReviewRunner:
                 lease=self.lease, now=self.dispatch_control.now,
             )
             raise ProviderAttemptRuntimeError("provider attempt dispatch scope is stopped")
+        if (
+            result.kind is SupervisorResultKind.BLOCKED
+            and result.outcome_source is SupervisorOutcomeSource.SDK_TURN_FAILED
+            and result.failure is CodexFailure.SANDBOX_OR_APPROVAL_DENIED
+            and result.sdk_error_category is SupervisorSdkTurnErrorCategory.SANDBOX
+        ):
+            durable_session = (
+                result.session_identity if session_checkpointed
+                else pre_dispatch_failure_identity(
+                    FailureRole.SUPERVISOR, selection.provider_attempt_id,
+                )
+            )
+            record_supervisor_scope_denial(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                session_identity=durable_session,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            raise ProviderAttemptRuntimeError("provider attempt native security denial stopped its scope")
         if not session_checkpointed:
             raise ProviderAttemptRuntimeError("native Supervisor did not provide a durable session checkpoint")
         if not turn_checkpointed:

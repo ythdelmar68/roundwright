@@ -27,6 +27,10 @@ class FailureRecoveryError(ValueError):
     """A failure decision or its clearance is malformed or unsafe."""
 
 
+class ScopeAdmissionDenied(FailureRecoveryError):
+    """An authenticated durable STOP_SCOPE decision denied one effect."""
+
+
 class FailureRole(StrEnum):
     WORKER = "worker"
     SUPERVISOR = "supervisor"
@@ -1503,7 +1507,7 @@ def require_scope_open(connection, task_id: str, scope: str) -> None:
         _require_attempt_admission(connection, TaskIdentity(*task), record.binding)
         history = _decision_history(connection, task_id, digest, record.binding)
         if not history or history[-1][1]["kind"] != "clear":
-            raise FailureRecoveryError("failure scope remains stopped")
+            raise ScopeAdmissionDenied("failure scope remains stopped")
 
 
 def require_scope_effect_admission(repository, identity, scope: str) -> None:

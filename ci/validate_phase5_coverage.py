@@ -660,6 +660,10 @@ SEMANTIC_TESTS = (
     "tests.test_dependency_review.DependencyReviewTests.test_all_dependency_consumers_share_exact_dispatch_authentication",
     "tests.test_dependency_review.DependencyReviewTests.test_pre_dispatch_claim_rechecks_scope_in_its_writer_transaction",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_supervisor_claim_rechecks_scope_inside_the_claim_transaction",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_native_security_denial_before_session_or_turn_is_durable",
+    "tests.test_dependency_review.DependencyReviewTests.test_graph_activation_rechecks_scope_immediately_before_mutation",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_scope_storage_failure_never_becomes_verified_host_denial",
+    "tests.test_dependency_review.DependencyReviewTests.test_schema67_dependency_evidence_migrates_with_original_dispatch",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 ISSUE_132_FINDING_REQUIREMENTS = {
@@ -805,6 +809,22 @@ ISSUE_132_E1R17_FINDING_REQUIREMENTS = {
     "E1R17-04": ("src/roundwright/provider_recovery.py", ISSUE_132_E1R17_TESTS[4]),
     "E1R17-05": ("src/roundwright/failure_recovery.py", ISSUE_132_E1R17_TESTS[5]),
 }
+ISSUE_132_E1R18_TESTS = (
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_scope_denial_before_session_or_turn_is_durable_without_invented_turn",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_native_security_denial_before_session_or_turn_is_durable",
+    "tests.test_dependency_review.DependencyReviewTests.test_all_dependency_consumers_share_exact_dispatch_authentication",
+    "tests.test_dependency_review.DependencyReviewTests.test_graph_activation_rechecks_scope_immediately_before_mutation",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_scope_storage_failure_never_becomes_verified_host_denial",
+    "tests.test_dependency_review.DependencyReviewTests.test_schema67_dependency_evidence_migrates_with_original_dispatch",
+)
+ISSUE_132_E1R18_FINDING_REQUIREMENTS = {
+    "E1R18-01": ("src/roundwright/codex_supervisor.py", ISSUE_132_E1R18_TESTS[0]),
+    "E1R18-02": ("src/roundwright/provider_attempt_runtime.py", ISSUE_132_E1R18_TESTS[1]),
+    "E1R18-03": ("src/roundwright/dependency_review.py", ISSUE_132_E1R18_TESTS[2]),
+    "E1R18-04": ("src/roundwright/dependency_graph.py", ISSUE_132_E1R18_TESTS[3]),
+    "E1R18-05": ("src/roundwright/provider_attempt_runtime.py", ISSUE_132_E1R18_TESTS[4]),
+    "E1R18-06": ("src/roundwright/state.py", ISSUE_132_E1R18_TESTS[5]),
+}
 ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + tuple(ISSUE_132_AFFECTED_MODULE_TESTS.values()) + (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
@@ -826,7 +846,7 @@ ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUI
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_prepared_format_correction_reuses_exact_reservation_after_crash",
     "tests.test_codex_supervisor.SupervisorTests.test_one_logical_profile_allows_bounded_physical_corrections_and_replay",
     "tests.test_codex_supervisor.SupervisorTests.test_generic_sequence_rejects_profile_jump_before_correction_coordinates",
-) + ISSUE_132_E1R11_TESTS + ISSUE_132_E1R12_TESTS[1:3] + ISSUE_132_E1R13_TESTS + ISSUE_132_E1R14_TESTS[:3] + ISSUE_132_E1R14_TESTS[5:7] + ISSUE_132_E1R14_TESTS[8:] + ISSUE_132_E1R15_TESTS + ISSUE_132_E1R16_TESTS[:6] + ISSUE_132_E1R17_TESTS[:5]
+) + ISSUE_132_E1R11_TESTS + ISSUE_132_E1R12_TESTS[1:3] + ISSUE_132_E1R13_TESTS + ISSUE_132_E1R14_TESTS[:3] + ISSUE_132_E1R14_TESTS[5:7] + ISSUE_132_E1R14_TESTS[8:] + ISSUE_132_E1R15_TESTS + ISSUE_132_E1R16_TESTS[:6] + ISSUE_132_E1R17_TESTS[:5] + ISSUE_132_E1R18_TESTS[1:2] + ISSUE_132_E1R18_TESTS[3:]
 def _validate_issue_132_semantic_tests() -> None:
     """Keep the independently maintained E1R2/E1R3 inventory closed and ordered."""
     if len(ISSUE_132_FINDING_REQUIREMENTS) != 8 or len(set(ISSUE_132_FINDING_REQUIREMENTS)) != 8:
@@ -889,6 +909,12 @@ def _validate_issue_132_semantic_tests() -> None:
         or any(not (ROOT / path).is_file() for path, _test in ISSUE_132_E1R17_FINDING_REQUIREMENTS.values())
         or any(test not in ISSUE_132_SEMANTIC_TESTS for test in ISSUE_132_E1R17_TESTS)):
         raise CoverageError("Issue 132 E1R17 finding mapping is incomplete")
+    if (set(ISSUE_132_E1R18_FINDING_REQUIREMENTS) != {
+            "E1R18-01", "E1R18-02", "E1R18-03", "E1R18-04", "E1R18-05", "E1R18-06"
+        } or len(ISSUE_132_E1R18_TESTS) != 6
+        or any(not (ROOT / path).is_file() for path, _test in ISSUE_132_E1R18_FINDING_REQUIREMENTS.values())
+        or any(test not in ISSUE_132_SEMANTIC_TESTS for test in ISSUE_132_E1R18_TESTS)):
+        raise CoverageError("Issue 132 E1R18 finding mapping is incomplete")
     if tuple(test for test in SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
         raise CoverageError("Issue 132 semantic test inventory is omitted, reordered, or drifted")
 

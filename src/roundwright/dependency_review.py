@@ -545,6 +545,9 @@ class DependencyReviewStore:
             if attempt[6] == "accepted":
                 if existing is None or stored is None or tuple(existing) != expected or tuple(stored) != outcome:
                     raise DependencyReviewError("dependency proposal outcome has drifted")
+                self._require_accepted_result_dispatch(
+                    connection, proposal.attempt_id, proposal.proposal_digest,
+                )
                 self._verify_proposal_edges(connection, proposal)
                 if connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone() != ("accepted",):
                     raise DependencyReviewError("dependency proposal acceptance has drifted")
@@ -560,6 +563,9 @@ class DependencyReviewStore:
                 raise DependencyReviewError("dependency proposal has drifted")
             self._verify_proposal_edges(connection, proposal)
             connection.execute("INSERT INTO dependency_review_validation_outcomes(attempt_id, outcome, reason_code, output_digest, owner_route) VALUES (?, ?, ?, ?, ?)", (proposal.attempt_id, *outcome))
+            self._bind_accepted_result_dispatch(
+                connection, proposal.attempt_id, proposal.proposal_digest,
+            )
             connection.execute("UPDATE dependency_review_attempts SET state = 'accepted' WHERE attempt_id = ?", (proposal.attempt_id,))
             if connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = ?", (proposal.attempt_id,)).fetchone() != ("accepted",):
                 raise DependencyReviewError("dependency proposal acceptance has drifted")
@@ -958,7 +964,76 @@ class DependencyReviewStore:
         )
         if not valid_claim or admission != expected_admission:
             raise DependencyReviewError(unavailable)
+        if attempt[6] == "accepted":
+            outcome = connection.execute(
+                "SELECT outcome, output_digest FROM dependency_review_validation_outcomes "
+                "WHERE attempt_id = ?", (attempt_id,),
+            ).fetchone()
+            if outcome is None or outcome[0] != "accepted":
+                raise DependencyReviewError(unavailable)
+            try:
+                DependencyReviewStore._require_accepted_result_dispatch(
+                    connection, attempt_id, outcome[1],
+                )
+            except DependencyReviewError:
+                raise DependencyReviewError(unavailable) from None
         return derived_identity
+
+    @staticmethod
+    def _bind_accepted_result_dispatch(
+        connection: object, attempt_id: str, output_digest: str,
+    ) -> None:
+        """Seal the exact native turn that produced one accepted result."""
+
+        claim = connection.execute(
+            "SELECT session_identity, turn_identity, state "
+            "FROM dependency_review_dispatch_claims WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if (
+            claim is None or claim[2] != "turn-dispatched"
+            or not _opaque_identity(claim[0]) or not _opaque_identity(claim[1])
+            or not _digest(output_digest)
+        ):
+            raise DependencyReviewError("dependency review accepted result dispatch is unavailable")
+        expected = (claim[0], claim[1], output_digest)
+        existing = connection.execute(
+            "SELECT session_identity, turn_identity, output_digest "
+            "FROM dependency_review_accepted_result_dispatches WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO dependency_review_accepted_result_dispatches"
+                "(attempt_id, session_identity, turn_identity, output_digest) VALUES (?, ?, ?, ?)",
+                (attempt_id, *expected),
+            )
+        elif existing != expected:
+            raise DependencyReviewError("dependency review accepted result dispatch has drifted")
+
+    @staticmethod
+    def _require_accepted_result_dispatch(
+        connection: object, attempt_id: str, output_digest: str,
+    ) -> None:
+        """Reconcile retained accepted evidence with its original turn."""
+
+        claim = connection.execute(
+            "SELECT session_identity, turn_identity, state "
+            "FROM dependency_review_dispatch_claims WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        retained = connection.execute(
+            "SELECT session_identity, turn_identity, output_digest "
+            "FROM dependency_review_accepted_result_dispatches WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if (
+            claim is None or claim[2] != "turn-dispatched"
+            or retained != (claim[0], claim[1], output_digest)
+            or not _opaque_identity(claim[0]) or not _opaque_identity(claim[1])
+            or not _digest(output_digest)
+        ):
+            raise DependencyReviewError("dependency review accepted result dispatch has drifted")
 
     def claim_turn(self, repository: RepositoryIdentity, *, attempt_id: str, session_identity: str, turn_identity: str) -> None:
         if not _token(attempt_id) or not _opaque_identity(session_identity) or not _opaque_identity(turn_identity):

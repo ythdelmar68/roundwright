@@ -24,7 +24,7 @@ from roundwright.dependency_graph import (
     GraphDecision,
 )
 from roundwright.git_identity import acquire_transition_lease
-from roundwright.failure_recovery import FailureRecoveryError
+from roundwright.failure_recovery import FailureRecoveryError, ScopeAdmissionDenied
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
 
@@ -189,6 +189,7 @@ class DependencyReviewTests(unittest.TestCase):
             "missing-claim": "DELETE FROM dependency_review_dispatch_claims WHERE attempt_id=?",
             "invalid-session": "UPDATE dependency_review_dispatch_claims SET session_identity='bad session' WHERE attempt_id=?",
             "invalid-turn": "UPDATE dependency_review_dispatch_claims SET turn_identity='bad turn' WHERE attempt_id=?",
+            "substituted-valid-turn": "UPDATE dependency_review_dispatch_claims SET turn_identity='other-valid-turn' WHERE attempt_id=?",
             "admission-session": "UPDATE dependency_review_failure_admissions SET session_identity='other-session' WHERE attempt_id=?",
             "admission-profile": "UPDATE dependency_review_failure_admissions SET profile_identity='sha256:" + "0" * 64 + "' WHERE attempt_id=?",
         }
@@ -224,6 +225,119 @@ class DependencyReviewTests(unittest.TestCase):
                     )
                 with self.assertRaisesRegex(DependencyGraphError, "current dependency graph"):
                     graph.current(repository, binding=graph_binding)
+
+    def test_graph_activation_rechecks_scope_immediately_before_mutation(self) -> None:
+        """A same-scope durable denial leaves every graph table unchanged."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            proposal = self.proposal("graph-scope-stop")
+            store.start_attempt(
+                repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                source_owned_relations=self.source_owned_relations(proposal),
+            )
+            self.accept(store, repository, proposal, binding=binding)
+            graph = DependencyGraphStore()
+            with mock.patch(
+                "roundwright.dependency_graph.require_scope_open",
+                side_effect=ScopeAdmissionDenied("injected graph scope stop"),
+            ), self.assertRaisesRegex(DependencyGraphError, "activation is unavailable"):
+                graph.activate(
+                    repository, proposal,
+                    binding=DependencyGraphBinding.from_review_binding(binding),
+                    graph_version_id="graph-scope-stop",
+                )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                for table in (
+                    "dependency_graph_versions", "dependency_graph_members",
+                    "dependency_graph_edges", "dependency_graph_current",
+                    "dependency_graph_decisions",
+                ):
+                    self.assertEqual(
+                        connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone(),
+                        (0,),
+                    )
+
+    def test_schema67_dependency_evidence_migrates_with_original_dispatch(self) -> None:
+        """Accepted evidence and its active graph survive the exact v67 upgrade."""
+
+        from roundwright.state import MIGRATIONS, _apply_migrations
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            graph_binding = DependencyGraphBinding.from_review_binding(binding)
+            proposal = self.proposal("migration-dispatch")
+            store.start_attempt(
+                repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                source_owned_relations=self.source_owned_relations(proposal),
+            )
+            self.accept(store, repository, proposal, binding=binding)
+            graph = DependencyGraphStore()
+            graph.activate(
+                repository, proposal, binding=graph_binding,
+                graph_version_id="graph-migration-dispatch",
+            )
+            path = database_path(repository)
+            legacy_path = path.with_name("dependency-schema-67.sqlite")
+            with closing(sqlite3.connect(legacy_path)) as connection, connection:
+                _apply_migrations(connection, MIGRATIONS[:67])
+                connection.execute("ATTACH DATABASE ? AS current", (str(path),))
+                tables = [row[0] for row in connection.execute(
+                    "SELECT name FROM main.sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )]
+                for table in tables:
+                    if table == "schema_migrations":
+                        continue
+                    columns = [row[1] for row in connection.execute(
+                        f'PRAGMA main.table_info("{table}")'
+                    )]
+                    names = ",".join('"' + name + '"' for name in columns)
+                    connection.execute(f'DELETE FROM main."{table}"')
+                    connection.execute(
+                        f'INSERT INTO main."{table}" ({names}) '
+                        f'SELECT {names} FROM current."{table}"'
+                    )
+            legacy_path.replace(path)
+            self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+            self.assertEqual(
+                store.accept_proposal(repository, proposal, binding=binding),
+                proposal.proposal_digest,
+            )
+            self.assertEqual(
+                store.terminal_snapshot(
+                    repository, attempt_id=proposal.attempt_id, binding=binding,
+                )["outcome"],
+                "accepted",
+            )
+            self.assertEqual(
+                graph.activate(
+                    repository, proposal, binding=graph_binding,
+                    graph_version_id="graph-migration-dispatch",
+                ).decision,
+                GraphDecision.ACCEPTED,
+            )
+            self.assertEqual(
+                graph.current(repository, binding=graph_binding).graph_version_id,
+                "graph-migration-dispatch",
+            )
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT session_identity, turn_identity FROM "
+                    "dependency_review_accepted_result_dispatches WHERE attempt_id=?",
+                    (proposal.attempt_id,),
+                ).fetchone(), (
+                    "session-" + proposal.attempt_id,
+                    "turn-" + proposal.attempt_id,
+                ))
+                self.assertEqual(connection.execute(
+                    "SELECT session_identity FROM dependency_review_failure_admissions "
+                    "WHERE attempt_id=?", (proposal.attempt_id,),
+                ).fetchone(), ("session-" + proposal.attempt_id,))
 
     def test_graph_requires_the_pre_dispatch_relation_identity_not_caller_scalars(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

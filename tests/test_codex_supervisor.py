@@ -394,6 +394,8 @@ class SupervisorTests(unittest.TestCase):
     def test_ordered_dispatch_rechecks_scope_after_session_checkpoint(self):
         """A stop between durable session and turn creation has no turn/read result."""
 
+        from roundwright.failure_recovery import ScopeAdmissionDenied
+
         adapter = self.adapter(
             self.profiles[0], "scope-fence", NativeSupervisorResponse(
                 SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
@@ -404,7 +406,7 @@ class SupervisorTests(unittest.TestCase):
 
         def scope() -> None:
             if stopped:
-                raise RuntimeError("durable scope stopped")
+                raise ScopeAdmissionDenied("durable scope stopped")
 
         def checkpoint(_session: str) -> None:
             nonlocal stopped

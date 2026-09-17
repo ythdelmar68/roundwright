@@ -1003,6 +1003,16 @@ MIGRATIONS = (
         ),
         (("provider_effect_reservation_intents", "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'supervisor'), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), reservation_repository_identity TEXT NOT NULL DEFAULT '', reservation_task_identity TEXT NOT NULL DEFAULT '', UNIQUE(task_id, reservation_digest))"),),
     ),
+    Migration(
+        83,
+        (
+            "ALTER TABLE provider_effect_reservation_intents RENAME TO provider_effect_reservation_intents_v82",
+            "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role IN ('supervisor', 'dependency-review')), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), reservation_repository_identity TEXT NOT NULL, reservation_task_identity TEXT NOT NULL, UNIQUE(task_id, reservation_digest))",
+            "INSERT INTO provider_effect_reservation_intents SELECT attempt_id, task_id, repository_id, authority_scope, provider_role, reservation_digest, state, reservation_repository_identity, reservation_task_identity FROM provider_effect_reservation_intents_v82",
+            "DROP TABLE provider_effect_reservation_intents_v82",
+        ),
+        (("provider_effect_reservation_intents", "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role IN ('supervisor', 'dependency-review')), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), reservation_repository_identity TEXT NOT NULL, reservation_task_identity TEXT NOT NULL, UNIQUE(task_id, reservation_digest))"),),
+    ),
 )
 
 

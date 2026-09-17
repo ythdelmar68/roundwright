@@ -1107,40 +1107,65 @@ def _require_current_admission_authority(connection, identity, binding: FailureB
     session checkpoint even when the old JSON remains canonical.
     """
 
-    row = connection.execute(
+    authority = connection.execute(
         "SELECT seals.base_sha, seals.candidate_sha, seals.state_identity, "
-        "current_context.candidate_fingerprint, current_context.policy_fingerprint, "
-        "current_context.configuration_digest, current_context.worker_profile_identity, "
-        "current_context.supervisor_profile_identities, runtime.schema_version, "
-        "runtime.resolved_digest, runtime.worker_profile_identity, "
-        "runtime.supervisor_profile_identities, checkpoints.task_id, "
-        "checkpoints.attempt_id, checkpoints.session_identity, checkpoints.identity_fingerprint, "
-        "dispatch.task_id, dispatch.claim_fingerprint, attempts.input_fingerprint, attempts.session_identity, "
-        "before_dispatch.task_id, before_dispatch.provider_role, before_dispatch.checkpoint_phase, before_dispatch.identity_fingerprint "
+        "runtime.schema_version, runtime.resolved_digest, runtime.worker_profile_identity, "
+        "runtime.supervisor_profile_identities "
         "FROM candidate_seals AS seals "
-        "JOIN provider_attempt_contexts AS current_context "
-        "ON current_context.attempt_id = ? AND current_context.task_id = seals.task_id "
-        "JOIN runtime_configuration_bindings AS runtime "
-        "ON runtime.task_id = seals.task_id "
-        "LEFT JOIN provider_session_checkpoints AS checkpoints "
-        "ON checkpoints.attempt_id = ? "
-        "JOIN provider_attempts AS attempts ON attempts.attempt_id = ? "
-        "LEFT JOIN provider_dispatch_claims AS dispatch ON dispatch.attempt_id = attempts.attempt_id "
-        "JOIN provider_checkpoints AS before_dispatch ON before_dispatch.checkpoint_id = attempts.attempt_id || ':before-dispatch' "
-        "WHERE seals.task_id = ?",
-        (binding.attempt_identity, binding.attempt_identity, binding.attempt_identity, identity.task_id),
+        "JOIN runtime_configuration_bindings AS runtime ON runtime.task_id = seals.task_id "
+        "WHERE seals.task_id = ?", (identity.task_id,),
     ).fetchone()
-    if row is None:
+    context = connection.execute(
+        "SELECT task_id, repository_fingerprint, worktree_fingerprint, branch_fingerprint, "
+        "base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint, "
+        "configuration_schema_version, configuration_digest, worker_profile_identity, "
+        "supervisor_profile_identities, review_complete_rounds, review_max_rounds, "
+        "review_max_supervisor_attempts_per_round, review_on_final_findings, review_policy_digest "
+        "FROM provider_attempt_contexts WHERE attempt_id = ?", (binding.attempt_identity,),
+    ).fetchone()
+    health = connection.execute(
+        "SELECT authorization.contract_commit, authorization.candidate_sha, authorization.case_id, "
+        "authorization.receipt_digest, authorization.selection_ordinal, authorization.fresh_until, "
+        "authorization.health_contract_identity, authorization.provider_role, authorization.profile_identity, "
+        "seals.authorization_fingerprint "
+        "FROM provider_attempt_health_authorizations AS authorization "
+        "LEFT JOIN provider_attempt_health_seals AS seals ON seals.attempt_id = authorization.attempt_id "
+        "WHERE authorization.attempt_id = ?", (binding.attempt_identity,),
+    ).fetchone()
+    attempt = connection.execute(
+        "SELECT task_id, provider_role, selected_profile_identity, input_fingerprint, session_identity "
+        "FROM provider_attempts WHERE attempt_id = ?", (binding.attempt_identity,),
+    ).fetchone()
+    dispatch = connection.execute(
+        "SELECT task_id, claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id = ?",
+        (binding.attempt_identity,),
+    ).fetchone()
+    before_dispatch = connection.execute(
+        "SELECT task_id, provider_role, checkpoint_phase, attempt_id, identity_fingerprint "
+        "FROM provider_checkpoints WHERE checkpoint_id = ?",
+        (binding.attempt_identity + ":before-dispatch",),
+    ).fetchone()
+    session_checkpoint = connection.execute(
+        "SELECT task_id, attempt_id, session_identity, identity_fingerprint "
+        "FROM provider_session_checkpoints WHERE attempt_id = ?",
+        (binding.attempt_identity,),
+    ).fetchone()
+    if any(value is None for value in (authority, context, health, attempt, before_dispatch)):
         raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
+    base_sha, candidate_sha, state_identity, runtime_schema, runtime_configuration, runtime_worker_profile, runtime_supervisor_profiles = authority
     (
-        base_sha, candidate_sha, state_identity, candidate_fingerprint,
-        policy_fingerprint, configuration_digest, context_worker_profile,
-        context_supervisor_profiles, runtime_schema, runtime_configuration,
-        runtime_worker_profile, runtime_supervisor_profiles, checkpoint_task,
-        checkpoint_attempt, checkpoint_session, checkpoint_fingerprint,
-        dispatch_task, dispatch_fingerprint, attempt_input_fingerprint, attempt_session,
-        before_task, before_role, before_phase, before_fingerprint,
-    ) = row
+        context_task, repository_fingerprint, worktree_fingerprint, branch_fingerprint,
+        base_fingerprint, candidate_fingerprint, policy_fingerprint, deployment_fingerprint,
+        context_schema, configuration_digest, context_worker_profile,
+        context_supervisor_profiles, review_complete_rounds, review_max_rounds,
+        review_max_attempts, review_on_final_findings, review_policy_digest,
+    ) = context
+    (
+        health_commit, health_candidate, health_case, health_receipt,
+        health_ordinal, health_fresh_until, health_contract, health_role,
+        health_profile, health_fingerprint,
+    ) = health
+    attempt_task, attempt_role, attempt_profile, attempt_input_fingerprint, attempt_session = attempt
     expected_fingerprint = hashlib.sha256(binding.candidate_sha.encode()).hexdigest()
     expected_policy = binding.policy_digest.removeprefix("sha256:")
     try:
@@ -1156,6 +1181,7 @@ def _require_current_admission_authority(connection, identity, binding: FailureB
         base_sha != identity.base_sha
         or candidate_sha != binding.candidate_sha
         or type(state_identity) is not str or not state_identity
+        or context_task != identity.task_id
         or candidate_fingerprint != expected_fingerprint
         or policy_fingerprint != expected_policy
         or configuration_digest != binding.configuration_digest
@@ -1163,26 +1189,64 @@ def _require_current_admission_authority(connection, identity, binding: FailureB
         or context_supervisors != runtime_supervisors
         or runtime_schema != "roundwright-runtime/v1"
         or runtime_configuration != binding.configuration_digest
+        or context_schema != runtime_schema
         or expected_profile != binding.profile_identity
         or (binding.role is FailureRole.SUPERVISOR and binding.profile_identity not in runtime_supervisors)
-        or before_task != identity.task_id or before_role != binding.role.value
-        or before_phase != "before-dispatch"
+        or (attempt_task, attempt_role, attempt_profile) != (
+            identity.task_id, binding.role.value, binding.profile_identity,
+        )
+    ):
+        raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
+    health_values = health[:9]
+    if (
+        type(health_commit) is not str or not _COMMIT.fullmatch(health_commit)
+        or health_candidate != binding.candidate_sha
+        or type(health_case) is not str or not _TOKEN.fullmatch(health_case)
+        or type(health_receipt) is not str or not _DIGEST.fullmatch(health_receipt)
+        or type(health_ordinal) is not int or health_ordinal < 0
+        or type(health_fresh_until) is not int or health_fresh_until <= 0
+        or type(health_contract) is not str or not _DIGEST.fullmatch(health_contract)
+        or (health_role, health_profile) != (binding.role.value, binding.profile_identity)
+        or type(health_fingerprint) is not str
+        or not re.fullmatch(r"[0-9a-f]{64}", health_fingerprint)
+        or health_fingerprint != hashlib.sha256(
+            "\x00".join((
+                binding.attempt_identity,
+                *("" if value is None else str(value) for value in health_values),
+            )).encode("utf-8")
+        ).hexdigest()
+    ):
+        raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
+    context_values = (
+        repository_fingerprint, worktree_fingerprint, branch_fingerprint,
+        base_fingerprint, candidate_fingerprint, policy_fingerprint,
+        deployment_fingerprint, context_schema, configuration_digest,
+        context_worker_profile, context_supervisor_profiles,
+        review_complete_rounds, review_max_rounds, review_max_attempts,
+        review_on_final_findings, review_policy_digest,
+    )
+    context_identity = hashlib.sha256(
+        "\x00".join("" if value is None else str(value) for value in context_values).encode("utf-8")
+    ).hexdigest()
+    expected_checkpoint = hashlib.sha256(
+        f"{context_identity}\x00{health_fingerprint}".encode("utf-8")
+    ).hexdigest()
+    if before_dispatch != (
+        identity.task_id, binding.role.value, "before-dispatch",
+        binding.attempt_identity, expected_checkpoint,
     ):
         raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
     pre_dispatch = pre_dispatch_failure_identity(binding.role, binding.attempt_identity)
     if binding.session_identity == pre_dispatch:
         if (
-            attempt_session is not None or checkpoint_task is not None
-            or (dispatch_task, dispatch_fingerprint) != (identity.task_id, attempt_input_fingerprint)
+            attempt_session is not None or session_checkpoint is not None
+            or dispatch != (identity.task_id, attempt_input_fingerprint)
         ):
             raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
-    elif (
-        checkpoint_task != identity.task_id
-        or checkpoint_attempt != binding.attempt_identity
-        or checkpoint_session != binding.session_identity
-        or attempt_session != binding.session_identity
-        or checkpoint_fingerprint != before_fingerprint
-    ):
+    elif session_checkpoint != (
+        identity.task_id, binding.attempt_identity, binding.session_identity,
+        expected_checkpoint,
+    ) or attempt_session != binding.session_identity:
         raise FailureRecoveryError("durable failure authority is unavailable or has drifted")
 
 
@@ -1504,7 +1568,7 @@ def begin_provider_effect_reservation_intent(
     reservation_digest: str, reservation_repository_identity: str,
     reservation_task_identity: str,
 ) -> bool:
-    """Persist an exact non-route Supervisor debit intent before budget I/O.
+    """Persist an exact non-route provider debit intent before budget I/O.
 
     ``True`` means the caller created the intent and may reserve the budget.
     ``False`` means a prior process already created this exact intent, so the
@@ -1512,9 +1576,10 @@ def begin_provider_effect_reservation_intent(
     """
 
     from .state import _open_writable_connection, _require_matching_task
+    provider_role = _provider_intent_role(identity, scope)
     if (
         not isinstance(scope, str)
-        or scope != "supervisor:" + identity.task_id
+        or provider_role is None
         or not isinstance(attempt_id, str) or not attempt_id
         or not _DIGEST.fullmatch(reservation_digest)
         or not _DIGEST.fullmatch(reservation_repository_identity)
@@ -1526,23 +1591,33 @@ def begin_provider_effect_reservation_intent(
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
         require_scope_open(connection, identity.task_id, scope)
-        successor = connection.execute(
-            "SELECT task_id, provider_role, state, session_identity, external_turn_identity, "
-            "output_pointer, completion_evidence_fingerprint, accepted_review_identity "
-            "FROM provider_attempts WHERE attempt_id = ?",
-            (attempt_id,),
-        ).fetchone()
-        if successor is not None and successor != (
-            identity.task_id, "supervisor", "prepared", None, None, None, None, None,
-        ):
+        if provider_role == "supervisor":
+            successor = connection.execute(
+                "SELECT task_id, provider_role, state, session_identity, external_turn_identity, "
+                "output_pointer, completion_evidence_fingerprint, accepted_review_identity "
+                "FROM provider_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            expected_successor = (
+                identity.task_id, "supervisor", "prepared", None, None, None, None, None,
+            )
+            claim_table = "provider_dispatch_claims"
+        else:
+            successor = connection.execute(
+                "SELECT task_id, state FROM dependency_review_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            expected_successor = (identity.task_id, "prepared")
+            claim_table = "dependency_review_dispatch_claims"
+        if successor is not None and successor != expected_successor:
             raise FailureRecoveryError("provider effect reservation already has a successor")
         if connection.execute(
-            "SELECT 1 FROM provider_dispatch_claims WHERE attempt_id = ?",
+            f"SELECT 1 FROM {claim_table} WHERE attempt_id = ?",
             (attempt_id,),
         ).fetchone() is not None:
             raise FailureRecoveryError("provider effect reservation already has a successor")
         expected = (
-            identity.task_id, identity.repository_id, scope, "supervisor",
+            identity.task_id, identity.repository_id, scope, provider_role,
             reservation_digest, "reserving", reservation_repository_identity,
             reservation_task_identity,
         )
@@ -1558,8 +1633,8 @@ def begin_provider_effect_reservation_intent(
                 "INSERT INTO provider_effect_reservation_intents("
                 "attempt_id, task_id, repository_id, authority_scope, provider_role, "
                 "reservation_digest, state, reservation_repository_identity, reservation_task_identity) "
-                "VALUES (?, ?, ?, ?, 'supervisor', ?, 'reserving', ?, ?)",
-                (attempt_id, identity.task_id, identity.repository_id, scope, reservation_digest,
+                "VALUES (?, ?, ?, ?, ?, ?, 'reserving', ?, ?)",
+                (attempt_id, identity.task_id, identity.repository_id, scope, provider_role, reservation_digest,
                  reservation_repository_identity, reservation_task_identity),
             )
             connection.commit()
@@ -1579,12 +1654,13 @@ def commit_provider_effect_reservation_intent(
     repository, identity, scope: str, *, attempt_id: str,
     reservation_digest: str,
 ) -> None:
-    """Retire one debit intent after its durable Supervisor attempt exists."""
+    """Retire one debit intent after its durable provider attempt exists."""
 
     from .state import _open_writable_connection, _require_matching_task
+    provider_role = _provider_intent_role(identity, scope)
     if (
         not isinstance(scope, str)
-        or scope != "supervisor:" + identity.task_id
+        or provider_role is None
         or not isinstance(attempt_id, str) or not attempt_id
         or not _DIGEST.fullmatch(reservation_digest)
     ):
@@ -1593,14 +1669,26 @@ def commit_provider_effect_reservation_intent(
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
-        successor = connection.execute(
-            "SELECT task_id, provider_role, state FROM provider_attempts WHERE attempt_id = ?",
-            (attempt_id,),
-        ).fetchone()
-        if successor != (identity.task_id, "supervisor", "prepared"):
+        if provider_role == "supervisor":
+            successor = connection.execute(
+                "SELECT task_id, provider_role, state FROM provider_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            expected_successor = (identity.task_id, "supervisor", "prepared")
+            claim_table = "provider_dispatch_claims"
+        else:
+            successor = connection.execute(
+                "SELECT task_id, state FROM dependency_review_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            expected_successor = (identity.task_id, "prepared")
+            claim_table = "dependency_review_dispatch_claims"
+        if successor != expected_successor or connection.execute(
+            f"SELECT 1 FROM {claim_table} WHERE attempt_id = ?", (attempt_id,),
+        ).fetchone() is not None:
             raise FailureRecoveryError("provider effect reservation successor has drifted")
         expected = (
-            identity.task_id, identity.repository_id, scope, "supervisor",
+            identity.task_id, identity.repository_id, scope, provider_role,
             reservation_digest,
         )
         row = connection.execute(
@@ -1649,7 +1737,12 @@ def release_unused_provider_effect_reservation(
     binding = getattr(effect_reservation, "_binding", None)
     request_identity = getattr(effect_reservation, "_request_identity", None)
     expected_scope = None if binding is None else binding.role.value + ":" + identity.task_id
-    if (binding is None or binding.role is not AdvisoryRole.SUPERVISOR
+    provider_role = _provider_intent_role(identity, scope)
+    expected_advisory_role = {
+        "supervisor": AdvisoryRole.SUPERVISOR,
+        "dependency-review": AdvisoryRole.DEPENDENCY_REVIEW,
+    }.get(provider_role)
+    if (binding is None or binding.role is not expected_advisory_role
             or request_identity != attempt_id or scope != expected_scope):
         raise FailureRecoveryError("unused provider reservation has drifted")
     connection = _open_writable_connection(repository)
@@ -1663,19 +1756,27 @@ def release_unused_provider_effect_reservation(
             (attempt_id,),
         ).fetchone()
         expected_intent = (
-            identity.task_id, identity.repository_id, scope, "supervisor",
+            identity.task_id, identity.repository_id, scope, provider_role,
             effect_reservation.recovery_digest, "reserving",
             binding.repository_identity, binding.task_identity,
         )
         if intent != expected_intent:
-            raise FailureRecoveryError("unused provider reservation intent has drifted")
-        occupied = any(connection.execute(statement, (attempt_id,)).fetchone() is not None for statement in (
-            "SELECT 1 FROM provider_attempts WHERE attempt_id=?",
-            "SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=?",
-            "SELECT 1 FROM provider_session_checkpoints WHERE attempt_id=?",
-            "SELECT 1 FROM provider_completion_outputs WHERE attempt_id=?",
-            "SELECT 1 FROM diff_review_attempts WHERE provider_attempt_id=?",
-        ))
+            raise FailureRecoveryError("unused provider reservation has drifted")
+        statements = (
+            (
+                "SELECT 1 FROM provider_attempts WHERE attempt_id=?",
+                "SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=?",
+                "SELECT 1 FROM provider_session_checkpoints WHERE attempt_id=?",
+                "SELECT 1 FROM provider_completion_outputs WHERE attempt_id=?",
+                "SELECT 1 FROM diff_review_attempts WHERE provider_attempt_id=?",
+            ) if provider_role == "supervisor" else (
+                "SELECT 1 FROM dependency_review_attempts WHERE attempt_id=?",
+                "SELECT 1 FROM dependency_review_dispatch_claims WHERE attempt_id=?",
+                "SELECT 1 FROM dependency_review_validation_outcomes WHERE attempt_id=?",
+                "SELECT 1 FROM dependency_review_failure_admissions WHERE attempt_id=?",
+            )
+        )
+        occupied = any(connection.execute(statement, (attempt_id,)).fetchone() is not None for statement in statements)
         if occupied:
             raise FailureRecoveryError("unused provider reservation has a durable successor")
         _release_exclusive_recovery_reservation(
@@ -1694,6 +1795,15 @@ def release_unused_provider_effect_reservation(
         raise
     finally:
         connection.close()
+
+
+def _provider_intent_role(identity, scope: object) -> str | None:
+    if not isinstance(scope, str):
+        return None
+    for role in ("supervisor", "dependency-review"):
+        if scope == role + ":" + identity.task_id:
+            return role
+    return None
 
 
 def classify(binding: FailureBinding, failure: FailureClass, evidence: EvidenceSource | FailureEvidence) -> FailureRecord:

@@ -87,6 +87,7 @@ class SupervisorTerminalFailureClass(StrEnum):
 
 class SupervisorTerminalFailureSource(StrEnum):
     SDK_TURN_FAILED = "sdk-turn-failed"
+    SCOPE_ADMISSION_DENIED = "scope-admission-denied"
 
 
 class SupervisorTerminalFailureSdkCategory(StrEnum):
@@ -611,6 +612,7 @@ def claim_supervisor_dispatch(
         connection.execute("BEGIN IMMEDIATE")
         _require_current_lease(connection, lease, identity.repository_id, observed)
         _require_matching_task(connection, identity)
+        require_scope_open(connection, identity.task_id, "supervisor:" + identity.task_id)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
         _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
@@ -1166,6 +1168,107 @@ def record_supervisor_terminal_failure(
         connection.execute(
             "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
             (identity.task_id, attempt_id, RecoveryAction.FRESH_SUPERVISOR_SESSION.value, observed),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return row
+
+
+def record_supervisor_scope_denial(
+    repository: RepositoryIdentity,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    session_identity: str,
+    lease: TransitionLease | None = None,
+    now: int | None = None,
+) -> ProviderAttempt:
+    """Close a claimed Supervisor attempt at an authenticated scope stop.
+
+    A denial can be observed before a native session exists or after the real
+    session checkpoint but before a turn checkpoint.  The durable dispatch
+    claim or session checkpoint supplies the identity; this transition never
+    fabricates a provider turn.
+    """
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    _require_token(attempt_id, "attempt identity")
+    if type(session_identity) is not str or not _TOKEN.fullmatch(session_identity):
+        raise ProviderRecoveryError("Supervisor scope denial identity is invalid")
+    observed = _clock(now)
+    action = RecoveryAction.BLOCKED_AMBIGUOUS_TURN
+    blocker = "scope-stopped"
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_current_lease(connection, lease, identity.repository_id, observed)
+        _require_matching_task(connection, identity)
+        _require_persisted_context(connection, attempt_id, context)
+        row = _attempt_row(connection, identity.task_id, attempt_id)
+        authorization_fingerprint = _require_persisted_health_authorization(
+            connection, attempt_id, context, row.role,
+            row.selected_profile_identity, observed,
+        )
+        if row.role is not ProviderRole.SUPERVISOR:
+            raise ProviderRecoveryError("scope denial requires a Supervisor attempt")
+        claim = connection.execute(
+            "SELECT task_id, claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if claim != (identity.task_id, row.input_fingerprint):
+            raise ProviderRecoveryError("scope denial dispatch claim is unavailable")
+        pre_dispatch = pre_dispatch_failure_identity(FailureRole.SUPERVISOR, attempt_id)
+        if session_identity == pre_dispatch:
+            if row.session_identity is not None or connection.execute(
+                "SELECT 1 FROM provider_session_checkpoints WHERE attempt_id=?", (attempt_id,),
+            ).fetchone() is not None:
+                raise ProviderRecoveryError("scope denial pre-dispatch identity has drifted")
+        else:
+            if row.session_identity != session_identity:
+                raise ProviderRecoveryError("scope denial session identity has drifted")
+            _require_session_checkpoint(
+                connection, identity.task_id, attempt_id, session_identity,
+                context, authorization_fingerprint,
+            )
+        if row.state is AttemptState.BLOCKED:
+            if _read_recovery_outcome(connection, attempt_id) != _PersistedRecoveryOutcome(action, blocker):
+                raise ProviderRecoveryError("scope denial conflicts with committed state")
+            connection.commit()
+            return row
+        if row.state not in {AttemptState.PREPARED, AttemptState.DISPATCHED}:
+            raise ProviderRecoveryError("scope denial requires an unsettled Supervisor attempt")
+        from .provider_health import CodexFailure
+        record_durable_failure(
+            repository, identity,
+            classify_native_failure(
+                FailureRole.SUPERVISOR,
+                FailureBinding(
+                    context.candidate_sha or identity.base_sha,
+                    "sha256:" + context.policy_fingerprint,
+                    context.runtime_binding.resolved_digest,
+                    "supervisor:" + identity.task_id,
+                    FailureRole.SUPERVISOR, row.selected_profile_identity,
+                    session_identity, attempt_id,
+                ),
+                CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+            ),
+            now=observed, connection=connection,
+        )
+        connection.execute(
+            "UPDATE provider_attempts SET state = ? WHERE attempt_id = ?",
+            (AttemptState.BLOCKED.value, attempt_id),
+        )
+        row = replace(row, state=AttemptState.BLOCKED)
+        _persist_recovery_outcome(connection, attempt_id, action, blocker, observed)
+        connection.execute(
+            "INSERT INTO provider_recovery_events(task_id, attempt_id, recovery_action, observed_at) VALUES (?, ?, ?, ?)",
+            (identity.task_id, attempt_id, action.value, observed),
         )
         connection.commit()
     except Exception:

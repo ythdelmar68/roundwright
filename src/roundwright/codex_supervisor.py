@@ -28,6 +28,10 @@ class CodexSupervisorError(ValueError):
     """Raised when a Supervisor boundary would lose identity or authority."""
 
 
+class _SupervisorScopeDenied(CodexSupervisorError):
+    """Internal typed stop from the durable product-scope fence."""
+
+
 class SupervisorCheckpointStage(StrEnum):
     """Public-safe local checkpoint stages, never provider outcome states."""
 
@@ -110,6 +114,7 @@ class SupervisorDiagnostic(StrEnum):
 
 class SupervisorOutcomeSource(StrEnum):
     SDK_TURN_FAILED = "sdk-turn-failed"
+    SCOPE_ADMISSION_DENIED = "scope-admission-denied"
 
 
 class SupervisorSdkTurnErrorCategory(StrEnum):
@@ -332,10 +337,18 @@ class CodexSupervisorAdapter:
                     try:
                         scope_admission()
                     except Exception as error:
-                        raise CodexSupervisorError("Supervisor durable scope admission is denied") from error
+                        raise _SupervisorScopeDenied("Supervisor durable scope admission is denied") from error
                 return receipt
 
             admit()
+        except _SupervisorScopeDenied:
+            return CodexSupervisorResult(
+                SupervisorResultKind.BLOCKED,
+                pre_dispatch_failure_identity(FailureRole.SUPERVISOR, request.provider_attempt_id),
+                None, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+                outcome_source=SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED,
+                sdk_error_category=SupervisorSdkTurnErrorCategory.SANDBOX,
+            )
         except RoleCapabilityError as error:
             raise CodexSupervisorError("Supervisor advisory admission is denied") from error
         session: NativeSupervisorSession | None = None
@@ -365,6 +378,17 @@ class CodexSupervisorAdapter:
                 ) from None
             admit()
             response = turn.read_response()
+        except _SupervisorScopeDenied:
+            _abort(turn); _close(session)
+            return CodexSupervisorResult(
+                SupervisorResultKind.BLOCKED,
+                session_identity or pre_dispatch_failure_identity(
+                    FailureRole.SUPERVISOR, request.provider_attempt_id,
+                ),
+                turn_identity, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+                outcome_source=SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED,
+                sdk_error_category=SupervisorSdkTurnErrorCategory.SANDBOX,
+            )
         except CodexSupervisorError:
             _abort(turn); _close(session)
             raise

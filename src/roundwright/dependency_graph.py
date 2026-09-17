@@ -387,6 +387,20 @@ class DependencyGraphStore:
             if stored != proposal or attempt[6] != "accepted":
                 raise DependencyGraphError("dependency proposal is not durably accepted")
             binding.require_subset(subset)
+            try:
+                DependencyReviewStore._require_authenticated_dispatch(
+                    connection, proposal.attempt_id, attempt, subset,
+                    DependencyReviewBinding(
+                        binding.candidate_sha, binding.policy_digest,
+                        binding.configuration_digest, attempt[2],
+                    ),
+                    task_identity=None, require_turn=True,
+                    unavailable="dependency review graph evidence is unavailable",
+                )
+            except DependencyReviewError as error:
+                raise DependencyGraphError(
+                    "dependency review graph evidence is unavailable"
+                ) from error
             DependencyReviewStore._verify_task_lineage(connection, attempt[0])
             if connection.execute("SELECT 1 FROM dependency_review_successors WHERE predecessor_attempt_id = ?", (proposal.attempt_id,)).fetchone() is not None:
                 raise DependencyGraphError("dependency proposal is superseded")
@@ -515,6 +529,19 @@ class DependencyGraphStore:
         except DependencyReviewError as error:
             raise DependencyGraphError("current dependency graph has drifted") from error
         binding = snapshot.binding
+        if binding is not None:
+            try:
+                DependencyReviewStore._require_authenticated_dispatch(
+                    connection, attempt_id, attempt, subset,
+                    DependencyReviewBinding(
+                        binding.candidate_sha, binding.policy_digest,
+                        binding.configuration_digest, attempt[2],
+                    ),
+                    task_identity=None, require_turn=True,
+                    unavailable="dependency review graph evidence is unavailable",
+                )
+            except DependencyReviewError as error:
+                raise DependencyGraphError("current dependency graph has drifted") from error
         if binding is None or proposal.attempt_id != attempt_id or attempt[6] != "accepted" or (subset_digest, validator_digest, policy_digest, candidate_sha, configuration_digest) != (subset.content_digest, binding.validator_digest, binding.policy_digest, binding.candidate_sha, binding.configuration_digest):
             raise DependencyGraphError("current dependency graph has drifted")
         new_edges = tuple(edge for edge in snapshot.edges if edge.proposal_id == proposal_id)

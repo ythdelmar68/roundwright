@@ -24,7 +24,7 @@ from .candidate_review import (
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
-    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorDiagnostic, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
+    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorDiagnostic, SupervisorOutcomeSource, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
@@ -37,7 +37,7 @@ from .failure_recovery import (
     begin_durable_recovery_route_reservation,
     commit_durable_recovery_route_reservation,
     issue_durable_recovery_route_authorization,
-    native_failure_class, parse_failure_record, read_durable_failure,
+    native_failure_class, parse_failure_record, pre_dispatch_failure_identity, read_durable_failure,
     admit_scope_effect_reservation, release_unused_provider_effect_reservation,
     begin_provider_effect_reservation_intent,
     commit_provider_effect_reservation_intent, require_scope_effect_admission,
@@ -47,7 +47,7 @@ from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, Seal
 from .provider_recovery import (
     AttemptState, ProviderAttemptAbsentError, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
-    read_supervisor_terminal_failure, record_supervisor_terminal_failure,
+    read_supervisor_terminal_failure, record_supervisor_scope_denial, record_supervisor_terminal_failure,
     claim_supervisor_dispatch, read_supervisor_dispatch_claim, SupervisorDispatchClaimState, read_attempt, record_invalid_output, recover_attempt, prepare_attempt, read_supervisor_accounting_snapshot,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
     SupervisorAccountingBlocker, record_supervisor_accounting_blocker,
@@ -1450,6 +1450,23 @@ class DurableDiffReviewRunner:
                 session_present=error.session_present,
                 turn_present=error.turn_present,
             ) from None
+        if (
+            result.kind is SupervisorResultKind.BLOCKED
+            and result.outcome_source is SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED
+        ):
+            durable_session = (
+                result.session_identity if session_checkpointed
+                else pre_dispatch_failure_identity(
+                    FailureRole.SUPERVISOR, selection.provider_attempt_id,
+                )
+            )
+            record_supervisor_scope_denial(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                session_identity=durable_session,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            raise ProviderAttemptRuntimeError("provider attempt dispatch scope is stopped")
         if not session_checkpointed:
             raise ProviderAttemptRuntimeError("native Supervisor did not provide a durable session checkpoint")
         if not turn_checkpointed:

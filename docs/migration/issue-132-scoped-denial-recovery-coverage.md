@@ -329,3 +329,21 @@ The six new E1R16 tests are appended to the ordered semantic inventory; the
 two extended admission/crash tests retain their existing positions. Windows
 declares no E1R16 skip, and coverage render/verify requires their exact
 candidate-bound execution receipt.
+
+## E1R17 dispatch admission, identity, and restart closure
+
+E1R17 closes the five remaining review boundaries without weakening the
+existing no-effect, no-double-debit, or candidate-bound replay rules.
+
+| Finding | Durable invariant and semantic evidence |
+| --- | --- |
+| E1R17-01 | A Supervisor scope denial before a native session or turn is a typed durable terminal result. It binds either the authenticated pre-dispatch surrogate or the real session checkpoint, never invents a turn, and blocks restart. `test_scope_denial_before_session_or_turn_is_durable_without_invented_turn` covers both boundaries. |
+| E1R17-02 | Every initial dependency-review debit has an exact repository/task reservation intent before budget I/O. Restart recovers interruption before or after durable attempt preparation, reuses one debit, dispatches once, and retires the intent only after the exact attempt is durable. `test_initial_reservation_intent_recovers_before_and_after_preparation` covers both crash windows. |
+| E1R17-03 | Dependency acceptance, terminal read-back, graph activation, and current-graph replay share one dispatch authenticator. It reconstructs durable task authority and rejects missing claims plus substituted session, turn, admission-session, or profile bindings. `test_all_dependency_consumers_share_exact_dispatch_authentication` exercises every consumer. |
+| E1R17-04 | Supervisor and dependency-review pre-dispatch claims recheck the stopped scope inside the same `BEGIN IMMEDIATE` transaction that inserts the claim. `test_supervisor_claim_rechecks_scope_inside_the_claim_transaction` and `test_pre_dispatch_claim_rechecks_scope_in_its_writer_transaction` prove neither writer can overtake a concurrent stop. |
+| E1R17-05 | Cleared-scope successor admission reconstructs the original health authorization and full sealed launch-context fingerprints, derives the expected before-dispatch checkpoint, and authenticates the persisted session checkpoint against it. The extended `test_cleared_scope_effect_reauthenticates_original_admission_and_session` rejects forged equal fingerprints and a substituted health seal before any reservation callback. |
+
+The five new semantic tests are appended to the independently ordered Issue
+#132 inventory; the extended clearance test retains its earlier position and
+both claim-writer races are required for E1R17-04. Windows declares no E1R17
+skip, and render/verify requires the exact candidate-bound execution receipt.

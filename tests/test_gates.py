@@ -321,7 +321,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
         proposal = DependencyProposal("proposal-21", "attempt-21", RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", "sha256:" + "7" * 64, Confidence.HIGH, "sha256:" + "8" * 64, relation.relation_digest),))
         reviews = DependencyReviewStore()
         reviews.start_attempt(repository, subset, attempt_id="attempt-21", binding=review_binding, source_owned_relations=(relation,))
-        reviews.accept_proposal(repository, proposal, binding=review_binding)
+        self.accept_dependency_proposal(reviews, repository, identity, proposal, review_binding)
         activation = DependencyGraphStore().activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(review_binding), graph_version_id="graph-21")
         context = GateContext(identity.task_id, seal.candidate_sha, 2, False, base_context.policy_digest, base_context.receipt_fingerprint, runtime, base_context.selected_supervisor_profile_identity, dependency_graph_version_id=activation.graph_version_id, dependency_graph_decision_digest=activation.decision_digest)
         evidence = tuple(sorted((
@@ -340,6 +340,33 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             connection.close()
         return repository, identity, binding, seal, context, lease, tuple(item.evidence_fingerprint for item in evidence), reviews, subset, review_binding
 
+    @staticmethod
+    def accept_dependency_proposal(
+        reviews: DependencyReviewStore, repository: RepositoryIdentity,
+        identity: TaskIdentity, proposal: DependencyProposal,
+        binding: DependencyReviewBinding,
+    ) -> str:
+        """Model the complete provider dispatch identity before acceptance."""
+
+        session_identity = "session-" + proposal.attempt_id
+        reviews.claim_pre_dispatch(
+            repository, attempt_id=proposal.attempt_id,
+            task_identity=identity, binding=binding,
+        )
+        reviews.claim_session(
+            repository, attempt_id=proposal.attempt_id,
+            session_identity=session_identity,
+            task_identity=identity, binding=binding,
+        )
+        reviews.claim_turn(
+            repository, attempt_id=proposal.attempt_id,
+            session_identity=session_identity,
+            turn_identity="turn-" + proposal.attempt_id,
+        )
+        return reviews.accept_proposal(
+            repository, proposal, binding=binding, task_identity=identity,
+        )
+
     def test_dependency_graph_pass_rejects_an_unaccepted_terminal_successor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, identity, binding, seal, base_context, lease, _ = self.complete_persisted_pass(Path(temporary))
@@ -356,7 +383,7 @@ class SQLiteGateEvidenceTests(unittest.TestCase):
             proposal = DependencyProposal("proposal-21", "attempt-21", RequestedDisposition.AUTO_ACTIVATE, "not-required", (ProposedEdge(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", "sha256:" + "7" * 64, Confidence.HIGH, "sha256:" + "8" * 64, relation.relation_digest),))
             attempt = reviews.start_attempt(repository, subset, attempt_id="attempt-21", binding=review_binding, source_owned_relations=(relation,))
             graph = DependencyGraphStore()
-            reviews.accept_proposal(repository, proposal, binding=review_binding)
+            self.accept_dependency_proposal(reviews, repository, identity, proposal, review_binding)
             activation = graph.activate(repository, proposal, binding=DependencyGraphBinding.from_review_binding(review_binding), graph_version_id="graph-21")
             context = GateContext(identity.task_id, seal.candidate_sha, 2, False, base_context.policy_digest, base_context.receipt_fingerprint, runtime, base_context.selected_supervisor_profile_identity, dependency_graph_version_id=activation.graph_version_id, dependency_graph_decision_digest=activation.decision_digest)
             successor = AffectedSubset("subset-22", identity.task_id, subset.source_digest, subset.candidate_sha, subset.policy_digest, subset.configuration_digest, subset.boundary_digest, "retry", members)

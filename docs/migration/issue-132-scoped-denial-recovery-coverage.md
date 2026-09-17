@@ -291,3 +291,21 @@ names the candidate-bound invariant and executable regression that closes it.
 All E1R14 tests are appended to the independently ordered Issue #132 semantic
 inventory. Windows declares no E1R14 skip, and the candidate-bound receipt must
 execute every entry before the coverage manifest can render or verify.
+
+## E1R15 durable acceptance, debit-intent, and legacy replay closure
+
+The E1R15 review evidence is retained as one repair set. Each row binds the
+reported bypass or restart gap to a candidate-enforced invariant and one
+independently ordered semantic regression.
+
+| Finding | Durable invariant and semantic evidence |
+| --- | --- |
+| E1R15-01 | A production dependency attempt is identified by its durable dispatch claim. Proposal acceptance reconstructs the exact task identity from the attempt and rechecks candidate/runtime authority plus the stopped scope even when `task_identity` is omitted. `test_default_acceptance_derives_production_task_and_rechecks_stopped_scope_after_restart` proves both default-argument and reconstructed-store rejection. |
+| E1R15-02 | The unused-provider refund primitive accepts only Supervisor reservations backed by an exact repository/task/scope debit intent. Dependency-review reservations are categorically non-refundable, including prepared, claimed, and accepted attempts, as proven by `test_dependency_review_reservations_are_never_refundable_by_provider_release`. |
+| E1R15-03 | Every non-route Supervisor debit is preceded by a repository-side exact reservation intent. Restart recovers the matching budget row or, when interruption preceded that row, performs the first debit. `test_process_death_after_correction_debit_before_prepare_recovers_exact_intent` uses a `BaseException` boundary before `prepare_attempt` and proves one debit, one later effect, and intent reconciliation. |
+| E1R15-04 | A cleared stop is not standalone authority. Every scope/effect admission reauthenticates the original failure admission and session checkpoint while holding the product transaction. `test_cleared_scope_effect_reauthenticates_original_admission_and_session` deletes each evidence class after an authentic clearance and proves the reserve callback remains untouched. |
+| E1R15-05 | Migration 81 recovers a schema-67 generic prepared Supervisor's logical profile position only when the selected profile is unique and its attempt/runtime contexts agree exactly. `test_schema67_generic_prepared_supervisor_replays_after_position_migration` migrates a populated database with no diff-review row and replays the unchanged attempt. |
+
+All five E1R15 tests are appended to the independent Issue #132 semantic
+inventory. Windows declares no E1R15 skip; render and verify require the exact
+candidate-bound execution receipt.

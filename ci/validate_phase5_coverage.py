@@ -154,6 +154,8 @@ SEMANTIC_CONTRACTS = {
         "def admit_recovery",
         "def release_durable_recovery_route_authorization",
         "def commit_durable_recovery_route_successor_admission",
+        "def begin_provider_effect_reservation_intent",
+        "_require_attempt_admission(connection, TaskIdentity(*task), record.binding)",
     ),
     "src/roundwright/provider_recovery.py": (
         "class ProviderAttempt",
@@ -172,6 +174,7 @@ SEMANTIC_CONTRACTS = {
         "provider prepared attempt has drifted or was claimed",
         "def _require_exact_persisted_attempt",
         "provider accepted evidence has drifted",
+        "provider attempt reservation intent is unavailable",
     ),
     "src/roundwright/codex_supervisor.py": (
         "roundwright-provider-attempt-accounting-material/v3",
@@ -207,6 +210,14 @@ SEMANTIC_CONTRACTS = {
         "``prepared`` is the successor admission",
         "dependency review dispatch scope is stopped",
     ),
+    "src/roundwright/dependency_review.py": (
+        "if task_identity is not None or dispatch_claim is not None",
+        "derived_identity = TaskIdentity(*durable_task)",
+    ),
+    "src/roundwright/state.py": (
+        "def _migrate_legacy_generic_supervisor_positions",
+        "legacy generic Supervisor position is unauthenticated",
+    ),
     "tests/test_failure_recovery.py": (
         "test_denial_blocks_same_scope_across_restart_until_exact_clearance",
     ),
@@ -216,6 +227,8 @@ SEMANTIC_CONTRACTS = {
         "test_durable_failure_readback_revalidates_current_admission_authority",
         "test_supervisor_coordinates_are_unique_and_strictly_monotonic",
         "test_durable_recovery_route_is_exact_single_use_and_restart_safe",
+        "test_cleared_scope_effect_reauthenticates_original_admission_and_session",
+        "test_schema67_generic_prepared_supervisor_replays_after_position_migration",
     ),
     "tests/test_codex_worker.py": (
         "test_typed_denial_and_transport_failure_remain_typed",
@@ -226,6 +239,8 @@ SEMANTIC_CONTRACTS = {
         "test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects",
         "test_recovery_route_fence_interruption_reconciles_before_successor_session",
         "test_prepared_dependency_retry_denial_is_inert_across_restart",
+        "test_default_acceptance_derives_production_task_and_rechecks_stopped_scope_after_restart",
+        "test_dependency_review_reservations_are_never_refundable_by_provider_release",
     ),
     "tests/test_codex_supervisor.py": (
         "test_native_corrections_cross_schema_parser_adapter_and_durable_lifecycle",
@@ -250,6 +265,7 @@ SEMANTIC_CONTRACTS = {
         "test_prepared_format_correction_reuses_exact_reservation_after_crash",
         "test_scope_stop_during_response_read_cannot_commit_accepted_review",
         "test_readiness_and_execution_share_complete_accepted_state_validation",
+        "test_process_death_after_correction_debit_before_prepare_recovers_exact_intent",
     ),
 }
 
@@ -610,6 +626,11 @@ SEMANTIC_TESTS = (
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_unused_correction_debit_is_recovered_when_preparation_fails",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_initial_prepared_reservation_resumes_after_crash_without_double_debit",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_prepared_fallback_readiness_rejects_route_identity_claim_and_reservation_drift",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_default_acceptance_derives_production_task_and_rechecks_stopped_scope_after_restart",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_dependency_review_reservations_are_never_refundable_by_provider_release",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_process_death_after_correction_debit_before_prepare_recovers_exact_intent",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_cleared_scope_effect_reauthenticates_original_admission_and_session",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_schema67_generic_prepared_supervisor_replays_after_position_migration",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 ISSUE_132_FINDING_REQUIREMENTS = {
@@ -708,6 +729,20 @@ ISSUE_132_E1R14_FINDING_REQUIREMENTS = {
     "E1R14-06": ("src/roundwright/provider_attempt_runtime.py", ISSUE_132_E1R14_TESTS[6]),
     "E1R14-07": ("src/roundwright/provider_attempt_runtime.py", ISSUE_132_E1R14_TESTS[8]),
 }
+ISSUE_132_E1R15_TESTS = (
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_default_acceptance_derives_production_task_and_rechecks_stopped_scope_after_restart",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_dependency_review_reservations_are_never_refundable_by_provider_release",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_process_death_after_correction_debit_before_prepare_recovers_exact_intent",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_cleared_scope_effect_reauthenticates_original_admission_and_session",
+    "tests.test_provider_recovery.ProviderRecoveryTests.test_schema67_generic_prepared_supervisor_replays_after_position_migration",
+)
+ISSUE_132_E1R15_FINDING_REQUIREMENTS = {
+    "E1R15-01": ("src/roundwright/dependency_review.py", ISSUE_132_E1R15_TESTS[0]),
+    "E1R15-02": ("src/roundwright/failure_recovery.py", ISSUE_132_E1R15_TESTS[1]),
+    "E1R15-03": ("src/roundwright/provider_attempt_runtime.py", ISSUE_132_E1R15_TESTS[2]),
+    "E1R15-04": ("src/roundwright/failure_recovery.py", ISSUE_132_E1R15_TESTS[3]),
+    "E1R15-05": ("src/roundwright/state.py", ISSUE_132_E1R15_TESTS[4]),
+}
 ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUIREMENTS.values()) + tuple(ISSUE_132_AFFECTED_MODULE_TESTS.values()) + (
     "tests.test_provider_recovery.ProviderRecoveryTests.test_terminal_block_and_invalid_output_replays_keep_their_original_classification",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch",
@@ -729,7 +764,7 @@ ISSUE_132_SEMANTIC_TESTS = tuple(test for _code, test in ISSUE_132_FINDING_REQUI
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_prepared_format_correction_reuses_exact_reservation_after_crash",
     "tests.test_codex_supervisor.SupervisorTests.test_one_logical_profile_allows_bounded_physical_corrections_and_replay",
     "tests.test_codex_supervisor.SupervisorTests.test_generic_sequence_rejects_profile_jump_before_correction_coordinates",
-) + ISSUE_132_E1R11_TESTS + ISSUE_132_E1R12_TESTS[1:3] + ISSUE_132_E1R13_TESTS + ISSUE_132_E1R14_TESTS[:3] + ISSUE_132_E1R14_TESTS[5:7] + ISSUE_132_E1R14_TESTS[8:]
+) + ISSUE_132_E1R11_TESTS + ISSUE_132_E1R12_TESTS[1:3] + ISSUE_132_E1R13_TESTS + ISSUE_132_E1R14_TESTS[:3] + ISSUE_132_E1R14_TESTS[5:7] + ISSUE_132_E1R14_TESTS[8:] + ISSUE_132_E1R15_TESTS
 def _validate_issue_132_semantic_tests() -> None:
     """Keep the independently maintained E1R2/E1R3 inventory closed and ordered."""
     if len(ISSUE_132_FINDING_REQUIREMENTS) != 8 or len(set(ISSUE_132_FINDING_REQUIREMENTS)) != 8:
@@ -774,6 +809,12 @@ def _validate_issue_132_semantic_tests() -> None:
         or any(not (ROOT / path).is_file() for path, _test in ISSUE_132_E1R14_FINDING_REQUIREMENTS.values())
         or any(test not in ISSUE_132_SEMANTIC_TESTS for test in ISSUE_132_E1R14_TESTS)):
         raise CoverageError("Issue 132 E1R14 finding mapping is incomplete")
+    if (set(ISSUE_132_E1R15_FINDING_REQUIREMENTS) != {
+            "E1R15-01", "E1R15-02", "E1R15-03", "E1R15-04", "E1R15-05"
+        } or len(ISSUE_132_E1R15_TESTS) != 5
+        or any(not (ROOT / path).is_file() for path, _test in ISSUE_132_E1R15_FINDING_REQUIREMENTS.values())
+        or any(test not in ISSUE_132_SEMANTIC_TESTS for test in ISSUE_132_E1R15_TESTS)):
+        raise CoverageError("Issue 132 E1R15 finding mapping is incomplete")
     if tuple(test for test in SEMANTIC_TESTS if test in ISSUE_132_SEMANTIC_TESTS) != ISSUE_132_SEMANTIC_TESTS:
         raise CoverageError("Issue 132 semantic test inventory is omitted, reordered, or drifted")
 

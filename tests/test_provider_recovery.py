@@ -42,7 +42,7 @@ from roundwright.provider_recovery import (
 from roundwright.review_lifecycle import ObjectiveState, ReviewLifecycleError, ReviewLifecycleStore, WorkerObjective, WorkerObjectiveResult, _owner_authority_digest
 from roundwright.provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
-from roundwright.failure_recovery import Clearance, ClearanceRevocation, DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding, FailureClass, FailureRole, _denial_authority_digest, abandon_durable_recovery_route_reservation, begin_durable_recovery_route_reservation, classify, commit_durable_recovery_route_successor_admission, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_recovery_route_authorization, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, release_durable_recovery_route_authorization, require_scope_open
+from roundwright.failure_recovery import Clearance, ClearanceRevocation, DurableRecoveryRouteAuthorization, EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, _denial_authority_digest, abandon_durable_recovery_route_reservation, admit_scope_effect_reservation, begin_durable_recovery_route_reservation, classify, commit_durable_recovery_route_successor_admission, consume_durable_recovery_route_authorization, issue_durable_recovery_route_authorization, read_durable_recovery_route_authorization, read_durable_failure, record_durable_clearance, record_durable_clearance_revocation, record_durable_failure, release_durable_recovery_route_authorization, require_scope_open
 
 
 class ProviderRecoveryTests(unittest.TestCase):
@@ -871,6 +871,62 @@ class ProviderRecoveryTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_schema67_generic_prepared_supervisor_replays_after_position_migration(self) -> None:
+        """A legacy generic attempt has an authentic profile position without a diff row."""
+
+        from roundwright.state import MIGRATIONS, _apply_migrations
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary)); initialize(repository)
+            lease = self.lease(repository); identity = self.identity("legacy-generic")
+            self.admit(repository, identity, lease)
+            context = self.context(identity, role=ProviderRole.SUPERVISOR)
+            profile = context.runtime_binding.supervisor_profile_identities[0]
+            expires_at = 2_000_000_000
+            expected = prepare_attempt(
+                repository, identity, context, attempt_id="legacy-generic-supervisor",
+                role=ProviderRole.SUPERVISOR, process_lease_id="legacy-generic-lease",
+                process_lease_expires_at=expires_at, input_fingerprint="a" * 64,
+                selected_profile_identity=profile, lease=lease,
+            )
+            path = database_path(repository)
+            legacy_path = path.with_name("legacy-schema-67.sqlite")
+            with closing(sqlite3.connect(legacy_path)) as connection, connection:
+                _apply_migrations(connection, MIGRATIONS[:67])
+                connection.execute("ATTACH DATABASE ? AS current", (str(path),))
+                tables = [row[0] for row in connection.execute(
+                    "SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                )]
+                for table in tables:
+                    if table == "schema_migrations":
+                        continue
+                    columns = [row[1] for row in connection.execute(
+                        f'PRAGMA main.table_info("{table}")'
+                    )]
+                    names = ",".join('"' + name + '"' for name in columns)
+                    connection.execute(f'DELETE FROM main."{table}"')
+                    connection.execute(
+                        f'INSERT INTO main."{table}" ({names}) '
+                        f'SELECT {names} FROM current."{table}"'
+                    )
+            legacy_path.replace(path)
+            self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+            migrated = read_attempt(
+                repository, identity, "legacy-generic-supervisor", context=context,
+            )
+            self.assertEqual(
+                (migrated.logical_profile_position, migrated.physical_format_output_ordinal),
+                (1, 0),
+            )
+            replay = prepare_attempt(
+                repository, identity, context, attempt_id="legacy-generic-supervisor",
+                role=ProviderRole.SUPERVISOR, process_lease_id="legacy-generic-lease",
+                process_lease_expires_at=expires_at, input_fingerprint="a" * 64,
+                selected_profile_identity=profile, lease=lease,
+            )
+            self.assertEqual(replay, migrated)
+            self.assertEqual(replay.state, expected.state)
+
     def test_durable_clearance_and_revocation_are_append_only_and_restart_verified(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = self.repository(Path(temporary)); initialize(repository)
@@ -945,6 +1001,60 @@ class ProviderRecoveryTests(unittest.TestCase):
             record_durable_clearance_revocation(repository, identity, exact)
             with self.assertRaises(Exception):
                 record_durable_clearance_revocation(repository, identity, exact)
+
+    def test_cleared_scope_effect_reauthenticates_original_admission_and_session(self) -> None:
+        """Evidence removed after clearance cannot authorize a successor debit."""
+
+        for table in ("provider_failure_admissions", "provider_session_checkpoints"):
+            with self.subTest(missing=table), tempfile.TemporaryDirectory() as temporary:
+                repository = self.repository(Path(temporary)); initialize(repository)
+                lease = self.lease(repository); identity = self.identity("clearance-loss-" + table)
+                self.admit(repository, identity, lease)
+                candidate = "c" * 40
+                self.seal_candidate(repository, identity, lease, candidate)
+                context = self.context(identity, candidate=candidate, role=ProviderRole.WORKER)
+                prepare_attempt(
+                    repository, identity, context, attempt_id="clearance-loss-attempt",
+                    role=ProviderRole.WORKER, process_lease_id="clearance-loss-lease",
+                    process_lease_expires_at=int(time.time()) + 10,
+                    input_fingerprint="a" * 64, lease=lease,
+                )
+                record_session_identity(
+                    repository, identity, context, attempt_id="clearance-loss-attempt",
+                    session_identity="clearance-loss-session", lease=lease,
+                )
+                binding = FailureBinding(
+                    candidate, "sha256:" + context.policy_fingerprint,
+                    context.runtime_binding.resolved_digest, "worker:" + identity.task_id,
+                    FailureRole.WORKER, context.runtime_binding.worker_profile_identity,
+                    "clearance-loss-session", "clearance-loss-attempt",
+                )
+                record = classify(
+                    binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST,
+                )
+                record_durable_failure(repository, identity, record)
+                self.denial_command(repository, identity, record, "clearance-loss-command", kind="clear")
+                record_durable_clearance(
+                    repository, identity,
+                    Clearance(record.digest, binding, "clearance-loss-command"),
+                )
+                called = []
+                self.assertEqual(admit_scope_effect_reservation(
+                    repository, identity, binding.authority_scope,
+                    lambda: called.append("reserved") or "reserved",
+                ), "reserved")
+                called.clear()
+                with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE attempt_id = ?",
+                        (binding.attempt_identity,),
+                    )
+                with self.assertRaisesRegex(FailureRecoveryError, "authority|admission"):
+                    admit_scope_effect_reservation(
+                        repository, identity, binding.authority_scope,
+                        lambda: called.append("reserved") or "reserved",
+                    )
+                self.assertEqual(called, [])
 
     def test_durable_routes_reject_legacy_and_unavailable_sources_before_any_effect(self) -> None:
         from roundwright.failure_recovery import EvidenceConfidence, FailureRecoveryError, _payload

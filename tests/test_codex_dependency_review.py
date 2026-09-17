@@ -30,14 +30,15 @@ from roundwright import external_validation
 from roundwright.configuration import ProviderProfile, ReasoningEffort, RepositoryIdentity
 from roundwright.dependency_review import (
     AffectedMember, AffectedSubset, Confidence, DependencyReviewBinding, EdgeDirection,
-    EdgeKind, ProposedEdge, RequestedDisposition, SourceOwnedRelation, DependencyReviewStore,
+    EdgeKind, ProposedEdge, RequestedDisposition, SourceOwnedRelation, DependencyProposal,
+    DependencyReviewStore,
 )
 from roundwright.git_identity import acquire_transition_lease
 from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
+from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect, trusted_provider_launch_context
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
 from roundwright.runtime_binding import RuntimeBinding
-from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, classify, read_durable_failure, record_durable_failure, read_durable_recovery_route_authorization, release_durable_recovery_route_authorization
+from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, classify, read_durable_failure, record_durable_failure, read_durable_recovery_route_authorization, release_durable_recovery_route_authorization, release_unused_provider_effect_reservation
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
 from tests.role_admission_fixture import independent_execution, sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
@@ -268,6 +269,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
     def test_fresh_no_tools_attempt_accepts_only_the_bound_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            self.bind_current_authority(repository, binding)
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116")))
             adapter = CodexDependencyReviewAdapter(backend, profile, audit)
             relations = (SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),)
@@ -774,6 +776,108 @@ class DependencyReviewServiceTests(unittest.TestCase):
                     **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
                 )
             self.assertEqual(len(backend.sessions), 1)
+
+    def test_default_acceptance_derives_production_task_and_rechecks_stopped_scope_after_restart(self) -> None:
+        """Omitting the optional identity cannot bypass a durable production stop."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, _profile, _audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="default-accept", binding=binding)
+            store.claim_pre_dispatch(
+                repository, attempt_id="default-accept",
+                task_identity=identity, binding=binding,
+            )
+            store.claim_session(
+                repository, attempt_id="default-accept", session_identity="default-session",
+                task_identity=identity, binding=binding,
+            )
+            store.claim_turn(
+                repository, attempt_id="default-accept",
+                session_identity="default-session", turn_identity="default-turn",
+            )
+            record_durable_failure(
+                repository, identity,
+                classify(FailureBinding(
+                    binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                    "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                    binding.profile_identity, "default-session", "default-accept",
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+            )
+            proposal = DependencyProposal.parse(self.proposal("default-accept"))
+            for restarted in (store, DependencyReviewStore()):
+                with self.assertRaisesRegex(FailureRecoveryError, "scope remains stopped"):
+                    restarted.accept_proposal(repository, proposal, binding=binding)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id='default-accept'"
+                ).fetchone(), ("prepared",))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM dependency_review_proposals WHERE attempt_id='default-accept'"
+                ).fetchone(), (0,))
+
+    def test_dependency_review_reservations_are_never_refundable_by_provider_release(self) -> None:
+        """Prepared, claimed, and accepted dependency effects stay outside the refund API."""
+
+        for terminal in ("prepared", "claimed", "accepted"):
+            with self.subTest(state=terminal), tempfile.TemporaryDirectory() as temporary:
+                repository, subset, binding, profile, audit = self.setup(Path(temporary))
+                identity = self.bind_current_authority(repository, binding)
+                adapter = CodexDependencyReviewAdapter(
+                    Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS)),
+                    profile, audit,
+                )
+                attempt_id = "release-" + terminal
+                effect = self.effect_kwargs(
+                    repository, subset, binding, adapter, attempt_id=attempt_id,
+                )
+                material = DependencyReviewStore().model_input(
+                    subset, attempt_id=attempt_id, profile_identity=binding.profile_identity,
+                )
+                request = DependencyReviewRequest(
+                    attempt_id, material,
+                    "sha256:" + hashlib.sha256(json.dumps(
+                        material, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                    ).encode("utf-8")).hexdigest(),
+                    binding.profile_identity,
+                )
+                request_material, preflight_material = adapter.effect_material(request)
+                reservation = reserve_role_effect(
+                    effect["advisory_execution"], host_inputs=effect["execution_host"],
+                    ledger_path=effect["budget_ledger_path"], profile=adapter._profile,
+                    request_or_attempt_identity=attempt_id,
+                    request_material=request_material, preflight_material=preflight_material,
+                )
+                store = DependencyReviewStore()
+                store.start_attempt(repository, subset, attempt_id=attempt_id, binding=binding)
+                if terminal in {"claimed", "accepted"}:
+                    store.claim_pre_dispatch(
+                        repository, attempt_id=attempt_id,
+                        task_identity=identity, binding=binding,
+                    )
+                if terminal == "accepted":
+                    store.claim_session(
+                        repository, attempt_id=attempt_id, session_identity="release-session",
+                        task_identity=identity, binding=binding,
+                    )
+                    store.claim_turn(
+                        repository, attempt_id=attempt_id,
+                        session_identity="release-session", turn_identity="release-turn",
+                    )
+                    store.accept_proposal(
+                        repository, DependencyProposal.parse(self.proposal(attempt_id)),
+                        binding=binding,
+                    )
+                with self.assertRaisesRegex(FailureRecoveryError, "reservation has drifted"):
+                    release_unused_provider_effect_reservation(
+                        repository, identity, "dependency-review:" + identity.task_id,
+                        attempt_id=attempt_id, effect_reservation=reservation,
+                    )
+                with closing(sqlite3.connect(effect["budget_ledger_path"])) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), [(1, 60, 4000)])
 
     def test_digit_leading_native_ids_persist_the_exact_durable_turn_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

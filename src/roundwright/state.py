@@ -988,6 +988,13 @@ MIGRATIONS = (
         ("CREATE TABLE diff_review_digest_versions (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), digest_version INTEGER NOT NULL CHECK(digest_version IN (1, 2)))",),
         (("diff_review_digest_versions", "CREATE TABLE diff_review_digest_versions (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), digest_version INTEGER NOT NULL CHECK(digest_version IN (1, 2)))"),),
     ),
+    Migration(
+        81,
+        (
+            "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'supervisor'), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), UNIQUE(task_id, reservation_digest))",
+        ),
+        (("provider_effect_reservation_intents", "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'supervisor'), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), UNIQUE(task_id, reservation_digest))"),),
+    ),
 )
 
 
@@ -1752,6 +1759,8 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 _migrate_supervisor_attempt_coordinates(connection)
             if migration.version == 80:
                 _migrate_diff_review_digest_versions(connection)
+            if migration.version == 81:
+                _migrate_legacy_generic_supervisor_positions(connection)
             connection.execute(
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
@@ -1822,6 +1831,66 @@ def _migrate_diff_review_digest_versions(connection: sqlite3.Connection) -> None
         if len(versions) != 1:
             raise StateError("legacy diff review identity is unauthenticated or ambiguous")
         connection.execute("INSERT INTO diff_review_digest_versions VALUES (?, ?)", (review_id, versions[0]))
+
+
+def _migrate_legacy_generic_supervisor_positions(connection: sqlite3.Connection) -> None:
+    """Recover only uniquely authenticated pre-coordinate Supervisor positions.
+
+    Schema-67 generic prepared attempts have no diff-review row, so v71 could
+    not copy their historical ``within_round_attempt`` value.  Their selected
+    profile and immutable attempt/runtime contexts still identify one exact
+    configured position.  Preserve replay by backfilling that position while
+    rejecting incomplete, duplicated, or drifted authority instead of
+    inventing a coordinate.
+    """
+
+    rows = connection.execute(
+        "SELECT attempts.attempt_id, attempts.task_id, attempts.selected_profile_identity, "
+        "contexts.task_id, contexts.configuration_schema_version, contexts.configuration_digest, "
+        "contexts.worker_profile_identity, contexts.supervisor_profile_identities, "
+        "runtime.schema_version, runtime.resolved_digest, runtime.worker_profile_identity, "
+        "runtime.supervisor_profile_identities "
+        "FROM provider_attempts AS attempts "
+        "LEFT JOIN provider_attempt_contexts AS contexts ON contexts.attempt_id = attempts.attempt_id "
+        "LEFT JOIN runtime_configuration_bindings AS runtime ON runtime.task_id = attempts.task_id "
+        "LEFT JOIN diff_review_attempts AS reviews ON reviews.provider_attempt_id = attempts.attempt_id "
+        "WHERE attempts.provider_role = 'supervisor' AND attempts.state = 'prepared' "
+        "AND attempts.logical_profile_position = 0 "
+        "AND attempts.physical_format_output_ordinal = 0 "
+        "AND reviews.provider_attempt_id IS NULL "
+        "ORDER BY attempts.task_id, attempts.attempt_number, attempts.attempt_id"
+    ).fetchall()
+    for row in rows:
+        (
+            attempt_id, task_id, selected_profile, context_task, context_schema,
+            context_digest, context_worker, context_supervisors, runtime_schema,
+            runtime_digest, runtime_worker, runtime_supervisors,
+        ) = row
+        try:
+            context_profiles = tuple(json.loads(context_supervisors))
+            runtime_profiles = tuple(json.loads(runtime_supervisors))
+        except (TypeError, json.JSONDecodeError):
+            raise StateError("legacy generic Supervisor position is unauthenticated") from None
+        if (
+            context_task != task_id
+            or context_schema != "roundwright-runtime/v1"
+            or runtime_schema != "roundwright-runtime/v1"
+            or context_digest != runtime_digest
+            or context_worker != runtime_worker
+            or context_profiles != runtime_profiles
+            or not isinstance(selected_profile, str)
+            or context_profiles.count(selected_profile) != 1
+        ):
+            raise StateError("legacy generic Supervisor position is unauthenticated")
+        logical_position = context_profiles.index(selected_profile) + 1
+        if connection.execute(
+            "UPDATE provider_attempts SET logical_profile_position = ? "
+            "WHERE attempt_id = ? AND task_id = ? AND provider_role = 'supervisor' "
+            "AND state = 'prepared' AND logical_profile_position = 0 "
+            "AND physical_format_output_ordinal = 0",
+            (logical_position, attempt_id, task_id),
+        ).rowcount != 1:
+            raise StateError("legacy generic Supervisor position is unavailable")
 
 
 def _migrate_supervisor_attempt_coordinates(connection: sqlite3.Connection) -> None:

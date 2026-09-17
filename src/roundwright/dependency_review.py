@@ -519,11 +519,25 @@ class DependencyReviewStore:
         try:
             connection.execute("BEGIN IMMEDIATE")
             attempt, subset = self._read_attempt(connection, proposal.attempt_id)
-            if task_identity is not None:
-                self._require_current_authority(connection, task_identity, subset, binding)
+            dispatch_claim = connection.execute(
+                "SELECT state FROM dependency_review_dispatch_claims WHERE attempt_id = ?",
+                (proposal.attempt_id,),
+            ).fetchone()
+            if task_identity is not None or dispatch_claim is not None:
+                durable_task = connection.execute(
+                    "SELECT task_id, source_id, repository_id, branch, worktree, base_sha "
+                    "FROM tasks WHERE task_id = ?",
+                    (attempt[0],),
+                ).fetchone()
+                if durable_task is None:
+                    raise DependencyReviewError("dependency review task authority is unavailable")
+                derived_identity = TaskIdentity(*durable_task)
+                if task_identity is not None and task_identity != derived_identity:
+                    raise DependencyReviewError("dependency review task authority has drifted")
+                self._require_current_authority(connection, derived_identity, subset, binding)
                 require_scope_open(
-                    connection, task_identity.task_id,
-                    "dependency-review:" + task_identity.task_id,
+                    connection, derived_identity.task_id,
+                    "dependency-review:" + derived_identity.task_id,
                 )
             if attempt[6] not in {"prepared", "accepted"} or (attempt[2], attempt[3]) != (binding.profile_identity, binding.configuration_digest):
                 raise DependencyReviewError("dependency review attempt is not available")

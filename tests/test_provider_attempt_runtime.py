@@ -729,6 +729,86 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
                 self.assertEqual(connection.execute("SELECT calls, duration_seconds, tokens FROM role_budget_usage").fetchall(), before)
 
+    def test_process_death_after_correction_debit_before_prepare_recovers_exact_intent(self) -> None:
+        """A real interruption boundary neither strands nor repeats the correction debit."""
+
+        class ProcessDeath(BaseException):
+            pass
+
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(
+                    SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE,
+                ),
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(
+                replace(runner, sequence=(first,)).execute(),
+                (first.selection.provider_attempt_id,),
+            )
+            selection = replace(
+                runner.selection, diff_review_attempt_id="intent-review",
+                provider_attempt_id="intent-provider", message_identity="intent-message",
+                process_lease_id="intent-lease", physical_format_output_ordinal=1,
+            )
+            backend = Backend(
+                "intent-correction",
+                NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                ), [],
+            )
+            correction = self.sequence_entry(runner, selection=selection, backend=backend)
+            restarted = replace(runner, sequence=(first, correction))
+            original = provider_attempt_runtime.prepare_attempt
+
+            def die_before_prepare(*args, **kwargs):
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    raise ProcessDeath
+                return original(*args, **kwargs)
+
+            with patch.object(
+                provider_attempt_runtime, "prepare_attempt", side_effect=die_before_prepare,
+            ), self.assertRaises(ProcessDeath):
+                restarted.execute()
+            self.assertEqual(backend.calls, 0)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM provider_attempts WHERE attempt_id = ?",
+                    (selection.provider_attempt_id,),
+                ).fetchone())
+                self.assertEqual(connection.execute(
+                    "SELECT task_id, authority_scope, provider_role, state "
+                    "FROM provider_effect_reservation_intents WHERE attempt_id = ?",
+                    (selection.provider_attempt_id,),
+                ).fetchone(), (
+                    identity.task_id, "supervisor:" + identity.task_id,
+                    "supervisor", "reserving",
+                ))
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                before = connection.execute(
+                    "SELECT ledger_key, calls, duration_seconds, tokens "
+                    "FROM role_budget_usage ORDER BY ledger_key"
+                ).fetchall()
+            self.assertEqual(len(before), 2)
+            self.assertEqual(restarted.execute(), (
+                first.selection.provider_attempt_id, selection.provider_attempt_id,
+            ))
+            self.assertEqual(backend.calls, 1)
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT ledger_key, calls, duration_seconds, tokens "
+                    "FROM role_budget_usage ORDER BY ledger_key"
+                ).fetchall(), before)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM provider_effect_reservation_intents WHERE attempt_id = ?",
+                    (selection.provider_attempt_id,),
+                ).fetchone())
+            self.assertEqual(read_attempt(
+                repository, identity, selection.provider_attempt_id, context=recovery,
+            ).state, AttemptState.ACCEPTED)
+
     def test_unused_correction_debit_is_recovered_when_preparation_fails(self) -> None:
         """No attempt, claim, or call means the scoped debit is recoverable."""
 

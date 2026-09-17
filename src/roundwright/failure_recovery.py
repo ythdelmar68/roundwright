@@ -1377,6 +1377,15 @@ def require_scope_open(connection, task_id: str, scope: str) -> None:
         _require_failure_compatibility(record)
         if record.action is not RecoveryAction.STOP_SCOPE or record.binding.authority_scope != scope:
             continue
+        task = connection.execute(
+            "SELECT task_id, source_id, repository_id, branch, worktree, base_sha "
+            "FROM tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise FailureRecoveryError("failure scope task authority is unavailable")
+        from .state import TaskIdentity
+        _require_attempt_admission(connection, TaskIdentity(*task), record.binding)
         history = _decision_history(connection, task_id, digest, record.binding)
         if not history or history[-1][1]["kind"] != "clear":
             raise FailureRecoveryError("failure scope remains stopped")
@@ -1439,6 +1448,115 @@ def admit_scope_effect_reservation(
         connection.close()
 
 
+def begin_provider_effect_reservation_intent(
+    repository, identity, scope: str, *, attempt_id: str,
+    reservation_digest: str,
+) -> bool:
+    """Persist an exact non-route Supervisor debit intent before budget I/O.
+
+    ``True`` means the caller created the intent and may reserve the budget.
+    ``False`` means a prior process already created this exact intent, so the
+    caller must recover the matching budget row before doing anything else.
+    """
+
+    from .state import _open_writable_connection, _require_matching_task
+    if (
+        not isinstance(scope, str)
+        or scope != "supervisor:" + identity.task_id
+        or not isinstance(attempt_id, str) or not attempt_id
+        or not _DIGEST.fullmatch(reservation_digest)
+    ):
+        raise FailureRecoveryError("provider effect reservation intent is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        require_scope_open(connection, identity.task_id, scope)
+        if connection.execute(
+            "SELECT 1 FROM provider_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone() is not None:
+            raise FailureRecoveryError("provider effect reservation already has a successor")
+        expected = (
+            identity.task_id, identity.repository_id, scope, "supervisor",
+            reservation_digest, "reserving",
+        )
+        row = connection.execute(
+            "SELECT task_id, repository_id, authority_scope, provider_role, "
+            "reservation_digest, state FROM provider_effect_reservation_intents "
+            "WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO provider_effect_reservation_intents("
+                "attempt_id, task_id, repository_id, authority_scope, provider_role, "
+                "reservation_digest, state) VALUES (?, ?, ?, ?, 'supervisor', ?, 'reserving')",
+                (attempt_id, identity.task_id, identity.repository_id, scope, reservation_digest),
+            )
+            connection.commit()
+            return True
+        if row != expected:
+            raise FailureRecoveryError("provider effect reservation intent has drifted")
+        connection.commit()
+        return False
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def commit_provider_effect_reservation_intent(
+    repository, identity, scope: str, *, attempt_id: str,
+    reservation_digest: str,
+) -> None:
+    """Retire one debit intent after its durable Supervisor attempt exists."""
+
+    from .state import _open_writable_connection, _require_matching_task
+    if (
+        not isinstance(scope, str)
+        or scope != "supervisor:" + identity.task_id
+        or not isinstance(attempt_id, str) or not attempt_id
+        or not _DIGEST.fullmatch(reservation_digest)
+    ):
+        raise FailureRecoveryError("provider effect reservation commit is invalid")
+    connection = _open_writable_connection(repository)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _require_matching_task(connection, identity)
+        successor = connection.execute(
+            "SELECT task_id, provider_role, state FROM provider_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if successor != (identity.task_id, "supervisor", "prepared"):
+            raise FailureRecoveryError("provider effect reservation successor has drifted")
+        expected = (
+            identity.task_id, identity.repository_id, scope, "supervisor",
+            reservation_digest,
+        )
+        row = connection.execute(
+            "SELECT task_id, repository_id, authority_scope, provider_role, reservation_digest, state "
+            "FROM provider_effect_reservation_intents WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row == (*expected, "reserving"):
+            if connection.execute(
+                "DELETE FROM provider_effect_reservation_intents "
+                "WHERE attempt_id = ? AND state = 'reserving'",
+                (attempt_id,),
+            ).rowcount != 1:
+                raise FailureRecoveryError("provider effect reservation commit is unavailable")
+        elif row is not None:
+            raise FailureRecoveryError("provider effect reservation commit has drifted")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def release_unused_provider_effect_reservation(
     repository, identity, scope: str, *, attempt_id: str,
     effect_reservation: object,
@@ -1463,13 +1581,24 @@ def release_unused_provider_effect_reservation(
     binding = getattr(effect_reservation, "_binding", None)
     request_identity = getattr(effect_reservation, "_request_identity", None)
     expected_scope = None if binding is None else binding.role.value + ":" + identity.task_id
-    if (binding is None or binding.role not in {AdvisoryRole.SUPERVISOR, AdvisoryRole.DEPENDENCY_REVIEW}
+    if (binding is None or binding.role is not AdvisoryRole.SUPERVISOR
             or request_identity != attempt_id or scope != expected_scope):
         raise FailureRecoveryError("unused provider reservation has drifted")
     connection = _open_writable_connection(repository)
     try:
         connection.execute("BEGIN IMMEDIATE")
         _require_matching_task(connection, identity)
+        intent = connection.execute(
+            "SELECT task_id, repository_id, authority_scope, provider_role, reservation_digest, state "
+            "FROM provider_effect_reservation_intents WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        expected_intent = (
+            identity.task_id, identity.repository_id, scope, "supervisor",
+            effect_reservation.recovery_digest, "reserving",
+        )
+        if intent != expected_intent:
+            raise FailureRecoveryError("unused provider reservation intent has drifted")
         occupied = any(connection.execute(statement, (attempt_id,)).fetchone() is not None for statement in (
             "SELECT 1 FROM provider_attempts WHERE attempt_id=?",
             "SELECT 1 FROM provider_dispatch_claims WHERE attempt_id=?",
@@ -1483,6 +1612,12 @@ def release_unused_provider_effect_reservation(
             effect_reservation,
             reservation_digest=effect_reservation.recovery_digest,
         )
+        if connection.execute(
+            "DELETE FROM provider_effect_reservation_intents "
+            "WHERE attempt_id = ? AND state = 'reserving'",
+            (attempt_id,),
+        ).rowcount != 1:
+            raise FailureRecoveryError("unused provider reservation intent is unavailable")
         connection.commit()
     except Exception:
         connection.rollback()

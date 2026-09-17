@@ -31,7 +31,7 @@ from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
 from .failure_recovery import (
-    EvidenceSource, FailureBinding, FailureClass, FailureRole,
+    EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError,
     RecoveryAction as FailureRecoveryAction, classify,
     abandon_durable_recovery_route_reservation,
     begin_durable_recovery_route_reservation,
@@ -39,7 +39,8 @@ from .failure_recovery import (
     issue_durable_recovery_route_authorization,
     native_failure_class, parse_failure_record, read_durable_failure,
     admit_scope_effect_reservation, release_unused_provider_effect_reservation,
-    require_scope_effect_admission,
+    begin_provider_effect_reservation_intent,
+    commit_provider_effect_reservation_intent, require_scope_effect_admission,
 )
 from .provider_health import CodexFailure
 from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, recovery_reservation_digest, recover_role_effect_reservation, reserve_role_effect, trusted_provider_launch_context
@@ -1216,11 +1217,47 @@ class DurableDiffReviewRunner:
             except Exception as error:
                 raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
         reservation = None
+        reservation_intent_digest = None
+        reservation_intent_created = False
+        if recovery_route is None:
+            try:
+                reservation_intent_digest = recovery_reservation_digest(
+                    entry.advisory_execution, host_inputs=entry.execution_host,
+                    profile=audit.profile,
+                    request_or_attempt_identity=selection.provider_attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                )
+                if not existing_prepared:
+                    reservation_intent_created = begin_provider_effect_reservation_intent(
+                        self.repository, self.identity,
+                        "supervisor:" + self.identity.task_id,
+                        attempt_id=selection.provider_attempt_id,
+                        reservation_digest=reservation_intent_digest,
+                    )
+            except (FailureRecoveryError, RoleCapabilityError) as error:
+                raise ProviderAttemptRuntimeError(
+                    "provider attempt reservation intent is unavailable"
+                ) from error
         try:
             # The durable route fence is written before the separate budget
             # file.  Restart sees and reconciles that fence before it can
             # create another reservation.
             def reserve_exact_effect():
+                if reservation_intent_digest is not None and not reservation_intent_created:
+                    try:
+                        return recover_role_effect_reservation(
+                            entry.advisory_execution, host_inputs=entry.execution_host,
+                            ledger_path=self.budget_ledger_path, profile=audit.profile,
+                            request_or_attempt_identity=selection.provider_attempt_id,
+                            request_material=request_material,
+                            preflight_material=preflight_material,
+                        )
+                    except RoleCapabilityError:
+                        # The process may have stopped after persisting the
+                        # intent but before the separate budget transaction.
+                        # Only the exact intent may authorize the first debit.
+                        pass
                 return reserve_role_effect(
                     entry.advisory_execution, host_inputs=entry.execution_host,
                     ledger_path=self.budget_ledger_path, profile=audit.profile,
@@ -1241,6 +1278,8 @@ class DurableDiffReviewRunner:
                 if reservation.recovery_digest != reservation_digest:
                     raise ProviderAttemptRuntimeError("provider terminal recovery reservation has drifted")
                 reservation.require_recovery_route(entry.advisory_execution)
+            elif reservation.recovery_digest != reservation_intent_digest:
+                raise ProviderAttemptRuntimeError("provider attempt reservation intent has drifted")
         except (RoleCapabilityError, ProviderAttemptRuntimeError) as error:
             if recovery_route is not None and route_reserved:
                 try:
@@ -1288,6 +1327,18 @@ class DurableDiffReviewRunner:
             raise
         if prepared.state is not AttemptState.PREPARED:
             raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
+        if reservation_intent_digest is not None:
+            try:
+                commit_provider_effect_reservation_intent(
+                    self.repository, self.identity,
+                    "supervisor:" + self.identity.task_id,
+                    attempt_id=selection.provider_attempt_id,
+                    reservation_digest=reservation_intent_digest,
+                )
+            except FailureRecoveryError as error:
+                raise ProviderAttemptRuntimeError(
+                    "provider attempt reservation intent commit failed"
+                ) from error
         def accounting_snapshot():
             entries = self.validate_sequence()
             prior = tuple((item.selection.provider_attempt_id, item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal, item.audit.profile_identity) for item in entries if (item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) < (selection.resolved_logical_profile_position, selection.physical_format_output_ordinal))

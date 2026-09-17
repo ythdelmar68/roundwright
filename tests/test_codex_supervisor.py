@@ -410,13 +410,25 @@ class SupervisorTests(unittest.TestCase):
             nonlocal stopped
             stopped = True
 
-        with self.assertRaisesRegex(CodexSupervisorError, "scope admission"):
-            self.dispatch_ordered(
-                (self.request(1, adapter),), (adapter,),
-                checkpoint_session=checkpoint,
-                checkpoint_turn=lambda _session, _turn: None,
-                scope_admission=scope,
-            )
+        dispatched = self.dispatch_ordered(
+            (self.request(1, adapter),), (adapter,),
+            checkpoint_session=checkpoint,
+            checkpoint_turn=lambda _session, _turn: None,
+            scope_admission=scope,
+        )
+        self.assertEqual(
+            (
+                dispatched.result.kind, dispatched.result.outcome_source,
+                dispatched.result.failure, dispatched.result.session_identity,
+                dispatched.result.turn_identity,
+            ),
+            (
+                SupervisorResultKind.BLOCKED,
+                SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED,
+                CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+                "session-scope-fence", None,
+            ),
+        )
         self.assertEqual(adapter._backend.calls, 1)
         self.assertEqual([event for event in events if event[0] in {"start", "read"}], [])
 
@@ -928,8 +940,23 @@ class SupervisorTests(unittest.TestCase):
                 self.context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright",
                 "codex/supervisor-sequence", "C:/private/supervisor-sequence", self.context.base_sha,
             )
-            with self.assertRaisesRegex(CodexSupervisorError, "scope admission"):
-                run()
+            qualification = run()
+            self.assertEqual(
+                (
+                    qualification.failover.result.kind,
+                    qualification.failover.result.outcome_source,
+                    qualification.failover.result.failure,
+                    qualification.failover.result.session_identity,
+                    qualification.failover.result.turn_identity,
+                    qualification.receipt,
+                ),
+                (
+                    SupervisorResultKind.BLOCKED,
+                    SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED,
+                    CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+                    "session-1", None, None,
+                ),
+            )
             self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 0, 0))
             self.assertFalse(any(event[0] == "read" for event in self.events))
             with closing(sqlite3.connect(database_path(repository))) as connection:

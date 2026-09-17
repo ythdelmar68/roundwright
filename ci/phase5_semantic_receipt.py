@@ -78,6 +78,12 @@ TESTS = (
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_process_death_after_correction_debit_before_prepare_recovers_exact_intent",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_cleared_scope_effect_reauthenticates_original_admission_and_session",
     "tests.test_provider_recovery.ProviderRecoveryTests.test_schema67_generic_prepared_supervisor_replays_after_position_migration",
+    "tests.test_dependency_review.DependencyReviewTests.test_acceptance_requires_complete_dispatch_identity_evidence",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_unused_correction_refund_rejects_foreign_reservation_owner",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_service_derives_durable_task_identity_and_rejects_missing_authority_before_dispatch",
+    "tests.test_codex_dependency_review.DependencyReviewServiceTests.test_pre_session_typed_denial_records_dispatch_bound_stop",
+    "tests.test_production_coding_runtime.ProductionRuntimeTests.test_pre_session_worker_denial_is_typed_durable_and_stops_restart",
+    "tests.test_codex_supervisor.SupervisorTests.test_pre_session_native_denial_persists_typed_scope_stop_without_turn",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

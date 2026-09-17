@@ -309,3 +309,23 @@ independently ordered semantic regression.
 All five E1R15 tests are appended to the independent Issue #132 semantic
 inventory. Windows declares no E1R15 skip; render and verify require the exact
 candidate-bound execution receipt.
+
+## E1R16 dispatch identity, denial, and reservation closure
+
+E1R16 closes the remaining boundaries where an operation could be accepted,
+refunded, or restarted without the complete identity that originally admitted
+its effect.
+
+| Finding | Durable invariant and semantic evidence |
+| --- | --- |
+| E1R16-01 | Dependency proposal acceptance requires a durable task plus a dispatch claim containing both the native session and turn in `turn-dispatched` state. It always rechecks current candidate/runtime authority and the open scope. `test_acceptance_requires_complete_dispatch_identity_evidence` rejects missing and session-only claims before accepting the complete claim. |
+| E1R16-02 | Migration 82 binds each non-route reservation intent to the exact sealed budget repository and task identities. The unused-refund transaction compares both identities before touching the budget ledger or deleting the intent. `test_unused_correction_refund_rejects_foreign_reservation_owner` substitutes a foreign repository owner and proves the completed debit and intent remain intact. |
+| E1R16-03 | The dependency service derives its production `TaskIdentity` from the durable task row before model input, reservation, or dispatch, and rejects missing or caller-substituted authority. `test_service_derives_durable_task_identity_and_rejects_missing_authority_before_dispatch` proves zero provider and budget effects. |
+| E1R16-04 | Worker, Supervisor, and dependency-review claims persist a domain-separated pre-dispatch session surrogate before native construction. A typed SDK denial can therefore retain its classification, record a durable scope stop, and block restart even when no turn identity exists. The three pre-session semantic regressions exercise each role end to end. |
+| E1R16-05 | Clearance successor admission now authenticates the session checkpoint fingerprint against the original before-dispatch checkpoint, in addition to task, attempt, session, candidate, policy, configuration, and runtime bindings. The extended `test_cleared_scope_effect_reauthenticates_original_admission_and_session` rejects a substituted checkpoint fingerprint with no reservation callback. |
+| E1R16-06 | Generic Supervisor qualification persists an exact initial reservation intent before the separate budget debit, recovers that debit after process death, and retires the intent atomically with its dispatch claim. The extended crash-boundary regression proves one initial debit, no pre-claim provider call, and exact restart recovery. |
+
+The six new E1R16 tests are appended to the ordered semantic inventory; the
+two extended admission/crash tests retain their existing positions. Windows
+declares no E1R16 skip, and coverage render/verify requires their exact
+candidate-bound execution receipt.

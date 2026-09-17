@@ -1090,6 +1090,53 @@ class SupervisorTests(unittest.TestCase):
             checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
         )
 
+    def test_qualification_acceptance_authenticates_complete_current_provider_binding(self):
+        """Response-time identity deletion or substitution cannot seal PASS."""
+
+        mutations = {
+            "turn": (
+                "UPDATE provider_attempts SET external_turn_identity='substituted-turn' "
+                "WHERE attempt_id=?"
+            ),
+            "dispatch-claim": "DELETE FROM provider_dispatch_claims WHERE attempt_id=?",
+            "session-checkpoint": "DELETE FROM provider_session_checkpoints WHERE attempt_id=?",
+            "candidate-seal": "DELETE FROM candidate_seals WHERE task_id=?",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(binding=name):
+                adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+                    NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+                ))
+                original = Turn.read_response
+
+                def exercise(run, repository, _budget):
+                    def mutate_after_read(turn):
+                        response = original(turn)
+                        parameter = self.context.task_id if name == "candidate-seal" else requests[0].provider_attempt_id
+                        with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                            connection.execute(statement, (parameter,))
+                        return response
+
+                    with patch.object(Turn, "read_response", mutate_after_read), self.assertRaisesRegex(
+                        SupervisorShadowError, "lifecycle acceptance is denied",
+                    ):
+                        run()
+                    record_identity = next(iter(lifecycle._records))
+                    progress = lifecycle.read_progress(record_identity, evidence_time=101)
+                    self.assertEqual((progress[2], progress[4]), ((), None))
+                    self.assertEqual(recorder.calls, ["prepare"])
+
+                qualify_supervisor_sequence(
+                    adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+                    evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+                    trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+                    review_authority_expectation=self.authority_expectation,
+                    review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+                    checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+                )
+
     def test_denial_before_correction_reservation_leaves_no_budget_or_successor(self):
         """Scope admission and the correction debit share one lock order."""
 

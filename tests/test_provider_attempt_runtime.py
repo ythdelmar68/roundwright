@@ -776,6 +776,55 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_restarted_format_correction_authenticates_complete_predecessor_before_debit(self) -> None:
+        """A durable INVALID row is not authority without its complete source chain."""
+
+        mutations = {
+            "dispatch-claim": "DELETE FROM provider_dispatch_claims WHERE attempt_id=?",
+            "session-checkpoint": "DELETE FROM provider_session_checkpoints WHERE attempt_id=?",
+            "failure-admission": "DELETE FROM provider_failure_admissions WHERE attempt_id=?",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(binding=name), TemporaryDirectory() as temporary:
+                runner, _, repository, _identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                    suffix="correction-auth-" + name,
+                )
+                first = self.sequence_entry(runner)
+                self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+                successor = replace(
+                    runner.selection, diff_review_attempt_id="correction-auth-review",
+                    provider_attempt_id="correction-auth-provider",
+                    message_identity="correction-auth-message",
+                    process_lease_id="correction-auth-lease",
+                    physical_format_output_ordinal=1,
+                )
+                backend = Backend(
+                    "correction-auth-successor",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    [],
+                )
+                restarted = replace(runner, sequence=(
+                    first,
+                    self.sequence_entry(runner, selection=successor, recovery=recovery, backend=backend),
+                ))
+                with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                    connection.execute(statement, (runner.selection.provider_attempt_id,))
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                    before = connection.execute("SELECT COUNT(*) FROM role_budget_usage").fetchone()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.execute()
+                self.assertEqual(backend.calls, 0)
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM role_budget_usage").fetchone(), before)
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT 1 FROM provider_attempts WHERE attempt_id=?", (successor.provider_attempt_id,),
+                    ).fetchone())
+
     def test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, backend, repository, identity, recovery, _ = self.durable_runner(Path(temporary) / "repository", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE))
@@ -1539,6 +1588,92 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertIsNone(MaterializedProviderAttemptContext(descriptor, resources).snapshot(
                 (runner.selection.provider_attempt_id,),
             )["event_graph"])
+
+    def test_provider_outage_before_session_or_turn_checkpoint_is_durable_and_falls_back_after_restart(self) -> None:
+        """Typed pre-checkpoint outages retain classification and the pre-bound route."""
+
+        for stage in ("open-session", "start-turn"):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    suffix="outage-" + stage,
+                )
+
+                class OutageSession:
+                    def identity(self):
+                        return "session-provider-outage"
+                    def close(self):
+                        return None
+                    def start_turn(self, _request):
+                        raise CodexAdapterError(CodexFailure.PROVIDER_OUTAGE)
+
+                class OutageBackend:
+                    def __init__(self):
+                        self.calls = 0
+                    def open_fresh_session(self, _profile):
+                        self.calls += 1
+                        if stage == "open-session":
+                            raise CodexAdapterError(CodexFailure.PROVIDER_OUTAGE)
+                        return OutageSession()
+
+                outage = OutageBackend()
+                first = self.sequence_entry(runner, backend=outage)
+                first_only = replace(runner, backend=outage, sequence=(first,))
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "no pre-bound fallback"):
+                    first_only.execute()
+                stored = read_attempt(
+                    repository, identity, runner.selection.provider_attempt_id, context=recovery,
+                )
+                self.assertEqual(
+                    (stored.state, stored.session_identity, stored.external_turn_identity),
+                    (AttemptState.INVALIDATED, None if stage == "open-session" else "session-provider-outage", None),
+                )
+                terminal = read_supervisor_terminal_failure(repository, identity, stored.attempt_id)
+                self.assertEqual(
+                    terminal,
+                    SupervisorTerminalFailure(
+                        SupervisorTerminalFailureClass.PROVIDER_OUTAGE,
+                        SupervisorTerminalFailureSource.SDK_TURN_FAILED,
+                        SupervisorTerminalFailureSdkCategory.CONNECTION,
+                    ),
+                )
+                second_recovery = provider_context(
+                    recovery, identity, ProviderRole.SUPERVISOR,
+                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+                )
+                fallback = Backend(
+                    "provider-outage-fallback",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    [],
+                )
+                second_selection = DiffReviewSelection(
+                    "provider-outage-review-two", runner.selection.implementation_attempt_id,
+                    "provider-outage-attempt-two", "provider-outage-message-two",
+                    "provider-outage-lease-two", runner.selection.process_lease_expires_at,
+                    "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                )
+                restarted = replace(runner, backend=outage, sequence=(
+                    first,
+                    self.sequence_entry(
+                        runner, selection=second_selection, recovery=second_recovery,
+                        audit=second_recovery.health_receipt.audit_identity, backend=fallback,
+                    ),
+                ))
+                self.assertEqual(
+                    restarted.execute(),
+                    (runner.selection.provider_attempt_id, second_selection.provider_attempt_id),
+                )
+                self.assertEqual((outage.calls, fallback.calls), (1, 1))
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    payload = json.loads(connection.execute(
+                        "SELECT record_json FROM failure_recovery_records WHERE task_id=?",
+                        (identity.task_id,),
+                    ).fetchone()[0])
+                    self.assertEqual(
+                        (payload["failure"], payload["evidence"], payload["action"]),
+                        ("transient-service", "verified-service", "prebound-fallback"),
+                    )
 
     def test_accounting_terminal_blocker_is_durable_and_never_fails_over(self) -> None:
         with TemporaryDirectory() as temporary:

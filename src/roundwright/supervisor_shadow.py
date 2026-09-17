@@ -92,6 +92,94 @@ def _require_durable_sequence_admission(repository: RepositoryIdentity, identity
         connection.close()
 
 
+def _require_accepted_result_binding(
+    connection: sqlite3.Connection, identity: TaskIdentity,
+    request: CodexSupervisorRequest, result: CodexSupervisorResult,
+) -> None:
+    """Authenticate the complete current provider binding before PASS can seal."""
+
+    if result.session_identity is None or result.turn_identity is None:
+        raise SupervisorShadowError("Supervisor accepted result identity is incomplete")
+    attempt = connection.execute(
+        "SELECT task_id, provider_role, state, session_identity, external_turn_identity, "
+        "input_fingerprint, selected_profile_identity, logical_profile_position, "
+        "physical_format_output_ordinal FROM provider_attempts WHERE attempt_id=?",
+        (request.provider_attempt_id,),
+    ).fetchone()
+    expected_attempt = (
+        identity.task_id, FailureRole.SUPERVISOR.value, "dispatched",
+        result.session_identity, result.turn_identity,
+        request.input_digest.removeprefix("sha256:"), request.selected_profile_identity,
+        request.within_round_attempt, request.physical_format_output_ordinal,
+    )
+    claim = connection.execute(
+        "SELECT task_id, claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id=?",
+        (request.provider_attempt_id,),
+    ).fetchone()
+    session = connection.execute(
+        "SELECT task_id, session_identity, identity_fingerprint "
+        "FROM provider_session_checkpoints WHERE attempt_id=?",
+        (request.provider_attempt_id,),
+    ).fetchone()
+    before = connection.execute(
+        "SELECT task_id, provider_role, checkpoint_phase, identity_fingerprint "
+        "FROM provider_checkpoints WHERE checkpoint_id=?",
+        (request.provider_attempt_id + ":before-dispatch",),
+    ).fetchone()
+    after = connection.execute(
+        "SELECT task_id, provider_role, checkpoint_phase, identity_fingerprint "
+        "FROM provider_checkpoints WHERE checkpoint_id=?",
+        (request.provider_attempt_id + ":after-dispatch",),
+    ).fetchone()
+    admission = connection.execute(
+        "SELECT task_id, candidate_sha, policy_digest, configuration_digest, "
+        "authority_scope, provider_role, profile_identity, session_identity, attempt_identity "
+        "FROM provider_failure_admissions WHERE attempt_id=?",
+        (request.provider_attempt_id,),
+    ).fetchone()
+    context = connection.execute(
+        "SELECT candidate_fingerprint, policy_fingerprint, configuration_digest "
+        "FROM provider_attempt_contexts WHERE attempt_id=?",
+        (request.provider_attempt_id,),
+    ).fetchone()
+    seal = connection.execute(
+        "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id=?",
+        (identity.task_id,),
+    ).fetchone()
+    identity_fingerprint = session[2] if type(session) is tuple and len(session) == 3 else None
+    expected_admission = (
+        identity.task_id, request.context.candidate_sha, request.context.policy_digest,
+        request.context.configuration_digest, "supervisor:" + identity.task_id,
+        FailureRole.SUPERVISOR.value, request.selected_profile_identity,
+        result.session_identity, request.provider_attempt_id,
+    )
+    expected_context = (
+        hashlib.sha256(request.context.candidate_sha.encode()).hexdigest(),
+        request.context.policy_digest.removeprefix("sha256:"),
+        request.context.configuration_digest,
+    )
+    if (
+        attempt != expected_attempt
+        or claim != (identity.task_id, request.input_digest.removeprefix("sha256:"))
+        or session is None or session[:2] != (identity.task_id, result.session_identity)
+        or not _token(identity_fingerprint)
+        or before != (
+            identity.task_id, FailureRole.SUPERVISOR.value, "before-dispatch",
+            identity_fingerprint,
+        )
+        or after != (
+            identity.task_id, FailureRole.SUPERVISOR.value, "after-dispatch",
+            identity_fingerprint,
+        )
+        or admission != expected_admission
+        or context != expected_context
+        or type(seal) is not tuple or len(seal) != 3
+        or seal[:2] != (identity.base_sha, request.context.candidate_sha)
+        or not _token(seal[2])
+    ):
+        raise SupervisorShadowError("Supervisor accepted result binding has drifted")
+
+
 @dataclass(frozen=True)
 class SupervisorCapturePlanReceipt:
     plan_digest: str; profile: str; case_id: str; candidate_sha: str; ready_at: int; receipt_digest: str
@@ -1071,6 +1159,9 @@ def qualify_supervisor_sequence(adapters: tuple[CodexSupervisorAdapter, ...], re
                 require_scope_open(
                     connection, task_identity.task_id,
                     "supervisor:" + task_identity.task_id,
+                )
+                _require_accepted_result_binding(
+                    connection, task_identity, request, result,
                 )
                 prior = lifecycle.append(
                     expected_receipt.record_identity, event,

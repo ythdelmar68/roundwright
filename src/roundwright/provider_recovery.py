@@ -127,7 +127,7 @@ class SupervisorAccountingAttemptSnapshot:
             raise ProviderRecoveryError("accounting turn snapshot is inconsistent")
         if self.invalid_output_present and self.state is not AttemptState.INVALIDATED:
             raise ProviderRecoveryError("accounting invalid snapshot is inconsistent")
-        if self.terminal_failure is not None and (self.state is not AttemptState.INVALIDATED or not self.session_present or not self.turn_present or self.completion_present or self.invalid_output_present or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
+        if self.terminal_failure is not None and (self.state is not AttemptState.INVALIDATED or self.completion_present or self.invalid_output_present or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
             raise ProviderRecoveryError("accounting terminal failure snapshot is inconsistent")
         if self.state is AttemptState.INVALIDATED and ((self.invalid_output_present == (self.terminal_failure is not None)) or self.recovery_action is not RecoveryAction.FRESH_SUPERVISOR_SESSION):
             raise ProviderRecoveryError("accounting recovery snapshot is inconsistent")
@@ -1098,6 +1098,8 @@ def record_supervisor_terminal_failure(
     context: RecoveryContext,
     *,
     attempt_id: str,
+    session_identity: str | None = None,
+    turn_identity: str | None = None,
     failure_class: SupervisorTerminalFailureClass,
     outcome_source: SupervisorTerminalFailureSource,
     sdk_error_category: SupervisorTerminalFailureSdkCategory,
@@ -1124,17 +1126,58 @@ def record_supervisor_terminal_failure(
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
-        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
-        if row.role is not ProviderRole.SUPERVISOR or row.external_turn_identity is None:
-            raise ProviderRecoveryError("terminal failure requires a dispatched Supervisor turn")
+        authorization_fingerprint = _require_persisted_health_authorization(
+            connection, attempt_id, context, row.role, row.selected_profile_identity, observed,
+        )
+        if row.role is not ProviderRole.SUPERVISOR:
+            raise ProviderRecoveryError("terminal failure requires a Supervisor attempt")
+        claim = connection.execute(
+            "SELECT task_id, claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if claim != (identity.task_id, row.input_fingerprint):
+            raise ProviderRecoveryError("terminal failure dispatch claim is unavailable")
+        legacy_observation = session_identity is None and turn_identity is None
+        observed_session = session_identity or row.session_identity
+        observed_turn = row.external_turn_identity if legacy_observation else turn_identity
+        if type(observed_session) is not str or not _TOKEN.fullmatch(observed_session):
+            raise ProviderRecoveryError("terminal failure session identity is invalid")
+        pre_dispatch = pre_dispatch_failure_identity(FailureRole.SUPERVISOR, attempt_id)
+        if observed_session == pre_dispatch:
+            if row.session_identity is not None or observed_turn is not None or row.external_turn_identity is not None:
+                raise ProviderRecoveryError("terminal failure pre-dispatch identity has drifted")
+        else:
+            if row.session_identity != observed_session:
+                raise ProviderRecoveryError("terminal failure session identity has drifted")
+            _require_session_checkpoint(
+                connection, identity.task_id, attempt_id, observed_session,
+                context, authorization_fingerprint,
+            )
+            if row.external_turn_identity != observed_turn:
+                raise ProviderRecoveryError("terminal failure turn identity has drifted")
+        admission = connection.execute(
+            "SELECT task_id, candidate_sha, policy_digest, configuration_digest, authority_scope, "
+            "provider_role, profile_identity, session_identity, attempt_identity "
+            "FROM provider_failure_admissions WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if admission != (
+            identity.task_id, context.candidate_sha,
+            "sha256:" + context.policy_fingerprint,
+            context.runtime_binding.resolved_digest,
+            "supervisor:" + identity.task_id, ProviderRole.SUPERVISOR.value,
+            row.selected_profile_identity, observed_session, attempt_id,
+        ):
+            raise ProviderRecoveryError("terminal failure admission has drifted")
         if row.state is AttemptState.INVALIDATED:
             outcome = _read_recovery_outcome(connection, attempt_id)
             if outcome != _PersistedRecoveryOutcome(RecoveryAction.FRESH_SUPERVISOR_SESSION, blocker):
                 raise ProviderRecoveryError("terminal failure conflicts with committed state")
             connection.commit()
             return row
-        if row.state is not AttemptState.DISPATCHED:
-            raise ProviderRecoveryError("terminal failure requires an unsettled Supervisor turn")
+        expected_state = AttemptState.DISPATCHED if observed_turn is not None else AttemptState.PREPARED
+        if row.state is not expected_state:
+            raise ProviderRecoveryError("terminal failure requires an unsettled Supervisor attempt")
         if connection.execute("SELECT 1 FROM provider_invalid_outputs WHERE attempt_id = ?", (attempt_id,)).fetchone() is not None:
             raise ProviderRecoveryError("terminal failure conflicts with invalid output")
         connection.execute("UPDATE provider_attempts SET state = ? WHERE attempt_id = ?", (AttemptState.INVALIDATED.value, attempt_id))
@@ -1153,7 +1196,7 @@ def record_supervisor_terminal_failure(
                     "supervisor:" + identity.task_id,
                     FailureRole.SUPERVISOR,
                     row.selected_profile_identity,
-                    row.session_identity or "unavailable-session",
+                    observed_session,
                     row.attempt_id,
                 ),
                 # SupervisorTerminalFailureClass is a storage projection,

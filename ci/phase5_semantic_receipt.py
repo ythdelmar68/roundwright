@@ -100,6 +100,10 @@ TESTS = (
     "tests.test_dependency_review.DependencyReviewTests.test_incomplete_schema67_claim_does_not_mint_admission_authority",
     "tests.test_codex_supervisor.SupervisorTests.test_scope_denial_after_session_open_uses_pre_dispatch_admission",
     "tests.test_dependency_review.DependencyReviewTests.test_terminal_snapshot_authenticates_one_database_snapshot",
+    "tests.test_codex_supervisor.SupervisorTests.test_qualification_acceptance_authenticates_complete_current_provider_binding",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_restarted_format_correction_authenticates_complete_predecessor_before_debit",
+    "tests.test_dependency_review.DependencyReviewTests.test_schema67_and_schema83_accepted_history_survive_candidate_invalidation",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_provider_outage_before_session_or_turn_checkpoint_is_durable_and_falls_back_after_restart",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

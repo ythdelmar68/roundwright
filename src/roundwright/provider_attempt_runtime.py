@@ -682,7 +682,10 @@ class DurableDiffReviewRunner:
         terminal = read_supervisor_terminal_failure(
             self.repository, self.identity, source.selection.provider_attempt_id,
         )
-        if source_attempt.session_identity is None or terminal is None:
+        source_session = source_attempt.session_identity or pre_dispatch_failure_identity(
+            FailureRole.SUPERVISOR, source.selection.provider_attempt_id,
+        )
+        if terminal is None:
             raise ProviderAttemptRuntimeError("provider terminal recovery source is unavailable")
         failure, evidence = native_failure_class(CodexFailure(terminal.failure_class.value))
         if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
@@ -709,7 +712,7 @@ class DurableDiffReviewRunner:
                 record.digest == digest
                 and record.binding.role is FailureRole.SUPERVISOR
                 and record.binding.attempt_identity == source.selection.provider_attempt_id
-                and record.binding.session_identity == source_attempt.session_identity
+                and record.binding.session_identity == source_session
             ):
                 matches.append(record)
         if len(matches) != 1:
@@ -912,6 +915,12 @@ class DurableDiffReviewRunner:
                 "SELECT provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, input_digest, selected_profile_identity, logical_profile_position, physical_format_output_ordinal FROM diff_review_attempts WHERE diff_review_attempt_id=? AND task_id=?",
                 (selection.diff_review_attempt_id, self.identity.task_id),
             ).fetchone()
+            failure_admission = connection.execute(
+                "SELECT task_id, candidate_sha, policy_digest, configuration_digest, "
+                "authority_scope, provider_role, profile_identity, session_identity, "
+                "attempt_identity FROM provider_failure_admissions WHERE attempt_id=?",
+                (selection.provider_attempt_id,),
+            ).fetchone()
             try:
                 authorization_fingerprint = _require_persisted_health_authorization(
                     connection, selection.provider_attempt_id, entry.recovery,
@@ -965,6 +974,22 @@ class DurableDiffReviewRunner:
             return
         if claim is not SupervisorDispatchClaimState.CLAIMED:
             raise ProviderAttemptRuntimeError("provider attempt dispatch claim has drifted")
+        admitted_session = (
+            stored.session_identity
+            if stored.session_identity is not None
+            else pre_dispatch_failure_identity(
+                FailureRole.SUPERVISOR, selection.provider_attempt_id,
+            )
+        )
+        if failure_admission != (
+            self.identity.task_id, entry.recovery.candidate_sha,
+            "sha256:" + entry.recovery.policy_fingerprint,
+            entry.recovery.runtime_binding.resolved_digest,
+            "supervisor:" + self.identity.task_id, FailureRole.SUPERVISOR.value,
+            entry.audit.profile_identity, admitted_session,
+            selection.provider_attempt_id,
+        ):
+            raise ProviderAttemptRuntimeError("provider failure admission has drifted")
         if stored.state is AttemptState.ACCEPTED:
             try:
                 accepted = read_diff_review(
@@ -1106,6 +1131,23 @@ class DurableDiffReviewRunner:
                 self._require_exact_persisted_attempt(entry, existing, accepted_input)
                 return (existing.attempt_id, True)
             if existing.state is AttemptState.INVALIDATED:
+                invalidated_input = preflight_diff_review_session_checkpoint(
+                    self.repository, self.identity, recovery, self.binding, self.seal,
+                    dependency_binding=self.dependency_binding, control=self.dispatch_control,
+                    implementation_attempt_id=selection.implementation_attempt_id,
+                    provider_attempt_id=selection.provider_attempt_id,
+                    message_identity=selection.message_identity,
+                    process_lease_id=selection.process_lease_id,
+                    process_lease_expires_at=selection.process_lease_expires_at,
+                    selected_profile_identity=audit.profile_identity,
+                    within_round_attempt=selection.resolved_logical_profile_position,
+                    review_round=self.review_round, review_epoch=self.review_epoch,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                self._require_exact_persisted_attempt(
+                    entry, existing, invalidated_input,
+                )
                 terminal = read_supervisor_terminal_failure(
                     self.repository, self.identity, existing.attempt_id,
                 )
@@ -1498,6 +1540,32 @@ class DurableDiffReviewRunner:
                 lease=self.lease, now=self.dispatch_control.now,
             )
             raise ProviderAttemptRuntimeError("provider attempt native security denial stopped its scope")
+        if (
+            result.kind is SupervisorResultKind.BLOCKED
+            and result.outcome_source is SupervisorOutcomeSource.SDK_TURN_FAILED
+        ):
+            if result.failure is None or result.sdk_error_category is None or result.session_identity is None:
+                raise ProviderAttemptRuntimeError("Supervisor terminal failure projection is invalid")
+            record_supervisor_terminal_failure(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                session_identity=result.session_identity,
+                turn_identity=result.turn_identity,
+                failure_class=SupervisorTerminalFailureClass(result.failure.value),
+                outcome_source=SupervisorTerminalFailureSource(result.outcome_source.value),
+                sdk_error_category=SupervisorTerminalFailureSdkCategory(result.sdk_error_category.value),
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            recover_attempt(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                max_attempts=runtime.review_max_supervisor_attempts_per_round,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            failure, evidence = native_failure_class(result.failure)
+            if failure is FailureClass.TRANSIENT_SERVICE and evidence is EvidenceSource.VERIFIED_SERVICE:
+                return (selection.provider_attempt_id, False)
+            raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
         if not session_checkpointed:
             raise ProviderAttemptRuntimeError("native Supervisor did not provide a durable session checkpoint")
         if not turn_checkpointed:
@@ -1513,30 +1581,6 @@ class DurableDiffReviewRunner:
             # This is an observed typed adapter outcome, not caller-supplied
             # provider text.  Ambiguity is durable and terminal for this
             # bounded sequence; only an explicit INVALID result may advance.
-            if result.kind is SupervisorResultKind.BLOCKED:
-                if result.failure is None or result.outcome_source is None or result.sdk_error_category is None:
-                    raise ProviderAttemptRuntimeError("Supervisor terminal failure projection is invalid")
-                record_supervisor_terminal_failure(
-                    self.repository, self.identity, recovery,
-                    attempt_id=selection.provider_attempt_id,
-                    failure_class=SupervisorTerminalFailureClass(result.failure.value),
-                    outcome_source=SupervisorTerminalFailureSource(result.outcome_source.value),
-                    sdk_error_category=SupervisorTerminalFailureSdkCategory(result.sdk_error_category.value),
-                    lease=self.lease, now=self.dispatch_control.now,
-                )
-                recover_attempt(
-                    self.repository, self.identity, recovery,
-                    attempt_id=selection.provider_attempt_id,
-                    max_attempts=runtime.review_max_supervisor_attempts_per_round,
-                    lease=self.lease, now=self.dispatch_control.now,
-                )
-                failure, evidence = native_failure_class(result.failure)
-                if failure is FailureClass.TRANSIENT_SERVICE and evidence is EvidenceSource.VERIFIED_SERVICE:
-                    # The outer ordered sequence independently verifies that
-                    # the next entry is the next logical pre-bound profile.
-                    # A terminal SDK failure never consumes a format slot.
-                    return (selection.provider_attempt_id, False)
-                raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
             if result.kind is SupervisorResultKind.INCOMPLETE:
                 if result.terminal_blocker is None:
                     raise ProviderAttemptRuntimeError("provider accounting terminal decision is invalid")

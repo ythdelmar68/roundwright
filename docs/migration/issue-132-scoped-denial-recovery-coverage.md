@@ -382,3 +382,19 @@ the durable evidence that was supposed to authorize it.
 All seven adversarial tests are appended to the ordered semantic inventory.
 Windows declares no E1R19 skips, and render/verify requires their exact
 candidate-bound execution receipt.
+
+## E1R20 current-binding, historical-evidence, and typed-outage closure
+
+E1R20 closes four restart and response-time gaps while preserving the existing
+single-use budget, current-candidate, and public-safe evidence boundaries.
+
+| Finding | Candidate-bound invariant and semantic evidence |
+| --- | --- |
+| E1R20-01 | Supervisor qualification authenticates the accepted adapter result against the current candidate seal, exact dispatch claim, session checkpoint chain, failure admission, and durable turn while holding the lifecycle acceptance transaction. `test_qualification_acceptance_authenticates_complete_current_provider_binding` deletes or substitutes each binding after response read and proves no PASS event or receipt seals. |
+| E1R20-02 | Readiness and execution use the same complete validator for a restarted invalidated format source before a successor reservation, debit, state transition, or dispatch. `test_restarted_format_correction_authenticates_complete_predecessor_before_debit` deletes the predecessor claim, session checkpoint, and failure admission and proves the correction remains absent with unchanged cost. |
+| E1R20-03 | Migration 84 treats a fully authenticated accepted dependency review with no current candidate seal as non-authorizing history. Schema-67 migration preserves only its accepted dispatch and does not mint a failure admission; schema-83 preserves its already-authenticated admission. `test_schema67_and_schema83_accepted_history_survive_candidate_invalidation` proves both upgrades succeed while current consumers still reject the invalidated candidate. |
+| E1R20-04 | Typed SDK failures are durably classified before generic missing-checkpoint recovery. `PROVIDER_OUTAGE` before session opening binds the pre-dispatch admission; the same failure during turn creation binds the real session checkpoint. `test_provider_outage_before_session_or_turn_checkpoint_is_durable_and_falls_back_after_restart` proves both retain verified-service evidence and consume only the explicitly pre-bound fallback after restart. |
+
+All four adversarial tests are appended to the ordered semantic inventory.
+Windows declares no E1R20 skips, and render/verify requires their exact
+candidate-bound execution receipt.

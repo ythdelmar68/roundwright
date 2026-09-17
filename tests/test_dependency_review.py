@@ -505,6 +505,52 @@ class DependencyReviewTests(unittest.TestCase):
                 ).fetchone(), (83,))
                 self.assertEqual(len(MIGRATIONS), 84)
 
+    def test_schema67_and_schema83_accepted_history_survive_candidate_invalidation(self) -> None:
+        """A removed current seal preserves history without minting new authority."""
+
+        from roundwright.state import MIGRATIONS
+
+        for version in (67, 83):
+            with self.subTest(schema=version), tempfile.TemporaryDirectory() as temporary:
+                repository, subset = self.setup_review(Path(temporary))
+                store = DependencyReviewStore()
+                binding = self.binding(subset)
+                proposal = self.proposal(f"schema{version}-invalidated-history")
+                store.start_attempt(
+                    repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                    source_owned_relations=self.source_owned_relations(proposal),
+                )
+                self.accept(store, repository, proposal, binding=binding)
+                path = database_path(repository)
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    connection.execute(
+                        "DELETE FROM candidate_seals WHERE task_id=?", (subset.task_id,),
+                    )
+                self.replace_with_schema(repository, version)
+                self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+                with closing(sqlite3.connect(path)) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT 1 FROM candidate_seals WHERE task_id=?", (subset.task_id,),
+                    ).fetchone())
+                    self.assertEqual(connection.execute(
+                        "SELECT session_identity, turn_identity, output_digest "
+                        "FROM dependency_review_accepted_result_dispatches WHERE attempt_id=?",
+                        (proposal.attempt_id,),
+                    ).fetchone(), (
+                        "session-" + proposal.attempt_id,
+                        "turn-" + proposal.attempt_id,
+                        proposal.proposal_digest,
+                    ))
+                    admission_count = connection.execute(
+                        "SELECT COUNT(*) FROM dependency_review_failure_admissions WHERE attempt_id=?",
+                        (proposal.attempt_id,),
+                    ).fetchone()
+                    self.assertEqual(admission_count, (0,) if version == 67 else (1,))
+                with self.assertRaises(DependencyReviewError):
+                    store.terminal_snapshot(
+                        repository, attempt_id=proposal.attempt_id, binding=binding,
+                    )
+
     def test_incomplete_schema67_claim_does_not_mint_admission_authority(self) -> None:
         """Only complete accepted legacy evidence receives a historical binding."""
 

@@ -1994,8 +1994,13 @@ def _migrate_dependency_review_evidence_bindings(
             or not digest(attempt_configuration)
             or not isinstance(candidate_sha, str) or len(candidate_sha) != 40
             or any(character not in "0123456789abcdef" for character in candidate_sha)
-            or seal_base_sha != task_base_sha or seal_candidate_sha != candidate_sha
-            or not isinstance(state_identity, str) or not state_identity
+            or (
+                (seal_base_sha, seal_candidate_sha, state_identity) != (None, None, None)
+                and (
+                    seal_base_sha != task_base_sha or seal_candidate_sha != candidate_sha
+                    or not isinstance(state_identity, str) or not state_identity
+                )
+            )
             or runtime_schema != "roundwright-runtime/v1"
             or runtime_configuration != attempt_configuration
         ):
@@ -2016,6 +2021,9 @@ def _migrate_dependency_review_evidence_bindings(
             admitted_session = session_identity
         else:
             raise StateError("legacy dependency review dispatch is unauthenticated")
+        historical_only = seal_candidate_sha is None
+        if historical_only and attempt_id not in authenticated_accepted:
+            raise StateError("legacy dependency review dispatch is unauthenticated")
         expected = (
             task_id, candidate_sha, policy_digest, attempt_configuration,
             "dependency-review:" + task_id, "dependency-review",
@@ -2030,7 +2038,7 @@ def _migrate_dependency_review_evidence_bindings(
         if existing is None:
             if source_schema_version >= 74:
                 raise StateError("legacy dependency review admission is missing")
-            if attempt_id in authenticated_accepted:
+            if attempt_id in authenticated_accepted and not historical_only:
                 connection.execute(
                     "INSERT INTO dependency_review_failure_admissions"
                     "(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, "

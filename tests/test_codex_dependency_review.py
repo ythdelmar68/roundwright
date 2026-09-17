@@ -711,6 +711,66 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, task_identity=identity, **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"))
             self.assertEqual(backend.sessions, [])
 
+    def test_initial_reservation_intent_recovers_before_and_after_preparation(self) -> None:
+        """Both initial crash windows reuse one debit and dispatch exactly once."""
+
+        class ProcessDeath(BaseException):
+            pass
+
+        for boundary in ("before-preparation", "after-preparation"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                repository, subset, binding, profile, audit = self.setup(Path(temporary))
+                backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+                adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+                effect = self.effect_kwargs(
+                    repository, subset, binding, adapter, attempt_id="intent-restart",
+                )
+                original = DependencyReviewStore.start_attempt
+
+                def interrupt(instance, *args, **kwargs):
+                    if boundary == "after-preparation":
+                        original(instance, *args, **kwargs)
+                    raise ProcessDeath()
+
+                with patch.object(
+                    DependencyReviewStore, "start_attempt", autospec=True,
+                    side_effect=interrupt,
+                ), self.assertRaises(ProcessDeath):
+                    DependencyReviewService().run(
+                        repository, subset, attempt_id="intent-restart", binding=binding,
+                        adapter=adapter, checkpoint_session=lambda _: None,
+                        checkpoint_turn=lambda *_: None, **effect,
+                    )
+                self.assertEqual(backend.sessions, [])
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT provider_role, state FROM provider_effect_reservation_intents "
+                        "WHERE attempt_id='intent-restart'"
+                    ).fetchone(), ("dependency-review", "reserving"))
+                    self.assertEqual(connection.execute(
+                        "SELECT state FROM dependency_review_attempts WHERE attempt_id='intent-restart'"
+                    ).fetchone(), None if boundary == "before-preparation" else ("prepared",))
+                with closing(sqlite3.connect(effect["budget_ledger_path"])) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), [(1, 60, 4000)])
+                result = DependencyReviewService().run(
+                    repository, subset, attempt_id="intent-restart", binding=binding,
+                    adapter=adapter, checkpoint_session=lambda _: None,
+                    checkpoint_turn=lambda *_: None, **effect,
+                )
+                self.assertEqual(result.kind, DependencyReviewResultKind.AMBIGUOUS)
+                self.assertEqual(len(backend.sessions), 1)
+                with closing(sqlite3.connect(effect["budget_ledger_path"])) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), [(1, 60, 4000)])
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT 1 FROM provider_effect_reservation_intents "
+                        "WHERE attempt_id='intent-restart'"
+                    ).fetchone(), None)
+
     def test_invalid_predecessor_cannot_mint_a_successor_session_or_budget(self) -> None:
         for prior in ("invalid", "accepted", "missing", "ambiguous", "unverified-transient", "missing-outcome", "drifted-input"):
             with self.subTest(predecessor=prior), tempfile.TemporaryDirectory() as temporary:

@@ -458,6 +458,70 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     (runner.selection.provider_attempt_id,),
                 ).fetchone(), (0,))
 
+    def test_scope_denial_before_session_or_turn_is_durable_without_invented_turn(self) -> None:
+        """Each pre-turn scope stop closes the claim with only authentic identity."""
+
+        from roundwright.failure_recovery import FailureRecoveryError, FailureRole, require_scope_open
+
+        for stage, denied_call, expected_session in (
+            ("before-session", 2, None),
+            ("before-turn", 5, "session-runtime-before-turn"),
+        ):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                runner, backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED,
+                        {"verdict": "pass", "findings": []},
+                    ),
+                    suffix=stage,
+                )
+                original = provider_attempt_runtime.require_scope_effect_admission
+                calls = 0
+
+                def deny_at_boundary(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == denied_call:
+                        raise FailureRecoveryError("injected authoritative scope stop")
+                    return original(*args, **kwargs)
+
+                with patch.object(
+                    provider_attempt_runtime, "require_scope_effect_admission",
+                    side_effect=deny_at_boundary,
+                ), self.assertRaisesRegex(ProviderAttemptRuntimeError, "scope is stopped"):
+                    runner.execute()
+                stored = read_attempt(
+                    repository, identity, runner.selection.provider_attempt_id,
+                    context=recovery,
+                )
+                self.assertEqual(
+                    (stored.state, stored.session_identity, stored.external_turn_identity),
+                    (AttemptState.BLOCKED, expected_session, None),
+                )
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    record = connection.execute(
+                        "SELECT record_json FROM failure_recovery_records WHERE task_id=?",
+                        (identity.task_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(record)
+                    payload = json.loads(record[0])
+                    self.assertEqual(payload["action"], "stop-scope")
+                    self.assertEqual(
+                        payload["binding"]["session_identity"],
+                        expected_session or provider_attempt_runtime.pre_dispatch_failure_identity(
+                            FailureRole.SUPERVISOR, runner.selection.provider_attempt_id,
+                        ),
+                    )
+                    with self.assertRaisesRegex(FailureRecoveryError, "scope remains stopped"):
+                        require_scope_open(
+                            connection, identity.task_id, "supervisor:" + identity.task_id,
+                        )
+                calls_before_restart = backend.calls
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "scope is stopped"):
+                    runner.execute()
+                self.assertEqual(backend.calls, calls_before_restart)
+
     def test_readiness_and_execution_share_complete_accepted_state_validation(self) -> None:
         """Claims, coordinates, and formal acceptance are all mandatory."""
 

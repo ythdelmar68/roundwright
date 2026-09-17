@@ -24,6 +24,7 @@ from roundwright.dependency_graph import (
     GraphDecision,
 )
 from roundwright.git_identity import acquire_transition_lease
+from roundwright.failure_recovery import FailureRecoveryError
 from roundwright.runtime_binding import RuntimeBinding
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
 
@@ -155,6 +156,74 @@ class DependencyReviewTests(unittest.TestCase):
                 store.accept_proposal(repository, proposal, binding=binding),
                 proposal.proposal_digest,
             )
+
+    def test_pre_dispatch_claim_rechecks_scope_in_its_writer_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset = self.setup_review(Path(temporary))
+            store = DependencyReviewStore()
+            binding = self.binding(subset)
+            store.start_attempt(
+                repository, subset, attempt_id="claim-scope", binding=binding,
+            )
+            identity = TaskIdentity(
+                "task-113", "source-113", "repo-113", "codex/113",
+                "C:/review-113", "a" * 40,
+            )
+            with mock.patch(
+                "roundwright.dependency_review.require_scope_open",
+                side_effect=FailureRecoveryError("injected stopped scope"),
+            ), self.assertRaisesRegex(FailureRecoveryError, "stopped scope"):
+                store.claim_pre_dispatch(
+                    repository, attempt_id="claim-scope",
+                    task_identity=identity, binding=binding,
+                )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT 1 FROM dependency_review_dispatch_claims WHERE attempt_id='claim-scope'"
+                ).fetchone(), None)
+
+    def test_all_dependency_consumers_share_exact_dispatch_authentication(self) -> None:
+        """Acceptance, terminal read-back, and graph replay reject the same drift."""
+
+        mutations = {
+            "missing-claim": "DELETE FROM dependency_review_dispatch_claims WHERE attempt_id=?",
+            "invalid-session": "UPDATE dependency_review_dispatch_claims SET session_identity='bad session' WHERE attempt_id=?",
+            "invalid-turn": "UPDATE dependency_review_dispatch_claims SET turn_identity='bad turn' WHERE attempt_id=?",
+            "admission-session": "UPDATE dependency_review_failure_admissions SET session_identity='other-session' WHERE attempt_id=?",
+            "admission-profile": "UPDATE dependency_review_failure_admissions SET profile_identity='sha256:" + "0" * 64 + "' WHERE attempt_id=?",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(drift=name), tempfile.TemporaryDirectory() as temporary:
+                repository, subset = self.setup_review(Path(temporary))
+                store = DependencyReviewStore()
+                binding = self.binding(subset)
+                proposal = self.proposal("dispatch-auth")
+                store.start_attempt(
+                    repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                    source_owned_relations=self.source_owned_relations(proposal),
+                )
+                self.accept(store, repository, proposal, binding=binding)
+                graph = DependencyGraphStore()
+                graph_binding = DependencyGraphBinding.from_review_binding(binding)
+                graph.activate(
+                    repository, proposal, binding=graph_binding,
+                    graph_version_id="graph-auth",
+                )
+                with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                    connection.execute(statement, (proposal.attempt_id,))
+                with self.assertRaisesRegex(DependencyReviewError, "acceptance evidence"):
+                    store.accept_proposal(repository, proposal, binding=binding)
+                with self.assertRaisesRegex(DependencyReviewError, "snapshot"):
+                    store.terminal_snapshot(
+                        repository, attempt_id=proposal.attempt_id, binding=binding,
+                    )
+                with self.assertRaisesRegex(DependencyGraphError, "graph evidence"):
+                    graph.activate(
+                        repository, proposal, binding=graph_binding,
+                        graph_version_id="graph-auth",
+                    )
+                with self.assertRaisesRegex(DependencyGraphError, "current dependency graph"):
+                    graph.current(repository, binding=graph_binding)
 
     def test_graph_requires_the_pre_dispatch_relation_identity_not_caller_scalars(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

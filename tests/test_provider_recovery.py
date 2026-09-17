@@ -12,6 +12,7 @@ import unittest
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -26,6 +27,7 @@ from roundwright.provider_recovery import (
     RecoveryAction,
     RecoveryContext,
     accept_supervisor_review,
+    claim_supervisor_dispatch,
     invalidate_supervisor_attempt,
     prepare_attempt,
     read_attempt,
@@ -160,6 +162,37 @@ class ProviderRecoveryTests(unittest.TestCase):
             input_fingerprint="a" * 64,
             lease=lease,
         )
+
+    def test_supervisor_claim_rechecks_scope_inside_the_claim_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = self.repository(Path(temporary))
+            initialize(repository)
+            lease = self.lease(repository)
+            identity = self.identity("claim-scope")
+            self.admit(repository, identity, lease)
+            candidate = "c" * 40
+            self.seal_candidate(repository, identity, lease, candidate)
+            context = self.context(identity, candidate=candidate, role=ProviderRole.SUPERVISOR)
+            prepare_attempt(
+                repository, identity, context, attempt_id="claim-scope-attempt",
+                role=ProviderRole.SUPERVISOR, process_lease_id="claim-scope-lease",
+                process_lease_expires_at=int(time.time()) + 10,
+                input_fingerprint="a" * 64,
+                selected_profile_identity=context.runtime_binding.supervisor_profile_identities[0],
+                lease=lease,
+            )
+            with patch(
+                "roundwright.provider_recovery.require_scope_open",
+                side_effect=FailureRecoveryError("injected stopped scope"),
+            ), self.assertRaisesRegex(FailureRecoveryError, "stopped scope"):
+                claim_supervisor_dispatch(
+                    repository, identity, context, attempt_id="claim-scope-attempt",
+                    lease=lease,
+                )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT 1 FROM provider_dispatch_claims WHERE attempt_id='claim-scope-attempt'"
+                ).fetchone(), None)
 
     def test_missing_or_role_mismatched_health_blocks_before_attempt_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1005,7 +1038,10 @@ class ProviderRecoveryTests(unittest.TestCase):
     def test_cleared_scope_effect_reauthenticates_original_admission_and_session(self) -> None:
         """Evidence removed after clearance cannot authorize a successor debit."""
 
-        for mutation in ("missing-admission", "missing-session", "session-fingerprint"):
+        for mutation in (
+            "missing-admission", "missing-session", "session-fingerprint",
+            "before-fingerprint", "matching-checkpoint-fingerprints", "health-seal",
+        ):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
                 repository = self.repository(Path(temporary)); initialize(repository)
                 lease = self.lease(repository); identity = self.identity("clearance-loss-" + mutation)
@@ -1055,9 +1091,28 @@ class ProviderRecoveryTests(unittest.TestCase):
                             "DELETE FROM provider_session_checkpoints WHERE attempt_id = ?",
                             (binding.attempt_identity,),
                         )
-                    else:
+                    elif mutation == "session-fingerprint":
                         connection.execute(
                             "UPDATE provider_session_checkpoints SET identity_fingerprint = ? WHERE attempt_id = ?",
+                            ("0" * 64, binding.attempt_identity),
+                        )
+                    elif mutation == "before-fingerprint":
+                        connection.execute(
+                            "UPDATE provider_checkpoints SET identity_fingerprint = ? WHERE checkpoint_id = ?",
+                            ("0" * 64, binding.attempt_identity + ":before-dispatch"),
+                        )
+                    elif mutation == "matching-checkpoint-fingerprints":
+                        connection.execute(
+                            "UPDATE provider_checkpoints SET identity_fingerprint = ? WHERE checkpoint_id = ?",
+                            ("0" * 64, binding.attempt_identity + ":before-dispatch"),
+                        )
+                        connection.execute(
+                            "UPDATE provider_session_checkpoints SET identity_fingerprint = ? WHERE attempt_id = ?",
+                            ("0" * 64, binding.attempt_identity),
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE provider_attempt_health_seals SET authorization_fingerprint = ? WHERE attempt_id = ?",
                             ("0" * 64, binding.attempt_identity),
                         )
                 with self.assertRaisesRegex(FailureRecoveryError, "authority|admission"):

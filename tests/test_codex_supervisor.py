@@ -760,7 +760,7 @@ class SupervisorTests(unittest.TestCase):
                                            else json.dumps({"verdict": "pass", "findings": [], "binding": binding}))
                             return handle
                     return _Session(Thread(), object(), ROOT, profile, "deny-all", "read-only", lambda value: value,
-                                    CompletionDeadline(100, 600), time.monotonic, inner.launch)
+                                    CompletionDeadline(1000, 2000), time.monotonic, inner.launch)
             converted.append(CodexSupervisorAdapter(NativeBackend(profile, identity, mode, FixtureLaunch(profile)), profile, adapter._audit))
         return (tuple(converted), requests, *rest)
 

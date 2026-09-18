@@ -426,14 +426,15 @@ print(json.dumps({
             self.assertTrue(result["commands"])
             self.assertTrue(all(command[0] in {"git", "git.exe"} and "push" not in command for command in result["commands"]))
             self.assertGreater(result["command_profile"][0], 1)
-            # Terminal persisted-gate revalidation adds two sealed-candidate Git checks.
-            self.assertLessEqual(result["command_profile"][0], 302)
+            # Terminal persisted-gate revalidation and the claimed formal
+            # dispatch each recheck their sealed-candidate Git evidence.
+            self.assertLessEqual(result["command_profile"][0], 312)
             self.assertEqual(result["command_profile"][1:], [1, 1])
             self.assertEqual(result["replay_shapes"], [
                 ["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
             ])
             self.assertTrue(result["database_snapshot_unchanged"])
-            self.assertEqual(result["command_sequence_digest"], "1253bd226f3938416116e15b178164986eecc6632768fbf11b9ecffd7fdb4f08")
+            self.assertEqual(result["command_sequence_digest"], "b42911ccba63e998fbc830da0e8e159e9524543e275e2bde3132ce3c4783bc27")
             self.assertTrue(result["platform_normalization_matches"])
             self.assertEqual(result["leases"], [0, 0])
             self.assertTrue(result["failure_released_lease"])

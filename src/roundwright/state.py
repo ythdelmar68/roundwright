@@ -1997,7 +1997,9 @@ def _migrate_dependency_review_evidence_bindings(
             or (
                 (seal_base_sha, seal_candidate_sha, state_identity) != (None, None, None)
                 and (
-                    seal_base_sha != task_base_sha or seal_candidate_sha != candidate_sha
+                    seal_base_sha != task_base_sha
+                    or not isinstance(seal_candidate_sha, str) or len(seal_candidate_sha) != 40
+                    or any(character not in "0123456789abcdef" for character in seal_candidate_sha)
                     or not isinstance(state_identity, str) or not state_identity
                 )
             )
@@ -2021,7 +2023,11 @@ def _migrate_dependency_review_evidence_bindings(
             admitted_session = session_identity
         else:
             raise StateError("legacy dependency review dispatch is unauthenticated")
-        historical_only = seal_candidate_sha is None
+        # An accepted review for an older candidate remains authenticated
+        # history when the task has advanced to a newer seal.  It must not mint
+        # admission authority for the old candidate, just as if the seal were
+        # absent entirely.
+        historical_only = seal_candidate_sha != candidate_sha
         if historical_only and attempt_id not in authenticated_accepted:
             raise StateError("legacy dependency review dispatch is unauthenticated")
         expected = (

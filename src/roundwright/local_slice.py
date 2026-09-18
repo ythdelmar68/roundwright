@@ -27,6 +27,7 @@ from .candidate_review import (
     VerificationOutcome,
     begin_implementation,
     dispatch_diff_review,
+    preflight_diff_review_session_checkpoint,
     record_candidate_verification,
     record_diff_review,
     record_implementation_candidate,
@@ -50,7 +51,7 @@ from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError,
 from .plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review, record_plan_review
 from .policy import ActivationReceipt, PolicyAction, PolicyDocument, ReceiptStatus, StandingAuthority, TrustedControlSource, TrustedPolicySnapshot
 from .provider_health import CodexCapability, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, profile_fingerprint
-from .provider_recovery import ProviderRole, RecoveryContext
+from .provider_recovery import ProviderRole, RecoveryContext, claim_supervisor_dispatch, prepare_attempt
 from .state import SourceSnapshot, StateError, TaskIdentity, TaskProjection, admit_task, check_database, database_path, initialize, record_artifact, set_next_action, task_projection
 from .worker_planning import (
     PlanReviewReceipt,
@@ -322,8 +323,38 @@ def _run_new_slice(repository, identity, fixture, lease, instant, epoch, configu
     candidate_dispatch_control = _materialize_dispatch_control(
         candidate_dependency_evidence, trusted_dependency_admission, candidate_binding, epoch,
     )
+    diff_context = _health_context(
+        candidate_context, identity, ProviderRole.SUPERVISOR,
+        configuration.supervisor_attempt_profiles.value[0], epoch,
+    )
+    diff_input = preflight_diff_review_session_checkpoint(
+        repository, identity, diff_context, binding, seal,
+        dependency_binding=candidate_binding, control=candidate_dispatch_control,
+        implementation_attempt_id=implementation.implementation_attempt_id,
+        provider_attempt_id="local-diff-supervisor",
+        message_identity="local-diff-review-message",
+        process_lease_id="local-diff-review-lease",
+        process_lease_expires_at=epoch + 60,
+        selected_profile_identity=runtime_binding.supervisor_profile_identities[0],
+        within_round_attempt=1, review_epoch=1, review_round=1,
+        lease=lease, now=epoch,
+    )
+    prepare_attempt(
+        repository, identity, diff_context,
+        attempt_id="local-diff-supervisor", role=ProviderRole.SUPERVISOR,
+        process_lease_id="local-diff-review-lease",
+        process_lease_expires_at=epoch + 60,
+        input_fingerprint=diff_input,
+        selected_profile_identity=runtime_binding.supervisor_profile_identities[0],
+        logical_profile_position=1, review_epoch=1, review_round=1,
+        lease=lease, now=epoch,
+    )
+    claim_supervisor_dispatch(
+        repository, identity, diff_context,
+        attempt_id="local-diff-supervisor", lease=lease, now=epoch,
+    )
     diff_review = dispatch_diff_review(
-        repository, identity, _health_context(candidate_context, identity, ProviderRole.SUPERVISOR, configuration.supervisor_attempt_profiles.value[0], epoch), binding, seal,
+        repository, identity, diff_context, binding, seal,
         dependency_binding=candidate_binding, control=candidate_dispatch_control,
         diff_review_attempt_id="local-diff-review", implementation_attempt_id=implementation.implementation_attempt_id,
         provider_attempt_id="local-diff-supervisor", supervisor_session_identity="local-diff-supervisor-session",

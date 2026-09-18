@@ -34,7 +34,7 @@ from roundwright.runtime_binding import RuntimeBinding
 from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from roundwright.git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review as _native_dispatch_plan_review, record_plan_review
-from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, prepare_attempt, read_attempt, recover_attempt
+from roundwright.provider_recovery import AttemptState, ProviderAttemptAbsentError, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, SupervisorDispatchClaimState, claim_supervisor_dispatch, prepare_attempt, read_attempt, read_supervisor_dispatch_claim, recover_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt, PlanningInput, ProviderDispatchControl, WorkerPlan, WorkerPlanOutput,
@@ -80,8 +80,65 @@ def _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs
         selected = None
     dependency_binding, control = _dispatch_control(identity, context, kwargs["now"], seal.candidate_sha)
     kwargs.update(dependency_binding=dependency_binding, control=control)
+    recovery = provider_context(
+        context, identity, ProviderRole.SUPERVISOR,
+        selected_profile_identity=selected,
+    )
+    if candidate_review._read_diff_dispatch(
+        repository, identity, kwargs["diff_review_attempt_id"],
+    ) is not None:
+        return _native_dispatch_diff_review(
+            repository, identity, recovery, binding, seal, **kwargs
+        )
+    projection = candidate_review._project_review_policy(
+        kwargs.get("review_epoch", 0), kwargs["review_round"],
+        recovery.runtime_binding,
+    )
+    candidate_review._require_unconsumed_formal_round(
+        repository, identity, projection.review_epoch, projection.review_round,
+    )
+    input_digest = candidate_review.preflight_diff_review_session_checkpoint(
+        repository, identity, recovery, binding, seal,
+        dependency_binding=dependency_binding, control=control,
+        implementation_attempt_id=kwargs["implementation_attempt_id"],
+        provider_attempt_id=kwargs["provider_attempt_id"],
+        message_identity=kwargs["message_identity"],
+        process_lease_id=kwargs["process_lease_id"],
+        process_lease_expires_at=kwargs["process_lease_expires_at"],
+        selected_profile_identity=kwargs["selected_profile_identity"],
+        within_round_attempt=kwargs["within_round_attempt"],
+        review_round=kwargs["review_round"],
+        review_epoch=kwargs.get("review_epoch", 0),
+        physical_format_output_ordinal=kwargs.get("physical_format_output_ordinal", 0),
+        lease=kwargs["lease"], now=kwargs["now"],
+    )
+    try:
+        provider = read_attempt(
+            repository, identity, kwargs["provider_attempt_id"],
+            context=recovery, now=kwargs["now"],
+        )
+    except ProviderAttemptAbsentError:
+        provider = prepare_attempt(
+            repository, identity, recovery,
+            attempt_id=kwargs["provider_attempt_id"], role=ProviderRole.SUPERVISOR,
+            process_lease_id=kwargs["process_lease_id"],
+            process_lease_expires_at=kwargs["process_lease_expires_at"],
+            input_fingerprint=input_digest,
+            selected_profile_identity=kwargs["selected_profile_identity"],
+            logical_profile_position=kwargs["within_round_attempt"],
+            physical_format_output_ordinal=kwargs.get("physical_format_output_ordinal", 0),
+            review_epoch=kwargs.get("review_epoch", 0), review_round=kwargs["review_round"],
+            lease=kwargs["lease"], now=kwargs["now"],
+        )
+    if provider.state is AttemptState.PREPARED and read_supervisor_dispatch_claim(
+        repository, identity, recovery, attempt_id=kwargs["provider_attempt_id"],
+    ) is SupervisorDispatchClaimState.UNCLAIMED:
+        claim_supervisor_dispatch(
+            repository, identity, recovery, attempt_id=kwargs["provider_attempt_id"],
+            lease=kwargs["lease"], now=kwargs["now"],
+        )
     return _native_dispatch_diff_review(
-        repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR, selected_profile_identity=selected), binding, seal, **kwargs
+        repository, identity, recovery, binding, seal, **kwargs
     )
 
 
@@ -498,7 +555,9 @@ class CandidateReviewTests(unittest.TestCase):
                 if not accepted:
                     replay = dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, implementation_attempt_id=review.implementation_attempt_id, provider_attempt_id=review.provider_attempt_id, supervisor_session_identity=review.supervisor_session_identity, external_turn_identity=review.external_turn_identity, message_identity=review.message_identity, process_lease_id="diff-accepted-lease", process_lease_expires_at=now + 60, review_round=policy.review_round, review_epoch=policy.review_epoch, lease=lease, now=now)
                     self.assertEqual(replay, dispatch)
-                    result = record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=output, completion_evidence_fingerprint="c" * 64, lease=lease, now=now)
+                    with self.assertRaisesRegex(CandidateReviewError, "dispatch has drifted"):
+                        record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=output, completion_evidence_fingerprint="c" * 64, lease=lease, now=now)
+                    continue
                 else:
                     result = read_diff_review(repository, identity, review.diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
                 self.assertTrue(result.accepted)

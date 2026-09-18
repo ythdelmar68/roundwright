@@ -2014,6 +2014,90 @@ def _require_session_checkpoint(
         raise ProviderRecoveryError("session checkpoint is unavailable or has drifted")
 
 
+def _require_complete_provider_dispatch_binding(
+    connection: sqlite3.Connection,
+    identity: TaskIdentity,
+    context: RecoveryContext,
+    *,
+    attempt_id: str,
+    role: ProviderRole,
+    profile_identity: str,
+    session_identity: str,
+    external_turn_identity: str,
+    input_fingerprint: str,
+    observed: int,
+) -> ProviderAttempt:
+    """Authenticate one dispatched turn from its complete persisted chain.
+
+    This helper is deliberately read-only and transaction-local.  Acceptance
+    writers use it after the provider response has returned so deletion or
+    coherent substitution of the context, runtime, health seal, claim, session,
+    failure admission, or either checkpoint cannot be hidden by comparing the
+    persisted rows only to one another.
+    """
+
+    _validate_task(identity)
+    _validate_context(identity, context)
+    for value, name in (
+        (attempt_id, "attempt identity"),
+        (profile_identity, "provider profile identity"),
+        (session_identity, "session identity"),
+        (external_turn_identity, "external turn identity"),
+    ):
+        _require_token(value, name)
+    _require_fingerprint(input_fingerprint, "provider input fingerprint")
+    require_runtime_binding(None, identity, context.runtime_binding, connection=connection)
+    if not _context_matches(connection, identity, attempt_id, context):
+        raise ProviderRecoveryError("provider dispatch context is unavailable or has drifted")
+    row = _attempt_row(connection, identity.task_id, attempt_id)
+    if (
+        row.role is not role
+        or row.selected_profile_identity != profile_identity
+        or row.session_identity != session_identity
+        or row.external_turn_identity != external_turn_identity
+        or row.input_fingerprint != input_fingerprint
+        or row.state is AttemptState.PREPARED
+    ):
+        raise ProviderRecoveryError("provider dispatch attempt is unavailable or has drifted")
+    authorization_fingerprint = _require_persisted_health_authorization(
+        connection, attempt_id, context, role, profile_identity, observed,
+    )
+    if connection.execute(
+        "SELECT task_id, claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone() != (identity.task_id, input_fingerprint):
+        raise ProviderRecoveryError("provider dispatch claim is unavailable or has drifted")
+    _require_session_checkpoint(
+        connection, identity.task_id, attempt_id, session_identity, context,
+        authorization_fingerprint,
+    )
+    expected_checkpoint = (
+        identity.task_id, role.value, "after-dispatch",
+        _checkpoint_fingerprint(context, authorization_fingerprint),
+    )
+    if connection.execute(
+        "SELECT task_id, provider_role, checkpoint_phase, identity_fingerprint "
+        "FROM provider_checkpoints WHERE checkpoint_id = ?",
+        (f"{attempt_id}:after-dispatch",),
+    ).fetchone() != expected_checkpoint:
+        raise ProviderRecoveryError("provider after-dispatch checkpoint is unavailable or has drifted")
+    if context.candidate_sha is None:
+        raise ProviderRecoveryError("provider failure admission is unavailable or has drifted")
+    expected_admission = (
+        identity.task_id, context.candidate_sha, "sha256:" + context.policy_fingerprint,
+        context.runtime_binding.resolved_digest, role.value + ":" + identity.task_id,
+        role.value, profile_identity, session_identity, attempt_id,
+    )
+    if connection.execute(
+        "SELECT task_id, candidate_sha, policy_digest, configuration_digest, "
+        "authority_scope, provider_role, profile_identity, session_identity, attempt_identity "
+        "FROM provider_failure_admissions WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone() != expected_admission:
+        raise ProviderRecoveryError("provider failure admission is unavailable or has drifted")
+    return row
+
+
 def _require_session_reuse_allowed(connection, row: ProviderAttempt, session_identity: str) -> None:
     """Permit cross-attempt reuse only for persistent Worker planning/execution sessions."""
 

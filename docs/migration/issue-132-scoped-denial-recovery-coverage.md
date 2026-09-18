@@ -398,3 +398,20 @@ single-use budget, current-candidate, and public-safe evidence boundaries.
 All four adversarial tests are appended to the ordered semantic inventory.
 Windows declares no E1R20 skips, and render/verify requires their exact
 candidate-bound execution receipt.
+
+## E1R21 complete acceptance, correction, debit, and history closure
+
+E1R21 closes five coherent-substitution and restart gaps without widening any
+provider, migration, or historical authority.
+
+| Finding | Candidate-bound invariant and semantic evidence |
+| --- | --- |
+| E1R21-01 | Qualification PASS recomputes the checkpoint identity from the full persisted recovery context and health seal in the acceptance transaction, and requires the current runtime binding. `test_qualification_acceptance_recomputes_runtime_health_and_checkpoint_binding` deletes health authorization or its seal, deletes runtime binding, coherently substitutes all checkpoint fingerprints, and changes the worktree fingerprint; none can append or seal PASS. |
+| E1R21-02 | Formal PASS acceptance reauthenticates the exact claim, session checkpoint, failure admission, after-dispatch checkpoint, and persisted formal turn against the observed session and turn. `test_formal_pass_acceptance_reauthenticates_observed_dispatch_chain` mutates each chain element during response read and proves neither review nor provider acceptance is recorded. |
+| E1R21-03 | Format correction authenticates the complete malformed predecessor twice: before successor materialization and immediately before native dispatch. `test_format_correction_preserves_predecessor_binding_through_dispatch` deletes the predecessor after-dispatch checkpoint after successor preparation and proves the successor provider is never called. |
+| E1R21-04 | A correction requires read-back of the predecessor's original sealed provider debit before readiness or execution can authorize another call. `test_format_correction_requires_original_sealed_provider_debit` deletes or conflicts the original cost row and proves the successor remains provider-inert. |
+| E1R21-05 | Migration preserves complete schema-67/schema-83 accepted history when a newer candidate seal exists, but treats it as non-authorizing and rejects incomplete or tampered legacy evidence. `test_schema67_and_schema83_history_survives_newer_seal_but_rejects_tampering` covers both preservation and fail-closed rejection. |
+
+All five adversarial tests are appended to the ordered semantic inventory.
+Windows declares no E1R21 skips, and render/verify requires their exact
+candidate-bound execution receipt.

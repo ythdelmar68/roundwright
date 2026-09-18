@@ -24,7 +24,7 @@ from typing import Iterable
 from .configuration import FinalFindingsPolicy, RepositoryIdentity, ReviewMode
 from .dependency_policy import CandidateBinding, DependencyExecutionControl, DependencyPolicyError, DependencyStage
 from .git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, TransitionLease, WorktreeBinding, bind_candidate_evidence, candidate_evidence, preflight_candidate_evidence, seal_candidate
-from .provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
+from .provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, RecoveryProjection, _require_complete_provider_dispatch_binding, _require_persisted_health_authorization, prepare_attempt, read_attempt, record_completed_output, record_external_turn, record_session_identity, recover_attempt
 from .failure_recovery import require_scope_open
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import ReviewLimitFinalizationReceipt, StateError, TaskIdentity, _open_writable_connection, _require_matching_task, database_path, record_review_limit_finalization, transition_task
@@ -1433,6 +1433,25 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now, pass_
         require_scope_open(connection, identity.task_id, "supervisor:" + identity.task_id)
         _require_exact_provider_context(connection, identity, dispatch.provider_attempt_id, context)
         _require_sealed_provider_authorization(connection, identity, dispatch.provider_attempt_id, context, now)
+        current_dispatch = _read_diff_dispatch_connection(
+            connection, identity, dispatch.diff_review_attempt_id,
+            digest_version=dispatch.digest_version, validate_provider_output=True,
+        )
+        if current_dispatch != dispatch:
+            raise CandidateReviewError("diff review acceptance does not match its durable dispatch")
+        try:
+            _require_complete_provider_dispatch_binding(
+                connection, identity, context,
+                attempt_id=dispatch.provider_attempt_id, role=ProviderRole.SUPERVISOR,
+                profile_identity=dispatch.selected_profile_identity,
+                session_identity=dispatch.supervisor_session_identity,
+                external_turn_identity=dispatch.external_turn_identity,
+                input_fingerprint=dispatch.input_digest, observed=_clock(now),
+            )
+        except ProviderRecoveryError as error:
+            raise CandidateReviewError(
+                "diff review acceptance provider dispatch has drifted"
+            ) from error
         row = connection.execute("SELECT state, accepted_review_identity, verification_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (dispatch.diff_review_attempt_id, identity.task_id)).fetchone()
         if row is None or row[2] != dispatch.verification_digest:
             raise CandidateReviewError("diff review acceptance does not match its dispatch")

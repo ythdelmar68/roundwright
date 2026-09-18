@@ -52,7 +52,8 @@ from .provider_recovery import (
     claim_supervisor_dispatch, read_supervisor_dispatch_claim, SupervisorDispatchClaimState, read_attempt, record_invalid_output, recover_attempt, prepare_attempt, read_supervisor_accounting_snapshot,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
     SupervisorAccountingBlocker, record_supervisor_accounting_blocker,
-    _require_persisted_health_authorization, _require_session_checkpoint,
+    _require_complete_provider_dispatch_binding, _require_persisted_health_authorization,
+    _require_session_checkpoint,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
 from .state import TaskIdentity, _open_writable_connection, check_database, require_runtime_binding, task_projection
@@ -530,6 +531,7 @@ class DurableDiffReviewRunner:
         attempt_ids: list[str] = []
         for position, entry in enumerate(entries):
             route = None
+            format_predecessor = None
             if position:
                 # A successor is not merely an ordered list item.  It must be
                 # be authorized from the exact *terminal* source before it
@@ -551,13 +553,12 @@ class DurableDiffReviewRunner:
                         entry.selection.physical_format_output_ordinal
                         != predecessor.selection.physical_format_output_ordinal + 1
                         or terminal is not None
-                        or not self._format_correction_is_durable(
-                            predecessor.selection.provider_attempt_id,
-                        )
                     ):
                         raise ProviderAttemptRuntimeError(
                             "prior Supervisor outcome is not format-correction-eligible"
                         )
+                    self._require_format_correction_predecessor(predecessor)
+                    format_predecessor = predecessor
                 elif terminal is not None:
                     route = self._authorize_terminal_successor(predecessor, entry)
                 else:
@@ -566,7 +567,9 @@ class DurableDiffReviewRunner:
                     raise ProviderAttemptRuntimeError(
                         "provider profile transition has no terminal recovery route"
                     )
-            attempt_id, accepted = self._execute_selection(entry, recovery_route=route)
+            attempt_id, accepted = self._execute_selection(
+                entry, recovery_route=route, format_predecessor=format_predecessor,
+            )
             attempt_ids.append(attempt_id)
             if accepted:
                 return tuple(attempt_ids)
@@ -626,6 +629,49 @@ class DurableDiffReviewRunner:
         finally:
             connection.close()
         return len(rows) == 1 and rows[0][0] == rows[0][1] and rows[0][0] in expected
+
+    def _require_format_correction_predecessor(
+        self, predecessor: DiffReviewSequenceEntry,
+    ) -> object:
+        """Authenticate the whole malformed turn and its original provider debit."""
+
+        selection = predecessor.selection
+        try:
+            stored = read_attempt(
+                self.repository, self.identity, selection.provider_attempt_id,
+                context=predecessor.recovery, now=self.dispatch_control.now,
+            )
+            expected_input = preflight_diff_review_session_checkpoint(
+                self.repository, self.identity, predecessor.recovery,
+                self.binding, self.seal, dependency_binding=self.dependency_binding,
+                control=self.dispatch_control,
+                implementation_attempt_id=selection.implementation_attempt_id,
+                provider_attempt_id=selection.provider_attempt_id,
+                message_identity=selection.message_identity,
+                process_lease_id=selection.process_lease_id,
+                process_lease_expires_at=selection.process_lease_expires_at,
+                selected_profile_identity=predecessor.audit.profile_identity,
+                within_round_attempt=selection.resolved_logical_profile_position,
+                review_round=self.review_round, review_epoch=self.review_epoch,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            self._require_exact_persisted_attempt(
+                predecessor, stored, expected_input,
+            )
+            if (
+                stored.state is not AttemptState.INVALIDATED
+                or not self._format_correction_is_durable(selection.provider_attempt_id)
+            ):
+                raise ProviderAttemptRuntimeError(
+                    "provider format-correction predecessor is unauthenticated"
+                )
+            self._recover_prepared_reservation(predecessor, required=True)
+            return stored
+        except (CandidateReviewError, GitIdentityError, ProviderRecoveryError, RoleCapabilityError) as error:
+            raise ProviderAttemptRuntimeError(
+                "provider format-correction predecessor is unauthenticated"
+            ) from error
 
     def _recovery_route_material(self, entry: DiffReviewSequenceEntry) -> tuple[str, str, str, str]:
         """Derive the immutable successor route, coordinate, and budget facts."""
@@ -861,6 +907,15 @@ class DurableDiffReviewRunner:
                         or stored.state not in {AttemptState.PREPARED, AttemptState.ACCEPTED, AttemptState.INVALIDATED, AttemptState.BLOCKED, AttemptState.AMBIGUOUS}):
                     raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
                 self._require_exact_persisted_attempt(entry, stored, expected_input)
+                if stored.state is AttemptState.INVALIDATED and position + 1 < len(entries):
+                    successor = entries[position + 1]
+                    if (
+                        successor.selection.resolved_logical_profile_position
+                        == selection.resolved_logical_profile_position
+                        and successor.selection.physical_format_output_ordinal
+                        == selection.physical_format_output_ordinal + 1
+                    ):
+                        self._require_format_correction_predecessor(entry)
                 if stored.state is AttemptState.PREPARED:
                     self._classify_prepared_attempt(entries, position, previous)
                     prepared_seen = True
@@ -936,6 +991,17 @@ class DurableDiffReviewRunner:
                         stored.session_identity, entry.recovery,
                         authorization_fingerprint,
                     )
+                    if stored.external_turn_identity is not None:
+                        _require_complete_provider_dispatch_binding(
+                            connection, self.identity, entry.recovery,
+                            attempt_id=selection.provider_attempt_id,
+                            role=ProviderRole.SUPERVISOR,
+                            profile_identity=entry.audit.profile_identity,
+                            session_identity=stored.session_identity,
+                            external_turn_identity=stored.external_turn_identity,
+                            input_fingerprint=expected_input,
+                            observed=self.dispatch_control.now,
+                        )
             except ProviderRecoveryError as error:
                 raise ProviderAttemptRuntimeError("provider session checkpoint has drifted") from error
             if stored.external_turn_identity is None:
@@ -1054,9 +1120,9 @@ class DurableDiffReviewRunner:
             and selection.physical_format_output_ordinal == predecessor.physical_format_output_ordinal + 1
             and entry.audit.profile_identity == predecessor_entry.audit.profile_identity
         ):
-            if (previous is None or previous.state is not AttemptState.INVALIDATED
-                    or not self._format_correction_is_durable(predecessor.provider_attempt_id)):
+            if previous is None or previous.state is not AttemptState.INVALIDATED:
                 raise ProviderAttemptRuntimeError("provider prepared correction is unauthenticated")
+            self._require_format_correction_predecessor(predecessor_entry)
             return "format-correction", self._recover_prepared_reservation(entry, required=True)
         if (
             selection.resolved_logical_profile_position == predecessor.resolved_logical_profile_position + 1
@@ -1084,7 +1150,10 @@ class DurableDiffReviewRunner:
             return "profile-fallback", self._recover_prepared_reservation(entry, required=True)
         raise ProviderAttemptRuntimeError("provider prepared successor is unauthenticated")
 
-    def _execute_selection(self, entry: DiffReviewSequenceEntry, *, recovery_route: object | None = None) -> tuple[str, bool]:
+    def _execute_selection(
+        self, entry: DiffReviewSequenceEntry, *, recovery_route: object | None = None,
+        format_predecessor: DiffReviewSequenceEntry | None = None,
+    ) -> tuple[str, bool]:
         """Use public durable APIs for exactly one observed native outcome."""
 
         selection, recovery, audit, backend = entry.selection, entry.recovery, entry.audit, entry.backend
@@ -1487,6 +1556,11 @@ class DurableDiffReviewRunner:
             )
             turn_checkpointed = True
 
+        # The first check authorized successor materialization and budget.  A
+        # second check immediately before the native adapter preserves that
+        # predecessor binding across the durability boundary.
+        if format_predecessor is not None:
+            self._require_format_correction_predecessor(format_predecessor)
         try:
             result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,

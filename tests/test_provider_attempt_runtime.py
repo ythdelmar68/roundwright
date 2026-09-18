@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
 from roundwright import external_validation
-from roundwright.candidate_review import CandidateVerification, VerificationKind, VerificationOutcome
+from roundwright.candidate_review import CandidateReviewError, CandidateVerification, VerificationKind, VerificationOutcome
 from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
     SupervisorResultKind, SupervisorSdkTurnErrorCategory, canonical_supervisor_review_material, supervisor_request_digest,
@@ -458,6 +458,67 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     (runner.selection.provider_attempt_id,),
                 ).fetchone(), (0,))
 
+    def test_formal_pass_acceptance_reauthenticates_observed_dispatch_chain(self) -> None:
+        """Response-time dispatch deletion or turn substitution cannot accept PASS."""
+
+        mutations = {
+            "dispatch-claim": "DELETE FROM provider_dispatch_claims WHERE attempt_id=?",
+            "session-checkpoint": "DELETE FROM provider_session_checkpoints WHERE attempt_id=?",
+            "failure-admission": "DELETE FROM provider_failure_admissions WHERE attempt_id=?",
+            "after-dispatch-checkpoint": "DELETE FROM provider_checkpoints WHERE checkpoint_id=? || ':after-dispatch'",
+            "formal-turn": "UPDATE diff_review_attempts SET external_turn_identity='substituted-turn' WHERE provider_attempt_id=?",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(binding=name), TemporaryDirectory() as temporary:
+                runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED,
+                        {"verdict": "pass", "findings": []},
+                    ),
+                    suffix="pass-chain-" + name,
+                )
+
+                class MutatingTurn:
+                    def identity(inner): return "pass-chain-turn"
+                    def abort(inner): return None
+                    def read_response(inner):
+                        with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                            connection.execute(statement, (runner.selection.provider_attempt_id,))
+                        return NativeSupervisorResponse(
+                            SupervisorResultKind.ACCEPTED,
+                            {"status": "complete", "action": "accept-formal-review", "blocker": None},
+                        )
+
+                class MutatingSession:
+                    def identity(inner): return "pass-chain-session"
+                    def close(inner): return None
+                    def start_turn(inner, _request): return MutatingTurn()
+
+                class MutatingBackend:
+                    def __init__(inner): inner.calls = 0
+                    def open_fresh_session(inner, _profile):
+                        inner.calls += 1
+                        return MutatingSession()
+
+                backend = MutatingBackend()
+                changed = replace(
+                    runner, backend=backend,
+                    sequence=(self.sequence_entry(runner, backend=backend),),
+                )
+                with self.assertRaises((ProviderAttemptRuntimeError, CandidateReviewError)):
+                    changed.execute()
+                self.assertEqual(backend.calls, 1)
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT accepted_review_identity FROM diff_review_attempts "
+                        "WHERE provider_attempt_id=? AND accepted_review_identity IS NOT NULL",
+                        (runner.selection.provider_attempt_id,),
+                    ).fetchone())
+                    self.assertIsNone(connection.execute(
+                        "SELECT 1 FROM accepted_provider_reviews WHERE attempt_id=?",
+                        (runner.selection.provider_attempt_id,),
+                    ).fetchone())
     def test_scope_denial_before_session_or_turn_is_durable_without_invented_turn(self) -> None:
         """Each pre-turn scope stop closes the claim with only authentic identity."""
 
@@ -824,6 +885,90 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     self.assertIsNone(connection.execute(
                         "SELECT 1 FROM provider_attempts WHERE attempt_id=?", (successor.provider_attempt_id,),
                     ).fetchone())
+
+    def test_format_correction_preserves_predecessor_binding_through_dispatch(self) -> None:
+        """Deletion after the first durability check still prevents provider effects."""
+
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, _identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                suffix="correction-race",
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(
+                replace(runner, sequence=(first,)).execute(),
+                (runner.selection.provider_attempt_id,),
+            )
+            successor = replace(
+                runner.selection, diff_review_attempt_id="correction-race-review",
+                provider_attempt_id="correction-race-provider",
+                message_identity="correction-race-message",
+                process_lease_id="correction-race-lease",
+                physical_format_output_ordinal=1,
+            )
+            backend = Backend(
+                "correction-race-successor",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                [],
+            )
+            restarted = replace(runner, sequence=(
+                first, self.sequence_entry(runner, selection=successor, recovery=recovery, backend=backend),
+            ))
+            original = provider_attempt_runtime.prepare_attempt
+
+            def delete_after_prepare(*args, **kwargs):
+                prepared = original(*args, **kwargs)
+                if kwargs["attempt_id"] == successor.provider_attempt_id:
+                    with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                        connection.execute(
+                            "DELETE FROM provider_checkpoints WHERE checkpoint_id=?",
+                            (runner.selection.provider_attempt_id + ":after-dispatch",),
+                        )
+                return prepared
+
+            with patch.object(provider_attempt_runtime, "prepare_attempt", side_effect=delete_after_prepare):
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.execute()
+            self.assertEqual(backend.calls, 0)
+
+    def test_format_correction_requires_original_sealed_provider_debit(self) -> None:
+        """Missing or conflicting source cost cannot authorize another call."""
+
+        for mutation in ("missing", "conflicting"):
+            with self.subTest(cost=mutation), TemporaryDirectory() as temporary:
+                runner, _, _repository, _identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                    suffix="correction-cost-" + mutation,
+                )
+                first = self.sequence_entry(runner)
+                self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+                successor = replace(
+                    runner.selection, diff_review_attempt_id="correction-cost-review-" + mutation,
+                    provider_attempt_id="correction-cost-provider-" + mutation,
+                    message_identity="correction-cost-message-" + mutation,
+                    process_lease_id="correction-cost-lease-" + mutation,
+                    physical_format_output_ordinal=1,
+                )
+                backend = Backend(
+                    "correction-cost-successor-" + mutation,
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    [],
+                )
+                restarted = replace(runner, sequence=(
+                    first, self.sequence_entry(runner, selection=successor, recovery=recovery, backend=backend),
+                ))
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection, connection:
+                    if mutation == "missing":
+                        connection.execute("DELETE FROM role_budget_usage")
+                    else:
+                        connection.execute("UPDATE role_budget_usage SET calls=calls-1")
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.execute()
+                self.assertEqual(backend.calls, 0)
 
     def test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected(self) -> None:
         with TemporaryDirectory() as temporary:

@@ -551,6 +551,84 @@ class DependencyReviewTests(unittest.TestCase):
                         repository, attempt_id=proposal.attempt_id, binding=binding,
                     )
 
+    def test_schema67_and_schema83_history_survives_newer_seal_but_rejects_tampering(self) -> None:
+        """A newer candidate preserves only complete authenticated old history."""
+
+        from roundwright.state import MIGRATIONS
+
+        for version in (67, 83):
+            with self.subTest(schema=version), tempfile.TemporaryDirectory() as temporary:
+                repository, subset = self.setup_review(Path(temporary))
+                store = DependencyReviewStore()
+                binding = self.binding(subset)
+                proposal = self.proposal(f"schema{version}-newer-seal-history")
+                store.start_attempt(
+                    repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                    source_owned_relations=self.source_owned_relations(proposal),
+                )
+                self.accept(store, repository, proposal, binding=binding)
+                path = database_path(repository)
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    connection.execute(
+                        "UPDATE candidate_seals SET candidate_sha=? WHERE task_id=?",
+                        ("f" * 40, subset.task_id),
+                    )
+                self.replace_with_schema(repository, version)
+                self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+                with closing(sqlite3.connect(path)) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT candidate_sha FROM candidate_seals WHERE task_id=?",
+                        (subset.task_id,),
+                    ).fetchone(), ("f" * 40,))
+                    self.assertEqual(connection.execute(
+                        "SELECT session_identity, turn_identity, output_digest "
+                        "FROM dependency_review_accepted_result_dispatches WHERE attempt_id=?",
+                        (proposal.attempt_id,),
+                    ).fetchone(), (
+                        "session-" + proposal.attempt_id,
+                        "turn-" + proposal.attempt_id,
+                        proposal.proposal_digest,
+                    ))
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM dependency_review_failure_admissions WHERE attempt_id=?",
+                        (proposal.attempt_id,),
+                    ).fetchone(), (0,) if version == 67 else (1,))
+                with self.assertRaises(DependencyReviewError):
+                    store.terminal_snapshot(
+                        repository, attempt_id=proposal.attempt_id, binding=binding,
+                    )
+
+        for tamper in ("missing-proposal", "conflicting-output"):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as temporary:
+                repository, subset = self.setup_review(Path(temporary))
+                store = DependencyReviewStore()
+                binding = self.binding(subset)
+                proposal = self.proposal("schema67-newer-seal-" + tamper)
+                store.start_attempt(
+                    repository, subset, attempt_id=proposal.attempt_id, binding=binding,
+                    source_owned_relations=self.source_owned_relations(proposal),
+                )
+                self.accept(store, repository, proposal, binding=binding)
+                path = database_path(repository)
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    connection.execute(
+                        "UPDATE candidate_seals SET candidate_sha=? WHERE task_id=?",
+                        ("f" * 40, subset.task_id),
+                    )
+                    if tamper == "missing-proposal":
+                        connection.execute(
+                            "DELETE FROM dependency_review_proposals WHERE attempt_id=?",
+                            (proposal.attempt_id,),
+                        )
+                    else:
+                        connection.execute(
+                            "UPDATE dependency_review_validation_outcomes SET output_digest=? WHERE attempt_id=?",
+                            (digest("f"), proposal.attempt_id),
+                        )
+                self.replace_with_schema(repository, 67)
+                with self.assertRaisesRegex(StateError, "unauthenticated"):
+                    initialize(repository)
+
     def test_incomplete_schema67_claim_does_not_mint_admission_authority(self) -> None:
         """Only complete accepted legacy evidence receives a historical binding."""
 

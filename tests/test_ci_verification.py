@@ -506,6 +506,27 @@ class CiVerificationTests(unittest.TestCase):
         self.assertIn("ci/verify_package_digest.py verify dist", workflow)
         self.assertIn("ci/verify_package_digest.py qualify dist", workflow)
 
+    def test_platform_matrix_keeps_explicit_complete_job_time_budgets(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        verify_package = workflow[
+            workflow.index("  verify-package:"):workflow.index("  docker-consumer-qualification:")
+        ]
+        expected_matrix = """      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.12"
+            timeout_minutes: 20
+          - os: macos-latest
+            python: "3.12"
+            timeout_minutes: 35
+          - os: windows-latest
+            python: "3.12"
+            timeout_minutes: 90
+"""
+        self.assertIn(expected_matrix, verify_package)
+        self.assertIn("    timeout-minutes: ${{ matrix.timeout_minutes }}", verify_package)
+        self.assertEqual(verify_package.count("timeout-minutes:"), 1)
+
     def test_docker_consumer_workflow_qualifies_the_uploaded_wheel_without_publication(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("docker-consumer-qualification:", workflow)

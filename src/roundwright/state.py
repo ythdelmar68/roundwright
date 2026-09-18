@@ -1928,6 +1928,7 @@ def _migrate_dependency_review_evidence_bindings(
 ) -> None:
     """Retain historical dependency identities without manufacturing claims."""
 
+    from .dependency_review import DependencyReviewError, DependencyReviewStore
     from .failure_recovery import FailureRole, pre_dispatch_failure_identity
 
     def opaque(value: object) -> bool:
@@ -1986,6 +1987,19 @@ def _migrate_dependency_review_evidence_bindings(
         session_identity, turn_identity, claim_state, task_base_sha, seal_base_sha,
         seal_candidate_sha, state_identity, runtime_schema, runtime_configuration,
     ) in claims:
+        # Reconstruct the complete legacy request from its retained subset,
+        # members, trusted relations, input digest, proposal, edges, and
+        # outcome before any v84 authority is backfilled.  Scalar agreement
+        # among the joined rows is insufficient: a drifted old candidate can
+        # otherwise become internally consistent current recovery authority.
+        try:
+            retained_attempt, retained_subset = DependencyReviewStore._read_attempt(
+                connection, attempt_id,
+            )
+        except (DependencyReviewError, TypeError, ValueError) as error:
+            raise StateError(
+                "legacy dependency review dispatch is unauthenticated"
+            ) from error
         if (
             not opaque(attempt_id) or not opaque(task_id)
             or subset_task != task_id
@@ -2005,6 +2019,14 @@ def _migrate_dependency_review_evidence_bindings(
             )
             or runtime_schema != "roundwright-runtime/v1"
             or runtime_configuration != attempt_configuration
+            or retained_attempt[0] != task_id
+            or retained_attempt[1] != retained_subset.snapshot_id
+            or retained_attempt[2] != profile_identity
+            or retained_attempt[3] != attempt_configuration
+            or retained_subset.task_id != subset_task
+            or retained_subset.candidate_sha != candidate_sha
+            or retained_subset.policy_digest != policy_digest
+            or retained_subset.configuration_digest != subset_configuration
         ):
             raise StateError("legacy dependency review dispatch is unauthenticated")
         if claim_state == "pre-dispatch":

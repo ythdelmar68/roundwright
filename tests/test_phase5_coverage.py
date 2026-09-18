@@ -292,6 +292,9 @@ class Phase5CoverageTests(unittest.TestCase):
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_format_correction_preserves_predecessor_binding_through_dispatch",
             "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_format_correction_requires_original_sealed_provider_debit",
             "tests.test_dependency_review.DependencyReviewTests.test_schema67_and_schema83_history_survives_newer_seal_but_rejects_tampering",
+            "tests.test_codex_supervisor.SupervisorTests.test_qualification_rejects_coherently_substituted_health_case",
+            "tests.test_candidate_review.CandidateReviewTests.test_findings_require_the_complete_observed_provider_dispatch",
+            "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_provider_outage_fallback_requires_the_original_provider_debit",
         )
         self.assertEqual(coverage.ISSUE_132_SEMANTIC_TESTS, required)
         self.assertEqual(tuple(test for test in coverage.SEMANTIC_TESTS if test in required), required)
@@ -343,6 +346,10 @@ class Phase5CoverageTests(unittest.TestCase):
         self.assertEqual(
             tuple(coverage.ISSUE_132_E1R21_FINDING_REQUIREMENTS),
             ("E1R21-01", "E1R21-02", "E1R21-03", "E1R21-04", "E1R21-05"),
+        )
+        self.assertEqual(
+            tuple(coverage.ISSUE_132_E1R22_FINDING_REQUIREMENTS),
+            ("E1R22-01", "E1R22-02", "E1R22-03", "E1R22-04", "E1R22-05"),
         )
 
     def test_issue_132_semantic_inventory_rejects_omission_and_reordering(self) -> None:
@@ -414,6 +421,10 @@ class Phase5CoverageTests(unittest.TestCase):
         e1r21 = dict(coverage.ISSUE_132_E1R21_FINDING_REQUIREMENTS)
         e1r21.pop("E1R21-05")
         with patch.object(coverage, "ISSUE_132_E1R21_FINDING_REQUIREMENTS", e1r21), self.assertRaisesRegex(coverage.CoverageError, "E1R21 finding mapping"):
+            coverage._validate_issue_132_semantic_tests()
+        e1r22 = dict(coverage.ISSUE_132_E1R22_FINDING_REQUIREMENTS)
+        e1r22.pop("E1R22-05")
+        with patch.object(coverage, "ISSUE_132_E1R22_FINDING_REQUIREMENTS", e1r22), self.assertRaisesRegex(coverage.CoverageError, "E1R22 finding mapping"):
             coverage._validate_issue_132_semantic_tests()
 
     def test_issue_132_affected_module_inventory_rejects_candidate_review_omission(self) -> None:

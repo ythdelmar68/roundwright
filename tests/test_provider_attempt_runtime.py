@@ -915,22 +915,35 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             restarted = replace(runner, sequence=(
                 first, self.sequence_entry(runner, selection=successor, recovery=recovery, backend=backend),
             ))
-            original = provider_attempt_runtime.prepare_attempt
+            original = provider_attempt_runtime.require_scope_effect_admission
+            admissions = 0
 
-            def delete_after_prepare(*args, **kwargs):
-                prepared = original(*args, **kwargs)
-                if kwargs["attempt_id"] == successor.provider_attempt_id:
+            def delete_at_adapter_admission(*args, **kwargs):
+                nonlocal admissions
+                admitted = original(*args, **kwargs)
+                admissions += 1
+                # The first admission is preflight; the second is the
+                # adapter's serialized, immediately-before-effect boundary.
+                if admissions == 2:
                     with closing(sqlite3.connect(database_path(repository))) as connection, connection:
                         connection.execute(
                             "DELETE FROM provider_checkpoints WHERE checkpoint_id=?",
                             (runner.selection.provider_attempt_id + ":after-dispatch",),
                         )
-                return prepared
+                return admitted
 
-            with patch.object(provider_attempt_runtime, "prepare_attempt", side_effect=delete_after_prepare):
+            with patch.object(
+                provider_attempt_runtime, "require_scope_effect_admission",
+                side_effect=delete_at_adapter_admission,
+            ):
                 with self.assertRaises(ProviderAttemptRuntimeError):
                     restarted.execute()
             self.assertEqual(backend.calls, 0)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertNotEqual(connection.execute(
+                    "SELECT state FROM provider_attempts WHERE attempt_id=?",
+                    (successor.provider_attempt_id,),
+                ).fetchone(), (AttemptState.ACCEPTED.value,))
 
     def test_format_correction_requires_original_sealed_provider_debit(self) -> None:
         """Missing or conflicting source cost cannot authorize another call."""
@@ -1819,6 +1832,99 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                         (payload["failure"], payload["evidence"], payload["action"]),
                         ("transient-service", "verified-service", "prebound-fallback"),
                     )
+
+    def test_provider_outage_fallback_requires_the_original_provider_debit(self) -> None:
+        """Neither outage stage can turn a deleted source debit into a second call."""
+
+        for stage in ("open-session", "start-turn"):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                    ),
+                    suffix="outage-debit-" + stage,
+                )
+
+                class OutageSession:
+                    def identity(self):
+                        return "session-provider-outage-debit"
+
+                    def close(self):
+                        return None
+
+                    def start_turn(self, _request):
+                        raise CodexAdapterError(CodexFailure.PROVIDER_OUTAGE)
+
+                class OutageBackend:
+                    def __init__(self):
+                        self.calls = 0
+
+                    def open_fresh_session(self, _profile):
+                        self.calls += 1
+                        if stage == "open-session":
+                            raise CodexAdapterError(CodexFailure.PROVIDER_OUTAGE)
+                        return OutageSession()
+
+                outage = OutageBackend()
+                first = self.sequence_entry(runner, backend=outage)
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "no pre-bound fallback"):
+                    replace(runner, backend=outage, sequence=(first,)).execute()
+                self.assertEqual(
+                    read_attempt(
+                        repository, identity, runner.selection.provider_attempt_id,
+                        context=recovery,
+                    ).state,
+                    AttemptState.INVALIDATED,
+                )
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection, connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM role_budget_usage",
+                    ).fetchone(), (1,))
+                    connection.execute("DELETE FROM role_budget_usage")
+
+                second_recovery = provider_context(
+                    recovery, identity, ProviderRole.SUPERVISOR,
+                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+                )
+                fallback = Backend(
+                    "provider-outage-debit-fallback-" + stage,
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                    ),
+                    [],
+                )
+                second_selection = DiffReviewSelection(
+                    "provider-outage-debit-review-two-" + stage,
+                    runner.selection.implementation_attempt_id,
+                    "provider-outage-debit-attempt-two-" + stage,
+                    "provider-outage-debit-message-two-" + stage,
+                    "provider-outage-debit-lease-two-" + stage,
+                    runner.selection.process_lease_expires_at,
+                    "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                )
+                restarted = replace(runner, backend=outage, sequence=(
+                    first,
+                    self.sequence_entry(
+                        runner, selection=second_selection, recovery=second_recovery,
+                        audit=second_recovery.health_receipt.audit_identity, backend=fallback,
+                    ),
+                ))
+                # Readiness describes the already-observed outage; fallback
+                # admission is the boundary that must authenticate its debit.
+                restarted.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.execute()
+                self.assertEqual((outage.calls, fallback.calls), (1, 0))
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT state FROM provider_attempts WHERE attempt_id=?",
+                        (second_selection.provider_attempt_id,),
+                    ).fetchone())
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM role_budget_usage",
+                    ).fetchone(), (0,))
 
     def test_accounting_terminal_blocker_is_durable_and_never_fails_over(self) -> None:
         with TemporaryDirectory() as temporary:

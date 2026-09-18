@@ -725,6 +725,10 @@ class DurableDiffReviewRunner:
             self.repository, self.identity, source.selection.provider_attempt_id,
             context=source.recovery, now=self.dispatch_control.now,
         )
+        # A terminal classification cannot mint a second call by itself.  The
+        # exact source effect must still have its original sealed budget debit;
+        # authenticate it before issuing or replaying any fallback route.
+        self._recover_prepared_reservation(source, required=True)
         terminal = read_supervisor_terminal_failure(
             self.repository, self.identity, source.selection.provider_attempt_id,
         )
@@ -1163,6 +1167,12 @@ class DurableDiffReviewRunner:
                 require_scope_effect_admission(
                     self.repository, self.identity, "supervisor:" + self.identity.task_id,
                 )
+                # This callback is the adapter's last admission boundary before
+                # the native provider effect.  Re-read the malformed source
+                # turn here so a checkpoint deletion after preparation cannot
+                # race the earlier correction checks.
+                if format_predecessor is not None:
+                    self._require_format_correction_predecessor(format_predecessor)
             except ScopeAdmissionDenied:
                 raise
             except Exception as error:

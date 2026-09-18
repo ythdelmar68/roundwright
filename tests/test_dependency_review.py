@@ -598,7 +598,7 @@ class DependencyReviewTests(unittest.TestCase):
                         repository, attempt_id=proposal.attempt_id, binding=binding,
                     )
 
-        for tamper in ("missing-proposal", "conflicting-output"):
+        for tamper in ("missing-proposal", "conflicting-output", "substituted-subset-candidate"):
             with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as temporary:
                 repository, subset = self.setup_review(Path(temporary))
                 store = DependencyReviewStore()
@@ -620,14 +620,36 @@ class DependencyReviewTests(unittest.TestCase):
                             "DELETE FROM dependency_review_proposals WHERE attempt_id=?",
                             (proposal.attempt_id,),
                         )
-                    else:
+                    elif tamper == "conflicting-output":
                         connection.execute(
                             "UPDATE dependency_review_validation_outcomes SET output_digest=? WHERE attempt_id=?",
                             (digest("f"), proposal.attempt_id),
                         )
+                    else:
+                        # Advance the current seal, then rewrite only the old
+                        # subset's candidate column.  Its retained subset and
+                        # request digests still authenticate the original value.
+                        connection.execute(
+                            "UPDATE dependency_review_subsets SET candidate_sha=? WHERE snapshot_id=?",
+                            ("e" * 40, subset.snapshot_id),
+                        )
                 self.replace_with_schema(repository, 67)
                 with self.assertRaisesRegex(StateError, "unauthenticated"):
                     initialize(repository)
+                if tamper == "substituted-subset-candidate":
+                    with closing(sqlite3.connect(path)) as connection:
+                        self.assertEqual(connection.execute(
+                            "SELECT MAX(version) FROM schema_migrations",
+                        ).fetchone(), (67,))
+                        for table in (
+                            "dependency_review_failure_admissions",
+                            "dependency_review_accepted_result_dispatches",
+                            "recovery_route_authorizations",
+                        ):
+                            self.assertIsNone(connection.execute(
+                                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                                (table,),
+                            ).fetchone())
 
     def test_incomplete_schema67_claim_does_not_mint_admission_authority(self) -> None:
         """Only complete accepted legacy evidence receives a historical binding."""

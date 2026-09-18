@@ -905,6 +905,17 @@ def record_diff_review(
         or provider.input_fingerprint != dispatch.input_digest
     ):
         raise CandidateReviewError("diff review provider attempt does not match the durable dispatch")
+    # Authenticate the complete native dispatch before completed-output state
+    # can be written.  The same check is repeated below in the product-state
+    # transaction so a deletion in either interval cannot authorize FINDINGS.
+    connection = _open_writable_connection(repository)
+    try:
+        _require_complete_diff_review_dispatch(
+            connection, identity, context, dispatch, now,
+            unavailable="diff review provider dispatch has drifted",
+        )
+    finally:
+        connection.close()
     if provider.state is AttemptState.ACCEPTED:
         if (
             provider.accepted_review_identity != dispatch.diff_review_attempt_id
@@ -931,6 +942,10 @@ def record_diff_review(
             # transition are one current-scope decision.  A response-time
             # STOP_SCOPE therefore leaves none of them behind.
             require_scope_open(connection, identity.task_id, "supervisor:" + identity.task_id)
+            _require_complete_diff_review_dispatch(
+                connection, identity, context, dispatch, now,
+                unavailable="diff review findings provider dispatch has drifted",
+            )
         artifact = connection.execute("SELECT verdict, findings_json, pass_follow_ups_json, content_digest FROM diff_review_artifacts WHERE diff_review_attempt_id = ?", (diff_review_attempt_id,)).fetchone()
         expected_artifact = (normalized.verdict.value, json.dumps(findings), json.dumps(normalized.pass_follow_ups), bound_output_digest)
         if artifact is None:
@@ -1431,27 +1446,10 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now, pass_
         # committed while the provider response is being read cannot be
         # overtaken merely because completed output evidence exists.
         require_scope_open(connection, identity.task_id, "supervisor:" + identity.task_id)
-        _require_exact_provider_context(connection, identity, dispatch.provider_attempt_id, context)
-        _require_sealed_provider_authorization(connection, identity, dispatch.provider_attempt_id, context, now)
-        current_dispatch = _read_diff_dispatch_connection(
-            connection, identity, dispatch.diff_review_attempt_id,
-            digest_version=dispatch.digest_version, validate_provider_output=True,
+        _require_complete_diff_review_dispatch(
+            connection, identity, context, dispatch, now,
+            unavailable="diff review acceptance provider dispatch has drifted",
         )
-        if current_dispatch != dispatch:
-            raise CandidateReviewError("diff review acceptance does not match its durable dispatch")
-        try:
-            _require_complete_provider_dispatch_binding(
-                connection, identity, context,
-                attempt_id=dispatch.provider_attempt_id, role=ProviderRole.SUPERVISOR,
-                profile_identity=dispatch.selected_profile_identity,
-                session_identity=dispatch.supervisor_session_identity,
-                external_turn_identity=dispatch.external_turn_identity,
-                input_fingerprint=dispatch.input_digest, observed=_clock(now),
-            )
-        except ProviderRecoveryError as error:
-            raise CandidateReviewError(
-                "diff review acceptance provider dispatch has drifted"
-            ) from error
         row = connection.execute("SELECT state, accepted_review_identity, verification_digest FROM diff_review_attempts WHERE diff_review_attempt_id = ? AND task_id = ?", (dispatch.diff_review_attempt_id, identity.task_id)).fetchone()
         if row is None or row[2] != dispatch.verification_digest:
             raise CandidateReviewError("diff review acceptance does not match its dispatch")
@@ -1509,6 +1507,36 @@ def _accept_diff_pass(repository, identity, context, dispatch, lease, now, pass_
         raise
     finally:
         connection.close()
+
+
+def _require_complete_diff_review_dispatch(
+    connection, identity, context, dispatch, now, *, unavailable: str,
+) -> None:
+    """Authenticate one formal review turn against every durable trust root."""
+
+    _require_exact_provider_context(
+        connection, identity, dispatch.provider_attempt_id, context,
+    )
+    _require_sealed_provider_authorization(
+        connection, identity, dispatch.provider_attempt_id, context, now,
+    )
+    current_dispatch = _read_diff_dispatch_connection(
+        connection, identity, dispatch.diff_review_attempt_id,
+        digest_version=dispatch.digest_version, validate_provider_output=True,
+    )
+    if current_dispatch != dispatch:
+        raise CandidateReviewError(unavailable)
+    try:
+        _require_complete_provider_dispatch_binding(
+            connection, identity, context,
+            attempt_id=dispatch.provider_attempt_id, role=ProviderRole.SUPERVISOR,
+            profile_identity=dispatch.selected_profile_identity,
+            session_identity=dispatch.supervisor_session_identity,
+            external_turn_identity=dispatch.external_turn_identity,
+            input_fingerprint=dispatch.input_digest, observed=_clock(now),
+        )
+    except ProviderRecoveryError as error:
+        raise CandidateReviewError(unavailable) from error
 
 
 def _require_unconsumed_formal_round(repository, identity: TaskIdentity, review_epoch: int, review_round: int) -> None:

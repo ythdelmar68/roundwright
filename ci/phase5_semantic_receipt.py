@@ -109,6 +109,9 @@ TESTS = (
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_format_correction_preserves_predecessor_binding_through_dispatch",
     "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_format_correction_requires_original_sealed_provider_debit",
     "tests.test_dependency_review.DependencyReviewTests.test_schema67_and_schema83_history_survives_newer_seal_but_rejects_tampering",
+    "tests.test_codex_supervisor.SupervisorTests.test_qualification_rejects_coherently_substituted_health_case",
+    "tests.test_candidate_review.CandidateReviewTests.test_findings_require_the_complete_observed_provider_dispatch",
+    "tests.test_provider_attempt_runtime.ProviderAttemptRuntimeTests.test_provider_outage_fallback_requires_the_original_provider_debit",
 )
 WINDOWS_DECLARED_SKIPS: tuple[str, ...] = ()
 

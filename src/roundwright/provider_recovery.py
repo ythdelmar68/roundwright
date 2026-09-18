@@ -1975,6 +1975,22 @@ def _persist_health_authorization(connection, attempt_id: str, receipt, role: Pr
 
 
 def _require_persisted_health_authorization(connection, attempt_id: str, context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> str:
+    # The persisted row is evidence, not its own trust root.  Re-authorize the
+    # original receipt carried by the caller's trusted recovery context and
+    # require the durable values to be that exact receipt.  Otherwise an
+    # attacker able to rewrite the case and recompute the dependent seal and
+    # checkpoint fingerprints could manufacture a self-consistent substitute.
+    health_values = (
+        context.health_contract_commit, context.shadow_case_id, context.health_receipt,
+    )
+    trusted_values = None
+    if any(value is not None for value in health_values):
+        trusted_receipt = _require_health_authorization(
+            context, role, profile_identity, observed,
+        )
+        trusted_values = _health_authorization_values(
+            trusted_receipt, role, profile_identity,
+        )
     existing = connection.execute(
         "SELECT authorization.contract_commit, authorization.candidate_sha, authorization.case_id, authorization.receipt_digest, authorization.selection_ordinal, authorization.fresh_until, authorization.health_contract_identity, authorization.provider_role, authorization.profile_identity, seals.authorization_fingerprint FROM provider_attempt_health_authorizations AS authorization LEFT JOIN provider_attempt_health_seals AS seals ON seals.attempt_id = authorization.attempt_id WHERE authorization.attempt_id = ?",
         (attempt_id,),
@@ -1990,6 +2006,7 @@ def _require_persisted_health_authorization(connection, attempt_id: str, context
         or type(existing[6]) is not str or not _DIGEST.fullmatch(existing[6])
         or existing[7] != role.value or existing[8] != profile_identity
         or existing[1] != context.candidate_sha
+        or (trusted_values is not None and existing[:9] != trusted_values)
         or type(existing[9]) is not str or not _FINGERPRINT.fullmatch(existing[9])
         or existing[9] != _health_authorization_fingerprint(attempt_id, existing[:9])
     ):

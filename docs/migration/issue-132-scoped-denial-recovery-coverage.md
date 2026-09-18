@@ -415,3 +415,21 @@ provider, migration, or historical authority.
 All five adversarial tests are appended to the ordered semantic inventory.
 Windows declares no E1R21 skips, and render/verify requires their exact
 candidate-bound execution receipt.
+
+## E1R22 original-evidence and last-boundary closure
+
+E1R22 closes five remaining cases where internally consistent replacement or
+late deletion could outlive the evidence that originally authorized an effect.
+
+| Finding | Candidate-bound invariant and semantic evidence |
+| --- | --- |
+| E1R22-01 | Qualification binds the persisted health authorization to the trusted original receipt, including its case identity, rather than accepting recomputed authorization and checkpoint fingerprints. `test_qualification_rejects_coherently_substituted_health_case` substitutes `foreign-case`, recomputes every dependent fingerprint, and proves PASS cannot be appended or sealed. |
+| E1R22-02 | FINDINGS authenticates the same complete observed provider dispatch as PASS both before completed-output persistence and again in the atomic artifact/route/state transaction. `test_findings_require_the_complete_observed_provider_dispatch` deletes the dispatch claim immediately before recording and proves provider, review, task, route, artifact, and review-item state remain unchanged. |
+| E1R22-03 | Format correction reauthenticates the malformed predecessor from the adapter's final effect-admission callback. The extended `test_format_correction_preserves_predecessor_binding_through_dispatch` deletes the predecessor after-dispatch checkpoint at that boundary and proves zero successor calls and no accepted successor. |
+| E1R22-04 | Transient fallback requires read-back of the exact source provider debit before a recovery route may be issued or replayed. `test_provider_outage_fallback_requires_the_original_provider_debit` deletes that debit after both pre-session and pre-turn outage forms and proves no fallback call, successor attempt, or replacement debit. |
+| E1R22-05 | Schema-67 migration reconstructs the complete retained subset, members, trusted relations, request digest, proposal, edges, outcome, and candidate identity before backfilling current recovery authority. The extended `test_schema67_and_schema83_history_survives_newer_seal_but_rejects_tampering` advances the seal, substitutes only the historical subset candidate, and proves transactional migration rollback with no admission, accepted-result, or recovery-route tables. |
+
+All five findings are pinned by the independent Issue #132 semantic inventory.
+The two extended regressions retain their existing positions; the three new
+tests are appended in finding order. Windows declares no E1R22 skips, and
+coverage render/verify requires their exact candidate-bound execution receipt.

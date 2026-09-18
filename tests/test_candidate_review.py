@@ -1219,6 +1219,72 @@ class CandidateReviewTests(unittest.TestCase):
                     (review.diff_review_attempt_id,),
                 ).fetchone(), (0,))
 
+    def test_findings_require_the_complete_observed_provider_dispatch(self):
+        """A missing dispatch claim leaves FINDINGS and task state untouched."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            _, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("findings-auth-tests", VerificationKind.TEST, VerificationOutcome.PASS, "7" * 64),
+                CandidateVerification("findings-auth-build", VerificationKind.BUILD, VerificationOutcome.PASS, "8" * 64),
+            ):
+                record_candidate_verification(
+                    repository, identity, binding, seal, verification, lease=lease,
+                )
+            dispatch = dispatch_diff_review(
+                repository, identity, review_context, binding, seal,
+                diff_review_attempt_id="diff-findings-auth",
+                implementation_attempt_id="implementation-25",
+                provider_attempt_id="findings-auth-supervisor",
+                supervisor_session_identity="findings-auth-session",
+                external_turn_identity="findings-auth-turn",
+                message_identity="findings-auth-message",
+                process_lease_id="findings-auth-lease",
+                process_lease_expires_at=now + 60, lease=lease, now=now,
+            )
+            output = DiffReviewOutput(
+                dispatch.diff_review_attempt_id, dispatch.provider_attempt_id,
+                dispatch.supervisor_session_identity, dispatch.external_turn_identity,
+                dispatch.message_identity, seal.base_sha, seal.candidate_sha,
+                DiffReviewVerdict.FINDINGS, ("repair authenticated dispatch",),
+            )
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                connection.execute(
+                    "DELETE FROM provider_dispatch_claims WHERE attempt_id=?",
+                    (dispatch.provider_attempt_id,),
+                )
+            with self.assertRaisesRegex(CandidateReviewError, "provider dispatch has drifted"):
+                record_diff_review(
+                    repository, identity, review_context, binding, seal,
+                    diff_review_attempt_id=dispatch.diff_review_attempt_id,
+                    output=output, completion_evidence_fingerprint="9" * 64,
+                    lease=lease, now=now,
+                )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM tasks WHERE task_id=?", (identity.task_id,),
+                ).fetchone(), ("diff-review",))
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM diff_review_attempts WHERE diff_review_attempt_id=?",
+                    (dispatch.diff_review_attempt_id,),
+                ).fetchone(), ("dispatched",))
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM provider_attempts WHERE attempt_id=?",
+                    (dispatch.provider_attempt_id,),
+                ).fetchone(), ("dispatched",))
+                for table in ("diff_review_artifacts", "diff_review_routes"):
+                    self.assertEqual(connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE diff_review_attempt_id=?",
+                        (dispatch.diff_review_attempt_id,),
+                    ).fetchone(), (0,))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM review_item_records WHERE review_identity=?",
+                    (dispatch.diff_review_attempt_id,),
+                ).fetchone(), (0,))
+
     def test_findings_route_to_the_same_worker_and_require_a_new_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
             values = self.ready_task(Path(temporary) / "repository")

@@ -28,6 +28,7 @@ from roundwright.codex_supervisor import (
     SupervisorFallbackAuthorization, dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
 from roundwright.provider_recovery import AttemptState, ProviderRole, RecoveryContext, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState, prepare_attempt, record_external_turn, record_session_identity
+import roundwright.provider_recovery as provider_recovery
 from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
 from roundwright.role_capability_policy import AdvisoryRole, RoleCapabilityError, reserve_role_effect, trusted_provider_launch_context
 from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
@@ -1190,6 +1191,74 @@ class SupervisorTests(unittest.TestCase):
                     review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
                     checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
                 )
+
+    def test_qualification_rejects_coherently_substituted_health_case(self):
+        """A recomputed durable seal cannot replace the trusted health receipt."""
+
+        import roundwright.supervisor_shadow as supervisor_shadow
+
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+            NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+        ))
+        original = supervisor_shadow._require_complete_provider_dispatch_binding
+
+        def exercise(run, repository, _budget):
+            def substitute_before_acceptance(connection, identity, recovery_context, **kwargs):
+                attempt_id = kwargs["attempt_id"]
+                values = list(connection.execute(
+                    "SELECT contract_commit, candidate_sha, case_id, receipt_digest, "
+                    "selection_ordinal, fresh_until, health_contract_identity, "
+                    "provider_role, profile_identity FROM provider_attempt_health_authorizations "
+                    "WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone())
+                values[2] = "foreign-case"
+                authorization = provider_recovery._health_authorization_fingerprint(
+                    attempt_id, tuple(values),
+                )
+                checkpoint = provider_recovery._checkpoint_fingerprint(
+                    recovery_context, authorization,
+                )
+                connection.execute(
+                    "UPDATE provider_attempt_health_authorizations SET case_id=? WHERE attempt_id=?",
+                    (values[2], attempt_id),
+                )
+                connection.execute(
+                    "UPDATE provider_attempt_health_seals SET authorization_fingerprint=? WHERE attempt_id=?",
+                    (authorization, attempt_id),
+                )
+                connection.execute(
+                    "UPDATE provider_checkpoints SET identity_fingerprint=? WHERE attempt_id=?",
+                    (checkpoint, attempt_id),
+                )
+                connection.execute(
+                    "UPDATE provider_session_checkpoints SET identity_fingerprint=? WHERE attempt_id=?",
+                    (checkpoint, attempt_id),
+                )
+                return original(connection, identity, recovery_context, **kwargs)
+
+            with patch.object(
+                supervisor_shadow, "_require_complete_provider_dispatch_binding",
+                side_effect=substitute_before_acceptance,
+            ), self.assertRaisesRegex(
+                SupervisorShadowError, "lifecycle acceptance is denied",
+            ):
+                run()
+            record_identity = next(iter(lifecycle._records))
+            progress = lifecycle.read_progress(record_identity, evidence_time=101)
+            self.assertEqual((progress[2], progress[4]), ((), None))
+            self.assertEqual(recorder.calls, ["prepare"])
+
+        qualify_supervisor_sequence(
+            adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+            evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+            trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+            review_authority_expectation=self.authority_expectation,
+            review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+            checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+        )
 
     def test_denial_before_correction_reservation_leaves_no_budget_or_successor(self):
         """Scope admission and the correction debit share one lock order."""

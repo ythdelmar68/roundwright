@@ -615,7 +615,11 @@ def claim_supervisor_dispatch(
         require_scope_open(connection, identity.task_id, "supervisor:" + identity.task_id)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
-        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        _require_persisted_health_authorization(
+            connection, attempt_id, context, row.role,
+            row.selected_profile_identity, observed,
+            require_trusted_receipt=True,
+        )
         if row.role is not ProviderRole.SUPERVISOR or row.state is not AttemptState.PREPARED or row.session_identity is not None or row.external_turn_identity is not None or row.output_pointer is not None or row.accepted_review_identity is not None:
             raise ProviderRecoveryError("Supervisor dispatch claim requires an unclaimed prepared attempt")
         existing = connection.execute("SELECT task_id,claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id=?", (attempt_id,)).fetchone()
@@ -1015,7 +1019,11 @@ def accept_supervisor_review(
         _require_matching_task(connection, identity)
         _require_persisted_context(connection, attempt_id, context)
         row = _attempt_row(connection, identity.task_id, attempt_id)
-        _require_persisted_health_authorization(connection, attempt_id, context, row.role, row.selected_profile_identity, observed)
+        _require_persisted_health_authorization(
+            connection, attempt_id, context, row.role,
+            row.selected_profile_identity, observed,
+            require_trusted_receipt=True,
+        )
         if _accepted_review_kind(connection, identity, row) != "generic":
             raise ProviderRecoveryError("generic supervisor acceptance requires generic review evidence")
         if row.role is ProviderRole.SUPERVISOR and row.state is AttemptState.ACCEPTED and row.accepted_review_identity == accepted_review_identity:
@@ -1974,17 +1982,17 @@ def _persist_health_authorization(connection, attempt_id: str, receipt, role: Pr
     return fingerprint
 
 
-def _require_persisted_health_authorization(connection, attempt_id: str, context: RecoveryContext, role: ProviderRole, profile_identity: str, observed: int) -> str:
-    # The persisted row is evidence, not its own trust root.  Re-authorize the
-    # original receipt carried by the caller's trusted recovery context and
-    # require the durable values to be that exact receipt.  Otherwise an
-    # attacker able to rewrite the case and recompute the dependent seal and
-    # checkpoint fingerprints could manufacture a self-consistent substitute.
-    health_values = (
-        context.health_contract_commit, context.shadow_case_id, context.health_receipt,
-    )
+def _require_persisted_health_authorization(
+    connection, attempt_id: str, context: RecoveryContext, role: ProviderRole,
+    profile_identity: str, observed: int, *,
+    require_trusted_receipt: bool = False,
+) -> str:
+    # Acceptance and complete-dispatch callers opt into comparing the durable
+    # row with the original receipt carried by their trusted recovery context.
+    # Terminal replay deliberately validates the sealed durable authorization
+    # without reapplying a later caller's availability/role decision.
     trusted_values = None
-    if any(value is not None for value in health_values):
+    if require_trusted_receipt:
         trusted_receipt = _require_health_authorization(
             context, role, profile_identity, observed,
         )
@@ -2078,6 +2086,7 @@ def _require_complete_provider_dispatch_binding(
         raise ProviderRecoveryError("provider dispatch attempt is unavailable or has drifted")
     authorization_fingerprint = _require_persisted_health_authorization(
         connection, attempt_id, context, role, profile_identity, observed,
+        require_trusted_receipt=True,
     )
     if connection.execute(
         "SELECT task_id, claim_fingerprint FROM provider_dispatch_claims WHERE attempt_id = ?",

@@ -618,7 +618,6 @@ def claim_supervisor_dispatch(
         _require_persisted_health_authorization(
             connection, attempt_id, context, row.role,
             row.selected_profile_identity, observed,
-            require_trusted_receipt=True,
         )
         if row.role is not ProviderRole.SUPERVISOR or row.state is not AttemptState.PREPARED or row.session_identity is not None or row.external_turn_identity is not None or row.output_pointer is not None or row.accepted_review_identity is not None:
             raise ProviderRecoveryError("Supervisor dispatch claim requires an unclaimed prepared attempt")
@@ -1022,7 +1021,6 @@ def accept_supervisor_review(
         _require_persisted_health_authorization(
             connection, attempt_id, context, row.role,
             row.selected_profile_identity, observed,
-            require_trusted_receipt=True,
         )
         if _accepted_review_kind(connection, identity, row) != "generic":
             raise ProviderRecoveryError("generic supervisor acceptance requires generic review evidence")
@@ -1987,8 +1985,8 @@ def _require_persisted_health_authorization(
     profile_identity: str, observed: int, *,
     require_trusted_receipt: bool = False,
 ) -> str:
-    # Acceptance and complete-dispatch callers opt into comparing the durable
-    # row with the original receipt when their recovery context carries one.
+    # Complete-dispatch callers opt into comparing the durable row with the
+    # original receipt when their recovery context carries one.
     # Legacy contexts without external health evidence retain sealed-row
     # validation, and terminal replay does not reapply a later caller's
     # availability/role decision.

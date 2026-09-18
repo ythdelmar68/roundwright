@@ -256,7 +256,8 @@ class DevContainerConsumerTests(unittest.TestCase):
         environment.update({"ROUNDWRIGHT_DOCKER_CANDIDATE_SHA": "a" * 40, "ROUNDWRIGHT_WHEEL_SHA256": "b" * 64})
         for target in ("definition", "dockerfile"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
-                copied = Path(temporary) / "candidate"; shutil.copytree(ROOT, copied)
+                copied = Path(temporary) / "candidate"
+                shutil.copytree(ROOT, copied, ignore=shutil.ignore_patterns("dist"))
                 path = copied / ".devcontainer" / "authoritative" / "devcontainer.json" if target == "definition" else copied / "docker" / "Dockerfile"
                 path.write_text(path.read_text(encoding="utf-8").replace(_BASE, "sha256:" + "0" * 64, 1), encoding="utf-8")
                 output = Path(temporary) / "receipt.json"; calls = []

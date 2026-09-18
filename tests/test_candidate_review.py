@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -33,7 +34,7 @@ from roundwright.runtime_binding import RuntimeBinding
 from roundwright.dependency_policy import BootstrapPolicyReceipt, CandidateBinding, ComponentPolicy, DependencyComponent, DependencyExecutionControl, DependencyPolicy, ObservedDependency, PolicyTransition, PolicyTransitionKind, TrustedDependencyAdmission, VersionRange
 from roundwright.git_identity import CandidateSeal, GitEntrypointControl, GitIdentityError, WorktreeBinding, acquire_transition_lease, provision_worktree
 from roundwright.plan_review import PlanReviewOutput, PlanReviewVerdict, dispatch_plan_review as _native_dispatch_plan_review, record_plan_review
-from roundwright.provider_recovery import AttemptState, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, prepare_attempt, read_attempt, recover_attempt
+from roundwright.provider_recovery import AttemptState, ProviderAttemptAbsentError, ProviderRecoveryError, ProviderRole, RecoveryAction, RecoveryContext, SupervisorDispatchClaimState, claim_supervisor_dispatch, prepare_attempt, read_attempt, read_supervisor_dispatch_claim, recover_attempt
 from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, task_projection
 from roundwright.worker_planning import (
     PlanReviewReceipt, PlanningInput, ProviderDispatchControl, WorkerPlan, WorkerPlanOutput,
@@ -79,8 +80,65 @@ def _dispatch_diff_review(repository, identity, context, binding, seal, **kwargs
         selected = None
     dependency_binding, control = _dispatch_control(identity, context, kwargs["now"], seal.candidate_sha)
     kwargs.update(dependency_binding=dependency_binding, control=control)
+    recovery = provider_context(
+        context, identity, ProviderRole.SUPERVISOR,
+        selected_profile_identity=selected,
+    )
+    if candidate_review._read_diff_dispatch(
+        repository, identity, kwargs["diff_review_attempt_id"],
+    ) is not None:
+        return _native_dispatch_diff_review(
+            repository, identity, recovery, binding, seal, **kwargs
+        )
+    projection = candidate_review._project_review_policy(
+        kwargs.get("review_epoch", 0), kwargs["review_round"],
+        recovery.runtime_binding,
+    )
+    candidate_review._require_unconsumed_formal_round(
+        repository, identity, projection.review_epoch, projection.review_round,
+    )
+    input_digest = candidate_review.preflight_diff_review_session_checkpoint(
+        repository, identity, recovery, binding, seal,
+        dependency_binding=dependency_binding, control=control,
+        implementation_attempt_id=kwargs["implementation_attempt_id"],
+        provider_attempt_id=kwargs["provider_attempt_id"],
+        message_identity=kwargs["message_identity"],
+        process_lease_id=kwargs["process_lease_id"],
+        process_lease_expires_at=kwargs["process_lease_expires_at"],
+        selected_profile_identity=kwargs["selected_profile_identity"],
+        within_round_attempt=kwargs["within_round_attempt"],
+        review_round=kwargs["review_round"],
+        review_epoch=kwargs.get("review_epoch", 0),
+        physical_format_output_ordinal=kwargs.get("physical_format_output_ordinal", 0),
+        lease=kwargs["lease"], now=kwargs["now"],
+    )
+    try:
+        provider = read_attempt(
+            repository, identity, kwargs["provider_attempt_id"],
+            context=recovery, now=kwargs["now"],
+        )
+    except ProviderAttemptAbsentError:
+        provider = prepare_attempt(
+            repository, identity, recovery,
+            attempt_id=kwargs["provider_attempt_id"], role=ProviderRole.SUPERVISOR,
+            process_lease_id=kwargs["process_lease_id"],
+            process_lease_expires_at=kwargs["process_lease_expires_at"],
+            input_fingerprint=input_digest,
+            selected_profile_identity=kwargs["selected_profile_identity"],
+            logical_profile_position=kwargs["within_round_attempt"],
+            physical_format_output_ordinal=kwargs.get("physical_format_output_ordinal", 0),
+            review_epoch=kwargs.get("review_epoch", 0), review_round=kwargs["review_round"],
+            lease=kwargs["lease"], now=kwargs["now"],
+        )
+    if provider.state is AttemptState.PREPARED and read_supervisor_dispatch_claim(
+        repository, identity, recovery, attempt_id=kwargs["provider_attempt_id"],
+    ) is SupervisorDispatchClaimState.UNCLAIMED:
+        claim_supervisor_dispatch(
+            repository, identity, recovery, attempt_id=kwargs["provider_attempt_id"],
+            lease=kwargs["lease"], now=kwargs["now"],
+        )
     return _native_dispatch_diff_review(
-        repository, identity, provider_context(context, identity, ProviderRole.SUPERVISOR, selected_profile_identity=selected), binding, seal, **kwargs
+        repository, identity, recovery, binding, seal, **kwargs
     )
 
 
@@ -373,6 +431,25 @@ class CandidateReviewTests(unittest.TestCase):
                     with self.assertRaises(CandidateReviewError):
                         _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
                     continue
+                # A later logical profile is never a valid new ledger origin.
+                # Seed the exact preceding durable Supervisor coordinates so this
+                # fixture exercises CandidateReview's within-round mapping rather
+                # than bypassing the accounting origin invariant.
+                for position in range(1, ordinal):
+                    selected_profile_identity = context.runtime_binding.supervisor_profile_identities[position - 1]
+                    prepare_attempt(
+                        repository, identity,
+                        provider_context(
+                            review_context, identity, ProviderRole.SUPERVISOR,
+                            selected_profile_identity=selected_profile_identity,
+                        ),
+                        attempt_id=f"mapping-prior-supervisor-{position}", role=ProviderRole.SUPERVISOR,
+                        process_lease_id=f"mapping-prior-lease-{position}", process_lease_expires_at=now + 60,
+                        input_fingerprint=f"{position:x}" * 64,
+                        selected_profile_identity=selected_profile_identity,
+                        logical_profile_position=position, physical_format_output_ordinal=0,
+                        review_epoch=0, review_round=4, lease=lease, now=now,
+                    )
                 dispatch = _dispatch_diff_review(repository, identity, review_context, binding, seal, **arguments)
                 self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).selected_profile_identity, arguments["selected_profile_identity"])
                 self.assertEqual((dispatch.within_round_attempt, dispatch.selected_profile_identity), (ordinal, arguments["selected_profile_identity"]))
@@ -421,6 +498,71 @@ class CandidateReviewTests(unittest.TestCase):
                     process_lease_id="later-supervisor-lease", process_lease_expires_at=now + 60,
                     input_fingerprint="e" * 64, lease=lease, now=now,
                 )
+
+    def test_legacy_populated_reviews_preserve_authenticated_identity_on_migration(self):
+        import json
+        from types import SimpleNamespace
+        from roundwright.state import MIGRATIONS, StateError, _apply_migrations, initialize
+        for accepted, tamper in ((True, False), (False, False), (True, True), (False, True)):
+            with self.subTest(accepted=accepted, tamper=tamper), tempfile.TemporaryDirectory() as temporary:
+                values = self.ready_task(Path(temporary) / "repository")
+                repository, identity, lease, _, binding, now = values
+                if accepted:
+                    seal, context, review = self.accepted_diff_review(values)
+                else:
+                    with patch(__name__ + ".record_diff_review", return_value=SimpleNamespace(accepted=True)):
+                        seal, context, review = self.accepted_diff_review(values)
+                policy = review.review_policy
+                # Exact schema-67 wire material, independent of the new encoders.
+                material = dict(task=identity.task_id, implementation=review.implementation_attempt_id, base=review.base_sha, candidate=review.candidate_sha, message=review.message_identity, verifications=review.verification_digest, within_round_attempt=review.within_round_attempt, selected_profile_identity=review.selected_profile_identity, review_round=policy.review_round, review_mode=policy.review_mode.value, review_complete_rounds=policy.complete_rounds, review_max_rounds=policy.max_rounds, review_max_supervisor_attempts_per_round=policy.max_supervisor_attempts_per_round, review_on_final_findings=policy.on_final_findings.value, review_policy_digest=policy.policy_digest)
+                if policy.review_epoch:
+                    material["review_epoch"] = policy.review_epoch
+                legacy_input = candidate_review._digest(material)
+                output = DiffReviewOutput(review.diff_review_attempt_id, review.provider_attempt_id, review.supervisor_session_identity, review.external_turn_identity, review.message_identity, seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS)
+                legacy_output = candidate_review._digest(dict(normalized_output_digest=output.digest, within_round_attempt=review.within_round_attempt, selected_profile_identity=review.selected_profile_identity))
+                path = database_path(repository)
+                with closing(sqlite3.connect(path)) as connection, connection:
+                    connection.execute("UPDATE diff_review_attempts SET input_digest=? WHERE diff_review_attempt_id=?", (legacy_input, review.diff_review_attempt_id))
+                    connection.execute("UPDATE provider_attempts SET input_fingerprint=? WHERE attempt_id=?", (legacy_input, review.provider_attempt_id))
+                    if accepted:
+                        connection.execute("UPDATE diff_review_artifacts SET content_digest=?", (legacy_output,))
+                        connection.execute("UPDATE provider_completion_outputs SET output_fingerprint=? WHERE attempt_id=?", (legacy_output, review.provider_attempt_id))
+                # Reconstruct the historical schema without inventing migration receipts.
+                legacy_path = path.with_name("legacy.sqlite")
+                with closing(sqlite3.connect(legacy_path)) as connection, connection:
+                    _apply_migrations(connection, MIGRATIONS[:67])
+                    connection.execute("ATTACH DATABASE ? AS current", (str(path),))
+                    tables = [row[0] for row in connection.execute("SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+                    for table in tables:
+                        if table == "schema_migrations":
+                            continue
+                        columns = [row[1] for row in connection.execute(f'PRAGMA main.table_info("{table}")')]
+                        names = ",".join('"' + name + '"' for name in columns)
+                        connection.execute(f'DELETE FROM main."{table}"')
+                        connection.execute(f'INSERT INTO main."{table}" ({names}) SELECT {names} FROM current."{table}"')
+                    if tamper:
+                        connection.execute("UPDATE diff_review_attempts SET input_digest=?", ("f" * 64,))
+                legacy_path.replace(path)
+                if tamper:
+                    with self.assertRaisesRegex(StateError, "unauthenticated"):
+                        initialize(repository)
+                    with closing(sqlite3.connect(path)) as connection, connection:
+                        self.assertEqual(connection.execute("SELECT max(version) FROM schema_migrations").fetchone(), (67,))
+                    continue
+                self.assertEqual(initialize(repository).version, len(MIGRATIONS))
+                dispatch = candidate_review._read_diff_dispatch(repository, identity, review.diff_review_attempt_id)
+                self.assertEqual((dispatch.input_digest, dispatch.digest_version), (legacy_input, 1))
+                if not accepted:
+                    replay = dispatch_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, implementation_attempt_id=review.implementation_attempt_id, provider_attempt_id=review.provider_attempt_id, supervisor_session_identity=review.supervisor_session_identity, external_turn_identity=review.external_turn_identity, message_identity=review.message_identity, process_lease_id="diff-accepted-lease", process_lease_expires_at=now + 60, review_round=policy.review_round, review_epoch=policy.review_epoch, lease=lease, now=now)
+                    self.assertEqual(replay, dispatch)
+                    with self.assertRaisesRegex(CandidateReviewError, "dispatch has drifted"):
+                        record_diff_review(repository, identity, context, binding, seal, diff_review_attempt_id=review.diff_review_attempt_id, output=output, completion_evidence_fingerprint="c" * 64, lease=lease, now=now)
+                    continue
+                else:
+                    result = read_diff_review(repository, identity, review.diff_review_attempt_id, binding=binding, seal=seal, context=context, lease=lease)
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.content_digest, legacy_output)
+                self.assertEqual(initialize(repository).version, len(MIGRATIONS))
 
     def test_accepted_diff_review_persists_a_profile_bound_output_digest(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -987,7 +1129,7 @@ class CandidateReviewTests(unittest.TestCase):
             record_candidate_verification(repository, identity, binding, seal, CandidateVerification("later-targeted-test", VerificationKind.TEST, VerificationOutcome.PASS, "6" * 64), lease=lease)
             with self.assertRaisesRegex(CandidateReviewError, "verification evidence has changed"):
                 record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-25", "diff-supervisor", "diff-session-25", "diff-turn", "diff-message", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="7" * 64, lease=lease, now=now)
-            dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-26", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor-2", supervisor_session_identity="diff-session-26", external_turn_identity="diff-turn-2", message_identity="diff-message-2", process_lease_id="diff-lease-2", process_lease_expires_at=now + 60, lease=lease, now=now)
+            dispatch = dispatch_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id="diff-26", implementation_attempt_id="implementation-25", provider_attempt_id="diff-supervisor-2", supervisor_session_identity="diff-session-26", external_turn_identity="diff-turn-2", message_identity="diff-message-2", process_lease_id="diff-lease-2", process_lease_expires_at=now + 60, review_epoch=1, lease=lease, now=now)
             result = record_diff_review(repository, identity, review_context, binding, seal, diff_review_attempt_id=dispatch.diff_review_attempt_id, output=DiffReviewOutput("diff-26", "diff-supervisor-2", "diff-session-26", "diff-turn-2", "diff-message-2", seal.base_sha, seal.candidate_sha, DiffReviewVerdict.PASS, pass_follow_ups=("owner-note",)), completion_evidence_fingerprint="8" * 64, lease=lease, now=now)
             self.assertTrue(result.accepted)
             self.assertEqual(result.accepted_review_identity, dispatch.diff_review_attempt_id)
@@ -1004,6 +1146,144 @@ class CandidateReviewTests(unittest.TestCase):
             record_candidate_verification(repository, identity, binding, seal, CandidateVerification("post-pass-test", VerificationKind.TEST, VerificationOutcome.PASS, "9" * 64), lease=lease)
             self.assertFalse(read_diff_review(repository, identity, dispatch.diff_review_attempt_id, binding=binding, seal=seal, context=review_context, lease=lease).accepted)
             self.assertEqual(read_attempt(repository, identity, dispatch.provider_attempt_id).state, AttemptState.INVALIDATED)
+
+    def test_response_time_denial_rolls_back_findings_route_and_transition(self):
+        """FINDINGS cannot outrun the PASS-only scope fence."""
+
+        from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRecoveryError, FailureRole, classify, record_durable_failure
+
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            implementation, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("denial-tests", VerificationKind.TEST, VerificationOutcome.PASS, "5" * 64),
+                CandidateVerification("denial-build", VerificationKind.BUILD, VerificationOutcome.PASS, "6" * 64),
+            ):
+                record_candidate_verification(repository, identity, binding, seal, verification, lease=lease)
+            review = dispatch_diff_review(
+                repository, identity, review_context, binding, seal,
+                diff_review_attempt_id="diff-denied-findings",
+                implementation_attempt_id=implementation.implementation_attempt_id,
+                provider_attempt_id="denied-findings-supervisor",
+                supervisor_session_identity="denied-findings-session",
+                external_turn_identity="denied-findings-turn",
+                message_identity="denied-findings-message",
+                process_lease_id="denied-findings-lease",
+                process_lease_expires_at=now + 60, lease=lease, now=now,
+            )
+            output = DiffReviewOutput(
+                review.diff_review_attempt_id, review.provider_attempt_id,
+                review.supervisor_session_identity, review.external_turn_identity,
+                review.message_identity, seal.base_sha, seal.candidate_sha,
+                DiffReviewVerdict.FINDINGS, ("repair denied race",),
+            )
+            original = candidate_review.record_completed_output
+
+            def deny_after_completion(*args, **kwargs):
+                completed = original(*args, **kwargs)
+                record_durable_failure(
+                    repository, identity,
+                    classify(FailureBinding(
+                        seal.candidate_sha, "sha256:" + review_context.policy_fingerprint,
+                        review_context.runtime_binding.resolved_digest,
+                        "supervisor:" + identity.task_id, FailureRole.SUPERVISOR,
+                        review.selected_profile_identity, review.supervisor_session_identity,
+                        review.provider_attempt_id,
+                    ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                    now=now,
+                )
+                return completed
+
+            with patch.object(candidate_review, "record_completed_output", side_effect=deny_after_completion), self.assertRaises(FailureRecoveryError):
+                record_diff_review(
+                    repository, identity, review_context, binding, seal,
+                    diff_review_attempt_id=review.diff_review_attempt_id, output=output,
+                    completion_evidence_fingerprint="7" * 64, lease=lease, now=now,
+                )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM tasks WHERE task_id=?", (identity.task_id,),
+                ).fetchone(), ("diff-review",))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM diff_review_artifacts WHERE diff_review_attempt_id=?",
+                    (review.diff_review_attempt_id,),
+                ).fetchone(), (0,))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM diff_review_routes WHERE diff_review_attempt_id=?",
+                    (review.diff_review_attempt_id,),
+                ).fetchone(), (0,))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM review_item_records WHERE review_identity=?",
+                    (review.diff_review_attempt_id,),
+                ).fetchone(), (0,))
+
+    def test_findings_require_the_complete_observed_provider_dispatch(self):
+        """A missing dispatch claim leaves FINDINGS and task state untouched."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            values = self.ready_task(Path(temporary) / "repository")
+            repository, identity, lease, context, binding, now = values
+            _, seal = self.implement(values)
+            review_context = self.review_context(identity, context, seal)
+            for verification in (
+                CandidateVerification("findings-auth-tests", VerificationKind.TEST, VerificationOutcome.PASS, "7" * 64),
+                CandidateVerification("findings-auth-build", VerificationKind.BUILD, VerificationOutcome.PASS, "8" * 64),
+            ):
+                record_candidate_verification(
+                    repository, identity, binding, seal, verification, lease=lease,
+                )
+            dispatch = dispatch_diff_review(
+                repository, identity, review_context, binding, seal,
+                diff_review_attempt_id="diff-findings-auth",
+                implementation_attempt_id="implementation-25",
+                provider_attempt_id="findings-auth-supervisor",
+                supervisor_session_identity="findings-auth-session",
+                external_turn_identity="findings-auth-turn",
+                message_identity="findings-auth-message",
+                process_lease_id="findings-auth-lease",
+                process_lease_expires_at=now + 60, lease=lease, now=now,
+            )
+            output = DiffReviewOutput(
+                dispatch.diff_review_attempt_id, dispatch.provider_attempt_id,
+                dispatch.supervisor_session_identity, dispatch.external_turn_identity,
+                dispatch.message_identity, seal.base_sha, seal.candidate_sha,
+                DiffReviewVerdict.FINDINGS, ("repair authenticated dispatch",),
+            )
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                connection.execute(
+                    "DELETE FROM provider_dispatch_claims WHERE attempt_id=?",
+                    (dispatch.provider_attempt_id,),
+                )
+            with self.assertRaisesRegex(CandidateReviewError, "provider dispatch has drifted"):
+                record_diff_review(
+                    repository, identity, review_context, binding, seal,
+                    diff_review_attempt_id=dispatch.diff_review_attempt_id,
+                    output=output, completion_evidence_fingerprint="9" * 64,
+                    lease=lease, now=now,
+                )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM tasks WHERE task_id=?", (identity.task_id,),
+                ).fetchone(), ("diff-review",))
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM diff_review_attempts WHERE diff_review_attempt_id=?",
+                    (dispatch.diff_review_attempt_id,),
+                ).fetchone(), ("dispatched",))
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM provider_attempts WHERE attempt_id=?",
+                    (dispatch.provider_attempt_id,),
+                ).fetchone(), ("dispatched",))
+                for table in ("diff_review_artifacts", "diff_review_routes"):
+                    self.assertEqual(connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE diff_review_attempt_id=?",
+                        (dispatch.diff_review_attempt_id,),
+                    ).fetchone(), (0,))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM review_item_records WHERE review_identity=?",
+                    (dispatch.diff_review_attempt_id,),
+                ).fetchone(), (0,))
 
     def test_findings_route_to_the_same_worker_and_require_a_new_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1044,7 +1324,7 @@ class CandidateReviewTests(unittest.TestCase):
                 CandidateVerification("repair-build", VerificationKind.BUILD, VerificationOutcome.PASS, "c" * 64),
             ):
                 record_candidate_verification(repository, identity, binding, repaired_seal, verification, lease=lease)
-            fresh = dispatch_diff_review(repository, identity, repaired_context, binding, repaired_seal, diff_review_attempt_id="diff-repaired", implementation_attempt_id=repair.implementation_attempt_id, provider_attempt_id="repair-supervisor", supervisor_session_identity="repair-session", external_turn_identity="repair-review-turn", message_identity="repair-message", process_lease_id="repair-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            fresh = dispatch_diff_review(repository, identity, repaired_context, binding, repaired_seal, diff_review_attempt_id="diff-repaired", implementation_attempt_id=repair.implementation_attempt_id, provider_attempt_id="repair-supervisor", supervisor_session_identity="repair-session", external_turn_identity="repair-review-turn", message_identity="repair-message", process_lease_id="repair-review-lease", process_lease_expires_at=now + 60, review_epoch=1, lease=lease, now=now)
             second_findings = record_diff_review(repository, identity, repaired_context, binding, repaired_seal, diff_review_attempt_id=fresh.diff_review_attempt_id, output=DiffReviewOutput("diff-repaired", "repair-supervisor", "repair-session", "repair-review-turn", "repair-message", repaired_seal.base_sha, repaired_seal.candidate_sha, DiffReviewVerdict.FINDINGS, ("second repair boundary",)), completion_evidence_fingerprint="d" * 64, lease=lease, now=now)
             with self.assertRaisesRegex(CandidateReviewError, "routed diff-review parent"):
                 begin_implementation(repository, identity, context, implementation_attempt_id="repair-26", provider_attempt_id="repair-worker-2", plan_attempt_id="plan-25", worker_thread_identity="worker-thread-25", external_turn_identity="repair-turn-2", process_lease_id="repair-lease-2", process_lease_expires_at=now + 60, lease=lease, now=now)
@@ -1064,7 +1344,7 @@ class CandidateReviewTests(unittest.TestCase):
                 CandidateVerification("final-repair-build", VerificationKind.BUILD, VerificationOutcome.PASS, "0" * 64),
             ):
                 record_candidate_verification(repository, identity, binding, final_seal, verification, lease=lease)
-            final_review = dispatch_diff_review(repository, identity, final_context, binding, final_seal, diff_review_attempt_id="diff-final", implementation_attempt_id=repair_two.implementation_attempt_id, provider_attempt_id="final-supervisor", supervisor_session_identity="final-session", external_turn_identity="final-review-turn", message_identity="final-message", process_lease_id="final-review-lease", process_lease_expires_at=now + 60, lease=lease, now=now)
+            final_review = dispatch_diff_review(repository, identity, final_context, binding, final_seal, diff_review_attempt_id="diff-final", implementation_attempt_id=repair_two.implementation_attempt_id, provider_attempt_id="final-supervisor", supervisor_session_identity="final-session", external_turn_identity="final-review-turn", message_identity="final-message", process_lease_id="final-review-lease", process_lease_expires_at=now + 60, review_epoch=2, lease=lease, now=now)
             accepted = record_diff_review(repository, identity, final_context, binding, final_seal, diff_review_attempt_id=final_review.diff_review_attempt_id, output=DiffReviewOutput("diff-final", "final-supervisor", "final-session", "final-review-turn", "final-message", final_seal.base_sha, final_seal.candidate_sha, DiffReviewVerdict.PASS), completion_evidence_fingerprint="1" * 64, lease=lease, now=now)
             self.assertTrue(accepted.accepted)
             self.assertNotEqual(fresh.supervisor_session_identity, dispatch.supervisor_session_identity)

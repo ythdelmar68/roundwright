@@ -5,10 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import shutil
 import subprocess
 import sys
+import time
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -22,14 +25,17 @@ from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
     ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, SupervisorAccountingDecisionSemantic,
     SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory,
-    dispatch_ordered_supervisor_attempts, supervisor_request_digest,
+    SupervisorFallbackAuthorization, dispatch_ordered_supervisor_attempts, supervisor_request_digest,
 )
-from roundwright.provider_recovery import AttemptState, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState
-from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
-from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect, trusted_provider_launch_context
+from roundwright.provider_recovery import AttemptState, ProviderRole, RecoveryContext, SupervisorAccountingAttemptSnapshot, SupervisorAccountingSnapshot, SupervisorDispatchClaimState, prepare_attempt, record_external_turn, record_session_identity
+import roundwright.provider_recovery as provider_recovery
+from roundwright.configuration import ConfigurationError, ConfigurationSource, FileReviewAuthorityStore, FinalFindingsPolicy, ProviderProfile, ReasoningEffort, RepositoryIdentity, ResolvedConfigurationBinding, ReviewAuthorityExpectation, ReviewMode, ReviewPolicy, TrustedReviewAuthorityReceipt, load_configuration, resolve_dispatch_configuration
+from roundwright.role_capability_policy import AdvisoryRole, RoleCapabilityError, reserve_role_effect, trusted_provider_launch_context
 from tests.role_admission_fixture import sealed_execution, sealed_execution_for_effect, trusted_execution_host
 from roundwright.policy import PolicyDocument, TrustedControlSource, TrustedPolicySnapshot
-from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexHealthContract, CodexRuntimeAudit, HealthState, ProviderHealthAuditIdentity, ProviderHealthObservation, ProviderHealthReceipt, required_provider_selections
+from roundwright.git_identity import acquire_transition_lease
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
 from roundwright.runtime_binding import FileSupervisorRuntimeStore, InMemorySupervisorRuntimeStore, RuntimeBindingError, SupervisorRuntimeBindingReceipt
 from roundwright.supervisor_toolbox import HarnessNativeCodexSupervisorBackend, _consume
 from roundwright.worker_toolbox import CompletionDeadline
@@ -53,18 +59,120 @@ def digest(value: object) -> str:
 
 
 def qualify_supervisor_sequence(adapters, requests, advisory_executions, *args, **kwargs):
-    """Supply wrapper-owned exact hosts and an ephemeral durable budget path."""
+    """Supply a verified durable task/attempt fixture for sequence tests."""
 
+    exercise = kwargs.pop("_exercise", None)
     with TemporaryDirectory() as temporary:
-        return _qualify_supervisor_sequence(
-            adapters, requests, advisory_executions, *args,
-            execution_hosts=tuple(
-                trusted_execution_host(AdvisoryRole.SUPERVISOR, adapter._profile)
-                for adapter in adapters
-            ),
-            budget_ledger_path=Path(temporary) / "role-budget.sqlite",
-            **kwargs,
+        readiness, binding, policy = args[:3]
+        context = requests[0].context
+        repository = object.__new__(RepositoryIdentity)
+        object.__setattr__(repository, "root", Path(temporary).resolve())
+        identity = TaskIdentity(
+            context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright",
+            "codex/supervisor-sequence", "C:/private/supervisor-sequence", context.base_sha,
         )
+        initialize(repository)
+        lease = acquire_transition_lease(
+            repository, repository_id=identity.repository_id,
+            owner="supervisor-sequence-tests", ttl_seconds=1000,
+        )
+        admit_task(
+            repository, identity,
+            (SourceSnapshot(identity.source_id, identity.repository_id, hashlib.sha256(identity.source_id.encode()).hexdigest()),),
+            lease=lease,
+        )
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            connection.execute(
+                "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                (identity.task_id, identity.base_sha, context.candidate_sha, lease.state_identity),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        recoveries = {}
+        for request, adapter in zip(requests, adapters, strict=True):
+            audit = adapter._audit
+            health = ProviderHealthObservation(
+                ProviderRole.SUPERVISOR, audit.profile_identity,
+                CodexHealthContract(audit.audit.sdk_version, audit.audit.runtime_version, identity.base_sha).fingerprint,
+                audit.audit.fingerprint, HealthState.READY, None, 0, 2_000_000_000, 1,
+            )
+            receipt = ProviderHealthReceipt(
+                identity.base_sha, context.candidate_sha, binding.case_id,
+                next(
+                    ordinal for ordinal, role, profile_identity in required_provider_selections(policy.runtime)
+                    if (role, profile_identity) == (ProviderRole.SUPERVISOR, audit.profile_identity)
+                ),
+                policy.runtime, ProviderRole.SUPERVISOR, audit.profile_identity,
+                health, audit,
+            )
+            recovery = RecoveryContext.for_task(
+                identity, candidate_sha=context.candidate_sha,
+                policy_fingerprint=context.policy_digest.removeprefix("sha256:"),
+                deployment_fingerprint="d" * 64, runtime_binding=policy.runtime,
+                health_contract_commit=identity.base_sha, shadow_case_id=binding.case_id,
+                health_receipt=receipt,
+            )
+            recoveries[request.provider_attempt_id] = recovery
+            prepare_attempt(
+                repository, identity, recovery, attempt_id=request.provider_attempt_id,
+                role=ProviderRole.SUPERVISOR,
+                process_lease_id="lease-" + request.provider_attempt_id,
+                process_lease_expires_at=int(time.time()) + 100,
+                input_fingerprint=request.input_digest.removeprefix("sha256:"),
+                selected_profile_identity=request.selected_profile_identity,
+                logical_profile_position=request.within_round_attempt,
+                physical_format_output_ordinal=request.physical_format_output_ordinal,
+                review_epoch=context.review_epoch, review_round=context.review_round,
+                lease=lease,
+            )
+
+        supplied_session = kwargs.pop("checkpoint_session")
+        supplied_turn = kwargs.pop("checkpoint_turn")
+        session_requests = {
+            "session-" + adapter._backend.identity: request
+            for request, adapter in zip(requests, adapters, strict=True)
+        }
+
+        def checkpoint_session(session_identity):
+            request = session_requests[session_identity]
+            record_session_identity(
+                repository, identity, recoveries[request.provider_attempt_id],
+                attempt_id=request.provider_attempt_id, session_identity=session_identity, lease=lease,
+            )
+            supplied_session(session_identity)
+
+        def checkpoint_turn(session_identity, turn_identity):
+            request = session_requests[session_identity]
+            record_external_turn(
+                repository, identity, recoveries[request.provider_attempt_id],
+                attempt_id=request.provider_attempt_id, session_identity=session_identity,
+                external_turn_identity=turn_identity, lease=lease,
+            )
+            supplied_turn(session_identity, turn_identity)
+
+        def run(*, new_attempt=False):
+            if new_attempt:
+                return prepare_attempt(
+                    repository, identity, recoveries[requests[0].provider_attempt_id],
+                    attempt_id="new-review-identity", role=ProviderRole.SUPERVISOR,
+                    process_lease_id="new-review-lease", process_lease_expires_at=int(time.time()) + 100,
+                    input_fingerprint="e" * 64, selected_profile_identity=requests[0].selected_profile_identity,
+                    logical_profile_position=1, physical_format_output_ordinal=0,
+                    review_epoch=context.review_epoch, review_round=context.review_round + 1, lease=lease,
+                )
+            return _qualify_supervisor_sequence(
+                adapters, requests, advisory_executions, *args,
+                repository=repository, task_identity=identity,
+                recovery_context=recoveries[requests[0].provider_attempt_id],
+                execution_hosts=tuple(trusted_execution_host(AdvisoryRole.SUPERVISOR, adapter._profile) for adapter in adapters),
+                budget_ledger_path=Path(temporary) / "role-budget.sqlite",
+                checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
+                **kwargs,
+            )
+        return run() if exercise is None else exercise(run, repository, Path(temporary) / "role-budget.sqlite")
 
 
 class Turn:
@@ -80,7 +188,7 @@ class Turn:
         if self._response.kind is SupervisorResultKind.ACCEPTED and "binding" not in self._response.structured_output:
             request = self._request
             value = dict(self._response.structured_output)
-            value["binding"] = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "within_round_attempt": request.within_round_attempt, "profile_identity": request.selected_profile_identity}
+            value["binding"] = {"input_digest": request.input_digest, "candidate_sha": request.context.candidate_sha, "logical_profile_position": request.within_round_attempt, "physical_format_output_ordinal": request.physical_format_output_ordinal, "profile_identity": request.selected_profile_identity}
             return NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, value)
         return self._response
 
@@ -118,7 +226,10 @@ class SupervisorTests(unittest.TestCase):
         )
 
     def admissions(self, adapters, requests=None):
-        requests = tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)) if requests is None else requests
+        requests = tuple(
+            self.request(index, adapter, logical=1, physical=index - 1)
+            for index, adapter in enumerate(adapters, start=1)
+        ) if requests is None else requests
         return tuple(self.admission(adapter, request) for adapter, request in zip(adapters, requests, strict=True))
 
     def execution_hosts(self, adapters):
@@ -140,8 +251,16 @@ class SupervisorTests(unittest.TestCase):
 
     def dispatch_ordered(self, requests, adapters, **kwargs):
         ledger_path = self.next_budget_path()
+        executions = self.admissions(adapters, requests)
+        def verified_route(source, _result, target):
+            def consume(reservation):
+                # Direct dispatcher tests use the real sealed reservation;
+                # qualifier tests exercise the durable route ledger itself.
+                reservation.require_recovery_route(executions[requests.index(target)])
+            return SupervisorFallbackAuthorization(source.input_digest, target.input_digest, consume)
+        kwargs.setdefault("authorize_fallback", verified_route)
         return dispatch_ordered_supervisor_attempts(
-            requests, adapters, self.admissions(adapters, requests),
+            requests, adapters, executions,
             self.execution_hosts(adapters),
             tuple(ledger_path for _ in adapters), **kwargs,
         )
@@ -156,21 +275,31 @@ class SupervisorTests(unittest.TestCase):
         self.budget_temporary = TemporaryDirectory()
         self.budget_ledger_path = Path(self.budget_temporary.name) / "role-budget.sqlite"
         self._budget_counter = 0
-        floor = ReviewPolicy(3, 10, 3, FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
-        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
-        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
-        anchor = load_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_review_floor=floor).resolved_digest
-        authority_root = Path(self.authority_temporary.name)
-        self.authority_expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(authority_root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "b" * 40, anchor, 101, 120)
-        self.authority_store = FileReviewAuthorityStore(authority_root, expectation=self.authority_expectation)
-        self.authority_evidence = self.authority_store.persist(authority, candidate_sha="b" * 40, configuration_anchor_digest=anchor, ready_at=101, freshness_until=120)
-        self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, trusted_policy_snapshot=snapshot, trusted_review_floor=floor, trusted_review_authority_receipt=authority, review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, candidate_sha="b" * 40, evidence_time=101).pin()
-        self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
+        self.configure_supervisors()
+
+    def configure_supervisors(self, count=3):
         self.profiles = (
             ProviderProfile("gpt-5.6-sol", ReasoningEffort.HIGH, "primary"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback"),
             ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fallback-retry"),
         )
+        if count == 4:
+            self.profiles += (ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH, "fourth"),)
+        else:
+            self.profiles = self.profiles[:count]
+        cli = {"review.max_supervisor_attempts_per_round": str(len(self.profiles)), "roles.supervisor.attempt_profiles": [{"name": profile.name, "model": profile.model, "reasoning_effort": profile.reasoning_effort.value} for profile in self.profiles]}
+        if count == 3:
+            cli = {}
+        floor = ReviewPolicy(3, 10, len(self.profiles), FinalFindingsPolicy.WORKER_FINAL_REPAIR_THEN_MERGE)
+        snapshot = TrustedPolicySnapshot(TrustedControlSource("a" * 64, "b" * 64), PolicyDocument(1, frozenset()))
+        authority = TrustedReviewAuthorityReceipt.from_snapshot(snapshot, floor)
+        anchor = load_configuration(cwd=ROOT, environment={}, home=ROOT, cli_values=cli, trusted_review_floor=floor).resolved_digest
+        authority_root = Path(self.authority_temporary.name) / str(count)
+        self.authority_expectation = ReviewAuthorityExpectation(authority.source_identity, authority.authority_identity, authority.runtime_store_source_identity, FileReviewAuthorityStore.identity_for_root(authority_root), authority.receipt_digest, authority.policy_snapshot_digest, floor, "b" * 40, anchor, 101, 120)
+        self.authority_store = FileReviewAuthorityStore(authority_root, expectation=self.authority_expectation)
+        self.authority_evidence = self.authority_store.persist(authority, candidate_sha="b" * 40, configuration_anchor_digest=anchor, ready_at=101, freshness_until=120)
+        self.configuration = resolve_dispatch_configuration(cwd=ROOT, environment={}, home=ROOT, cli_values=cli, trusted_policy_snapshot=snapshot, trusted_review_floor=floor, trusted_review_authority_receipt=authority, review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, candidate_sha="b" * 40, evidence_time=101).pin()
+        self.context = CodexSupervisorContext("task-44", *(digest(item) for item in ("source", "repo", "worktree", "branch")), "a" * 40, "b" * 40, "sha256:" + self.configuration.runtime_binding().review_policy_digest, self.configuration.digest, 2, 4, ReviewMode.CONVERGING)
 
     def tearDown(self):
         self.budget_temporary.cleanup()
@@ -180,17 +309,21 @@ class SupervisorTests(unittest.TestCase):
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile)
         return CodexSupervisorAdapter(Backend(identity, response, self.events), profile, audit)
 
-    def request(self, ordinal, adapter):
-        values = dict(review_attempt_id=f"review-{ordinal}", provider_attempt_id=f"provider-{ordinal}", selected_profile_identity=adapter.profile_identity, within_round_attempt=ordinal, context=self.context, objective="Review the immutable candidate.", acceptance_criteria=("Return a strict verdict.",))
+    def request(self, ordinal, adapter, *, logical=None, physical=0):
+        values = dict(review_attempt_id=f"review-{ordinal}", provider_attempt_id=f"provider-{ordinal}", selected_profile_identity=adapter.profile_identity, within_round_attempt=ordinal if logical is None else logical, physical_format_output_ordinal=physical, context=self.context, objective="Review the immutable candidate.", acceptance_criteria=("Return a strict verdict.",))
         return CodexSupervisorRequest(input_digest=supervisor_request_digest(**values), **values)
 
-    def test_later_schema_valid_fallback_is_accepted_after_invalid_primary(self):
+    def test_format_exhaustion_blocks_even_a_schema_valid_later_profile(self):
         primary = self.adapter(self.profiles[0], "one", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX))
+        retry_one = self.adapter(self.profiles[0], "one-retry", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX))
+        retry_two = self.adapter(self.profiles[0], "one-retry-two", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX))
         fallback = self.adapter(self.profiles[1], "two", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}))
-        result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda identity: self.events.append(("session", identity)), checkpoint_turn=lambda session, turn: self.events.append(("turn", session, turn)))
-        self.assertFalse(result.exhausted)
-        self.assertEqual((result.attempted_profile_identities, result.result.verdict, result.result.findings), ((primary.profile_identity, fallback.profile_identity), "findings", ("missing-evidence",)))
-        self.assertEqual([event[0] for event in self.events if event[0] == "start"], ["start", "start"])
+        result = self.dispatch_ordered((self.request(1, primary, logical=1), self.request(2, retry_one, logical=1, physical=1), self.request(3, retry_two, logical=1, physical=2), self.request(4, fallback, logical=2)), (primary, retry_one, retry_two, fallback), checkpoint_session=lambda identity: self.events.append(("session", identity)), checkpoint_turn=lambda session, turn: self.events.append(("turn", session, turn)))
+        self.assertTrue(result.exhausted)
+        self.assertEqual(result.attempted_profile_identities, (primary.profile_identity,) * 3)
+        self.assertEqual(result.result.kind, SupervisorResultKind.INVALID)
+        self.assertEqual(fallback._backend.calls, 0)
+        self.assertEqual([event[0] for event in self.events if event[0] == "start"], ["start"] * 3)
 
     def test_dispatch_rejects_the_removed_expected_execution_argument(self):
         adapter = self.adapter(self.profiles[0], "missing-expectation", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
@@ -198,7 +331,7 @@ class SupervisorTests(unittest.TestCase):
             adapter.dispatch(self.request(1, adapter), checkpoint_session=lambda identity: self.events.append(("session", identity)), checkpoint_turn=lambda session, turn: self.events.append(("turn", session, turn)), advisory_execution=self.admission(adapter), expected_execution=object())  # type: ignore[call-arg]
         self.assertEqual((adapter._backend.calls, self.events), (0, []))
 
-    def test_exact_terminal_failure_advances_to_the_next_prebound_profile(self):
+    def test_typed_blocked_stops_before_the_next_prebound_profile(self):
         primary = self.adapter(self.profiles[0], "failed-primary", NativeSupervisorResponse(
             SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
             outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
@@ -206,11 +339,106 @@ class SupervisorTests(unittest.TestCase):
         ))
         fallback = self.adapter(self.profiles[1], "failed-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
         result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
-        self.assertEqual((result.result.kind, result.attempted_profile_identities, primary._backend.calls, fallback._backend.calls), (SupervisorResultKind.ACCEPTED, (primary.profile_identity, fallback.profile_identity), 1, 1))
+        self.assertEqual((result.result.kind, result.attempted_profile_identities, primary._backend.calls, fallback._backend.calls), (SupervisorResultKind.BLOCKED, (primary.profile_identity,), 1, 0))
+
+    def test_fallback_fence_is_abandoned_when_successor_budget_reservation_fails(self):
+        """The generic dispatcher unwinds a prepared fallback before dispatch."""
+
+        primary = self.adapter(self.profiles[0], "fence-primary", NativeSupervisorResponse(
+            SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX,
+        ))
+        # A format repair stays on the current profile at physical ordinal 1.
+        # Use that valid sequence coordinate so the injected budget denial is
+        # the first rejected boundary.
+        fallback = self.adapter(self.profiles[0], "fence-fallback", NativeSupervisorResponse(
+            SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+        ))
+        requests = (self.request(1, primary, logical=1), self.request(2, fallback, logical=1, physical=1))
+        executions = self.admissions((primary, fallback), requests)
+        route_events: list[str] = []
+        authorization = SupervisorFallbackAuthorization(
+            requests[0].input_digest, requests[1].input_digest,
+            lambda reservation: reservation.require_recovery_route(executions[1]),
+            prepare=lambda: route_events.append("prepared"),
+            abandon=lambda: route_events.append("abandoned"),
+        )
+        original_reserve = reserve_role_effect
+        calls = 0
+
+        def reserve_then_fail(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RoleCapabilityError("injected successor reservation failure")
+            return original_reserve(*args, **kwargs)
+
+        with patch("roundwright.codex_supervisor.reserve_role_effect", side_effect=reserve_then_fail):
+            with self.assertRaisesRegex(CodexSupervisorError, "budget admission is denied"):
+                dispatch_ordered_supervisor_attempts(
+                    requests, (primary, fallback), executions, self.execution_hosts((primary, fallback)),
+                    (self.next_budget_path(), self.next_budget_path()),
+                    checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None,
+                    authorize_fallback=lambda _source, _result, _target: authorization,
+                )
+        self.assertEqual((route_events, primary._backend.calls, fallback._backend.calls), (["prepared", "abandoned"], 1, 0))
+
+    def test_security_denial_stops_before_a_prebound_profile_fallback(self):
+        primary = self.adapter(self.profiles[0], "security-denial", NativeSupervisorResponse(
+            SupervisorResultKind.BLOCKED, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+            outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+            sdk_error_category=SupervisorSdkTurnErrorCategory.SANDBOX,
+        ))
+        fallback = self.adapter(self.profiles[1], "must-not-run", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
+        result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((result.result.kind, result.attempted_profile_identities, fallback._backend.calls), (SupervisorResultKind.BLOCKED, (primary.profile_identity,), 0))
+
+    def test_ordered_dispatch_rechecks_scope_after_session_checkpoint(self):
+        """A stop between durable session and turn creation has no turn/read result."""
+
+        from roundwright.failure_recovery import ScopeAdmissionDenied
+
+        adapter = self.adapter(
+            self.profiles[0], "scope-fence", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ),
+        )
+        stopped = False
+        events = adapter._backend.events
+
+        def scope() -> None:
+            if stopped:
+                raise ScopeAdmissionDenied("durable scope stopped")
+
+        def checkpoint(_session: str) -> None:
+            nonlocal stopped
+            stopped = True
+
+        dispatched = self.dispatch_ordered(
+            (self.request(1, adapter),), (adapter,),
+            checkpoint_session=checkpoint,
+            checkpoint_turn=lambda _session, _turn: None,
+            scope_admission=scope,
+        )
+        self.assertEqual(
+            (
+                dispatched.result.kind, dispatched.result.outcome_source,
+                dispatched.result.failure, dispatched.result.session_identity,
+                dispatched.result.turn_identity,
+            ),
+            (
+                SupervisorResultKind.BLOCKED,
+                SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED,
+                CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+                "session-scope-fence", None,
+            ),
+        )
+        self.assertEqual(adapter._backend.calls, 1)
+        self.assertEqual([event for event in events if event[0] in {"start", "read"}], [])
 
     def test_exhaustion_is_only_for_all_retryable_results_and_never_fabricates_a_verdict(self):
-        adapters = tuple(self.adapter(profile, str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index, profile in enumerate(self.profiles, start=1))
-        result = self.dispatch_ordered(tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1)), adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        adapters = tuple(self.adapter(self.profiles[0], str(index), NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX)) for index in range(1, 4))
+        requests = tuple(self.request(index, adapter, logical=1, physical=index - 1) for index, adapter in enumerate(adapters, start=1))
+        result = self.dispatch_ordered(requests, adapters, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.result, result.exhausted, len(result.attempted_profile_identities)), (None, True, 3))
 
     def test_ambiguous_and_incomplete_results_stop_before_fallback(self):
@@ -220,6 +448,31 @@ class SupervisorTests(unittest.TestCase):
                 fallback = self.adapter(self.profiles[1], f"{kind.value}-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
                 result = self.dispatch_ordered((self.request(1, primary), self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 self.assertEqual((result.result.kind, result.exhausted, result.attempted_profile_identities, fallback._backend.calls), (kind, False, (primary.profile_identity,), 0))
+
+    def test_every_non_format_invalid_stops_before_successor(self):
+        for diagnostic in (
+            SupervisorDiagnostic.CONTEXT,
+            SupervisorDiagnostic.CANDIDATE,
+            SupervisorDiagnostic.NON_FINAL,
+        ):
+            with self.subTest(diagnostic=diagnostic.value):
+                primary = self.adapter(
+                    self.profiles[0], f"{diagnostic.value}-primary",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=diagnostic),
+                )
+                fallback = self.adapter(
+                    self.profiles[1], f"{diagnostic.value}-fallback",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                )
+                result = self.dispatch_ordered(
+                    (self.request(1, primary), self.request(2, fallback)),
+                    (primary, fallback), checkpoint_session=lambda _identity: None,
+                    checkpoint_turn=lambda _session, _turn: None,
+                )
+                self.assertEqual(
+                    (result.result.kind, result.result.diagnostic, result.attempted_profile_identities, fallback._backend.calls),
+                    (SupervisorResultKind.INVALID, diagnostic, (primary.profile_identity,), 0),
+                )
 
     def test_injected_supervisor_factory_cannot_bypass_not_activated(self):
         events = []
@@ -399,8 +652,8 @@ class SupervisorTests(unittest.TestCase):
             ("cancelled", {"completed": "cancelled"}, SupervisorResultKind.AMBIGUOUS, None, 0),
             ("interrupted", {"completed": "interrupted"}, SupervisorResultKind.AMBIGUOUS, None, 0),
             ("unknown", {"completed": "unknown"}, SupervisorResultKind.AMBIGUOUS, None, 0),
-            ("invalid-context", {"binding": "wrong-turn"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CONTEXT),
-            ("stale-candidate", {"text": "__stale_candidate__"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CANDIDATE),
+            ("invalid-context", {"binding": "wrong-turn"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CONTEXT, 0),
+            ("stale-candidate", {"text": "__stale_candidate__"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.CANDIDATE, 0),
             ("malformed-output", {"text": "not-json"}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SYNTAX),
             ("missing-result", {}, SupervisorResultKind.INVALID, SupervisorDiagnostic.SHAPE),
         )
@@ -415,7 +668,7 @@ class SupervisorTests(unittest.TestCase):
                 fallback = self.adapter(self.profiles[1], "native-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}))
                 ordered = self.dispatch_ordered((first, self.request(2, fallback)), (primary, fallback), checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
                 expected_profiles = (primary.profile_identity, fallback.profile_identity) if fallback_calls else (primary.profile_identity,)
-                expected_kind = SupervisorResultKind.ACCEPTED if fallback_calls else SupervisorResultKind.AMBIGUOUS
+                expected_kind = SupervisorResultKind.ACCEPTED if fallback_calls else kind
                 self.assertEqual((ordered.attempted_profile_identities, ordered.result.kind, fallback._backend.calls, first.context.review_epoch, first.context.review_round, first.context.review_mode), (expected_profiles, expected_kind, fallback_calls, self.context.review_epoch, self.context.review_round, ReviewMode.CONVERGING))
 
     def test_armed_capture_uses_one_plan_for_prepare_seal_and_readback(self):
@@ -435,9 +688,17 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaises(SupervisorShadowError): qualify_supervisor_attempt(adapter, request, readiness, binding, recorder, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual(recorder.plans, [])
 
-    def sequence_fixture(self, responses):
-        adapters = tuple(self.adapter(profile, str(index), response) for index, (profile, response) in enumerate(zip(self.profiles, responses, strict=True), start=1))
-        requests = tuple(self.request(index, adapter) for index, adapter in enumerate(adapters, start=1))
+    def sequence_fixture(self, responses, *, coordinates=None):
+        if coordinates is None:
+            coordinates = tuple((self.profiles[0], 1, index) for index in range(len(responses)))
+        adapters = tuple(
+            self.adapter(profile, str(index), response)
+            for index, ((profile, _logical, _physical), response) in enumerate(zip(coordinates, responses, strict=True), start=1)
+        )
+        requests = tuple(
+            self.request(index, adapter, logical=logical, physical=physical)
+            for index, (adapter, (_profile, logical, physical)) in enumerate(zip(adapters, coordinates, strict=True), start=1)
+        )
         configuration = self.configuration
         readiness = require_supervisor_capture_readiness(candidate_sha=self.context.candidate_sha, ready_at=101, case_id="case-44-sequence", observation_identity=supervisor_sequence_observation_identity(requests), producer_identity=configuration.trusted_floor_source_identity, exporter_identity=configuration.trusted_floor_authority_identity, comparator_identity=configuration.runtime_store_authority_identity, recorder=RecorderBinding("1bb063d3f8f1fef9a24b3147b8bc99794e4637a7", "cf669e186a739a8597cfaf9f050ce3bdcadda334", "632dcc3ecb3b8664de860844af2215ad5ade83e1"), store_identity=digest("sequence-store"))
         binding = SupervisorSequenceBinding("case-44-sequence", self.context.candidate_sha, self.context.base_sha, self.context.task_id, tuple(item.input_digest for item in requests), tuple(item.profile_identity for item in adapters), tuple(item.runtime_fingerprint for item in adapters), self.context.review_epoch, self.context.review_round, self.context.review_mode.value, readiness.capture_plan_digest)
@@ -459,6 +720,596 @@ class SupervisorTests(unittest.TestCase):
     def runtime_store(self):
         return InMemorySupervisorRuntimeStore(self.configuration.runtime_store_authority_identity)
 
+    def native_sequence(self, modes):
+        """Inject SDK handles, retaining the product session/schema/parser/adapter."""
+        from roundwright.supervisor_toolbox import _Session
+        if len(modes) == 4:
+            self.configure_supervisors(4)
+        coordinates = tuple((self.profiles[0], 1, index) if index < 3 else (self.profiles[1], 2, 0) for index in range(len(modes)))
+        fixture = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * len(modes), coordinates=coordinates)
+        adapters, requests, *rest = fixture
+        converted = []
+        for adapter, mode in zip(adapters, modes, strict=True):
+            profile, identity = adapter._profile, adapter._backend.identity
+            class FixtureLaunch:
+                # Internal SDK fixture below the intentionally disabled native
+                # launch gate. No production activation or launch authorization.
+                def __init__(inner, profile): inner.profile = profile
+                def verify(inner, *, cwd, profile, required_capability):
+                    self.assertEqual(required_capability.value, "read-only-review")
+                    self.assertEqual((cwd, profile), (ROOT, inner.profile))
+            class NativeBackend:
+                def __init__(inner, profile, identity, mode, launch):
+                    inner.profile, inner.identity, inner.mode, inner.launch = profile, identity, mode, launch
+                    inner.calls = 0
+                def open_fresh_session(inner, profile):
+                    inner.calls += 1
+                    if inner.mode == "pre-session-denial":
+                        raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
+                    class Handle:
+                        id = "turn-" + inner.identity
+                        def stream(handle):
+                            if inner.mode == "denial":
+                                return iter(({"method": "turn/completed", "payload": {"turn": {"id": handle.id, "status": "failed", "error": {"codexErrorInfo": "sandboxError", "message": "private denial"}}}},))
+                            return iter((
+                                {"method": "item/completed", "payload": {"turn_id": handle.id, "item": {"type": "agentMessage", "phase": "final_answer", "text": handle.text}}},
+                                {"method": "turn/completed", "payload": {"turn": {"id": handle.id, "status": "completed"}}},
+                            ))
+                    class Thread:
+                        id = "session-" + inner.identity
+                        def turn(thread, prompt, **controls):
+                            material = json.loads(prompt)["review_material"]
+                            keys = controls["output_schema"]["properties"]["binding"]["required"]
+                            self.assertEqual(set(keys), {"input_digest", "candidate_sha", "profile_identity", "logical_profile_position", "physical_format_output_ordinal"})
+                            binding = {key: material[key] for key in keys}
+                            if inner.mode == "substitute":
+                                binding["input_digest"] = requests[0].input_digest
+                                binding["physical_format_output_ordinal"] = 0
+                            elif inner.mode == "boolean":
+                                binding["logical_profile_position"] = True
+                            elif inner.mode == "legacy":
+                                binding["within_round_attempt"] = binding.pop("logical_profile_position")
+                                binding.pop("physical_format_output_ordinal")
+                            handle = Handle()
+                            handle.text = ("not-json" if inner.mode == "syntax" else "{}" if inner.mode == "shape"
+                                           else json.dumps({"verdict": "pass", "findings": [], "binding": binding}))
+                            return handle
+                    return _Session(Thread(), object(), ROOT, profile, "deny-all", "read-only", lambda value: value,
+                                    CompletionDeadline(1000, 2000), time.monotonic, inner.launch)
+            converted.append(CodexSupervisorAdapter(NativeBackend(profile, identity, mode, FixtureLaunch(profile)), profile, adapter._audit))
+        return (tuple(converted), requests, *rest)
+
+    def qualify_fixture(self, fixture, **kwargs):
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = fixture
+        return qualify_supervisor_sequence(
+            adapters, requests, self.admissions(adapters, requests), readiness, binding, policy, lifecycle, recorder,
+            evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+            trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+            review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store,
+            review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _: None,
+            checkpoint_turn=lambda *_: None, **kwargs,
+        )
+
+    def test_native_corrections_cross_schema_parser_adapter_and_durable_lifecycle(self):
+        for modes in (("legacy",), ("syntax", "pass"), ("shape", "syntax", "pass"),
+                      ("syntax", "shape", "syntax"), ("syntax", "substitute", "pass"),
+                      ("syntax", "legacy", "pass"), ("boolean", "pass"), ("syntax", "shape", "syntax", "pass")):
+            with self.subTest(modes=modes), TemporaryDirectory() as directory:
+                fixture = list(self.native_sequence(modes))
+                fixture[5] = FileSupervisorLifecycle(Path(directory), digest("native-lifecycle"))
+                result = self.qualify_fixture(fixture)
+                accepted = len(modes) <= 3 and modes[-1] in {"pass", "legacy"}
+                self.assertEqual(result.envelope.terminal.value, "invalid" if len(modes) == 4 else "accepted" if accepted else "exhausted")
+                self.assertEqual(result.failover.exhausted, not accepted)
+                self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [1] * min(3, len(modes)) + ([0] if len(modes) == 4 else []))
+                self.assertEqual(set(result.failover.attempted_profile_identities), {fixture[0][0].profile_identity})
+                # Read the exact persisted record through a new file-store instance.
+                record_dir = next(Path(directory).glob("record-*"))
+                durable = FileSupervisorLifecycle(Path(directory), digest("native-lifecycle")).read(
+                    "sha256:" + record_dir.name.removeprefix("record-"), evidence_time=101)
+                self.assertTrue(durable.expected_plan.schema.endswith("/v3"))
+                self.assertEqual(durable.terminal.terminal, result.envelope.terminal.value)
+
+    def test_one_logical_profile_allows_bounded_physical_corrections_and_replay(self):
+        self.configure_supervisors(1)
+        for modes in (("syntax", "pass"), ("syntax", "shape", "pass"), ("syntax", "shape", "syntax")):
+            with self.subTest(modes=modes), TemporaryDirectory() as directory:
+                fixture = list(self.native_sequence(modes))
+                fixture[5] = FileSupervisorLifecycle(Path(directory), digest("one-profile-lifecycle"))
+                def exercise(run, repository, budget):
+                    result = run()
+                    self.assertEqual(result.envelope.terminal.value, "accepted" if modes[-1] == "pass" else "exhausted")
+                    with closing(sqlite3.connect(budget)) as connection:
+                        before = connection.execute("SELECT * FROM role_budget_usage").fetchall()
+                    with self.assertRaises(SupervisorShadowError):
+                        run()
+                    self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [1] * len(modes))
+                    with closing(sqlite3.connect(budget)) as connection:
+                        self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+                self.qualify_fixture(fixture, _exercise=exercise)
+
+    def test_generic_sequence_rejects_profile_jump_before_correction_coordinates(self):
+        self.configure_supervisors(2)
+        fixture = self.sequence_fixture(
+            (NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+             NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []})),
+            coordinates=((self.profiles[0], 1, 0), (self.profiles[1], 2, 0)),
+        )
+        def exercise(run, repository, budget):
+            for _ in range(2):
+                with self.assertRaisesRegex(SupervisorShadowError, "context has drifted"):
+                    run()
+                self.assertFalse(budget.exists())
+                self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [0, 0])
+                self.assertEqual(fixture[6].calls, [])
+        self.qualify_fixture(fixture, _exercise=exercise)
+
+    def test_native_denial_persists_scope_stop_before_terminal_and_restart(self):
+        from roundwright.failure_recovery import FailureRecoveryError, FailureClass, parse_failure_record, require_scope_open
+        for crash in (False, True):
+            with self.subTest(crash=crash), TemporaryDirectory() as directory:
+                fixture = list(self.native_sequence(("denial", "pass")))
+                fixture[5] = FileSupervisorLifecycle(Path(directory), digest("denial-lifecycle"))
+                class ProcessDeath(BaseException): pass
+                def exercise(run, repository, budget):
+                    if crash:
+                        with patch.object(fixture[5], "append", side_effect=ProcessDeath):
+                            with self.assertRaises(ProcessDeath): run()
+                    else:
+                        result = run()
+                        self.assertEqual((result.envelope.terminal.value, result.envelope.blocker, result.comparison.disposition.value),
+                                         ("blocked", "provider-outcome-blocked", "match"))
+                        self.assertEqual(fixture[6].calls, ["prepare"])
+                        record_dir = next(Path(directory).glob("record-*"))
+                        durable = FileSupervisorLifecycle(Path(directory), digest("denial-lifecycle")).read(
+                            "sha256:" + record_dir.name.removeprefix("record-"), evidence_time=101)
+                        self.assertEqual(durable.terminal.terminal, "blocked")
+                    with closing(sqlite3.connect(database_path(repository))) as connection:
+                        rows = connection.execute("SELECT record_json FROM failure_recovery_records").fetchall()
+                        self.assertEqual(len(rows), 1)
+                        decision = parse_failure_record(json.loads(rows[0][0]))
+                        self.assertIs(decision.failure, FailureClass.HOST_SECURITY_DENIAL)
+                        self.assertNotIn("private denial", rows[0][0])
+                        with self.assertRaises(FailureRecoveryError):
+                            require_scope_open(connection, self.context.task_id, "supervisor:" + self.context.task_id)
+                    with closing(sqlite3.connect(budget)) as connection:
+                        before = connection.execute("SELECT * FROM role_budget_usage").fetchall()
+                    with self.assertRaises((FailureRecoveryError, SupervisorShadowError)): run()
+                    from roundwright.provider_recovery import ProviderRecoveryError
+                    with self.assertRaisesRegex(ProviderRecoveryError, "scope is stopped"):
+                        run(new_attempt=True)
+                    # The second pre-admitted attempt has another identity and no dispatch claim.
+                    from roundwright.supervisor_shadow import _require_durable_sequence_admission
+                    with self.assertRaises(FailureRecoveryError):
+                        _require_durable_sequence_admission(repository, TaskIdentity(self.context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright", "codex/supervisor-sequence", "C:/private/supervisor-sequence", self.context.base_sha), (fixture[1][1],), fixture[4])
+                    with closing(sqlite3.connect(budget)) as connection:
+                        self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+                    self.assertEqual([a._backend.calls for a in fixture[0]], [1, 0])
+                self.qualify_fixture(fixture, _exercise=exercise)
+
+    def test_pre_session_native_denial_persists_typed_scope_stop_without_turn(self):
+        from roundwright.failure_recovery import FailureClass, FailureRecoveryError, parse_failure_record, require_scope_open
+
+        fixture = list(self.native_sequence(("pre-session-denial", "pass")))
+
+        def exercise(run, repository, budget):
+            result = run()
+            self.assertEqual((result.envelope.terminal.value, result.failover.result.turn_identity), ("blocked", None))
+            assert result.failover.result.session_identity is not None
+            self.assertTrue(result.failover.result.session_identity.startswith("pre-dispatch-supervisor-"))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                rows = connection.execute("SELECT record_json FROM failure_recovery_records").fetchall()
+                self.assertEqual(len(rows), 1)
+                decision = parse_failure_record(json.loads(rows[0][0]))
+                self.assertEqual((decision.failure, decision.binding.session_identity), (
+                    FailureClass.HOST_SECURITY_DENIAL,
+                    result.failover.result.session_identity,
+                ))
+                with self.assertRaises(FailureRecoveryError):
+                    require_scope_open(connection, self.context.task_id, "supervisor:" + self.context.task_id)
+            with self.assertRaises((FailureRecoveryError, SupervisorShadowError)):
+                run()
+            self.assertEqual([adapter._backend.calls for adapter in fixture[0]], [1, 0])
+
+        self.qualify_fixture(fixture, _exercise=exercise)
+
+    def test_scope_denial_after_session_open_uses_pre_dispatch_admission(self):
+        """A stop before session checkpointing still closes the lifecycle."""
+
+        from roundwright.failure_recovery import (
+            FailureClass, FailureRole, ScopeAdmissionDenied, parse_failure_record,
+            pre_dispatch_failure_identity,
+        )
+
+        fixture = self.sequence_fixture((
+            NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+        ))
+        admissions = 0
+
+        def deny_after_session_open(*_args, **_kwargs):
+            nonlocal admissions
+            admissions += 1
+            if admissions == 3:
+                raise ScopeAdmissionDenied("scope stopped before session checkpoint")
+
+        def exercise(run, repository, _budget):
+            with patch(
+                "roundwright.supervisor_shadow.require_scope_effect_admission",
+                side_effect=deny_after_session_open,
+            ):
+                result = run()
+            request = fixture[1][0]
+            pre_dispatch = pre_dispatch_failure_identity(
+                FailureRole.SUPERVISOR, request.provider_attempt_id,
+            )
+            self.assertEqual(
+                (
+                    result.envelope.terminal.value,
+                    result.failover.result.kind,
+                    result.failover.result.session_identity,
+                    result.failover.result.turn_identity,
+                ),
+                ("blocked", SupervisorResultKind.BLOCKED, "session-1", None),
+            )
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state, session_identity, external_turn_identity FROM provider_attempts "
+                    "WHERE attempt_id=?", (request.provider_attempt_id,),
+                ).fetchone(), ("prepared", None, None))
+                encoded = connection.execute(
+                    "SELECT record_json FROM failure_recovery_records"
+                ).fetchone()
+                self.assertIsNotNone(encoded)
+                decision = parse_failure_record(json.loads(encoded[0]))
+                self.assertEqual(
+                    (decision.failure, decision.binding.session_identity),
+                    (FailureClass.HOST_SECURITY_DENIAL, pre_dispatch),
+                )
+            record = fixture[5].read(
+                next(iter(fixture[5]._records)), evidence_time=101,
+            )
+            self.assertEqual(record.terminal.terminal, "blocked")
+
+        self.qualify_fixture(fixture, _exercise=exercise)
+
+    def test_real_qualification_entrypoint_rechecks_scope_after_session_checkpoint(self):
+        """The repository-bound qualifier threads its guard into dispatch."""
+
+        from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+            NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+        ))
+        holder = {}
+
+        def deny_at_session(session_identity):
+            record_durable_failure(
+                holder["repository"], holder["identity"],
+                classify(FailureBinding(
+                    self.context.candidate_sha, self.context.policy_digest,
+                    self.context.configuration_digest, "supervisor:" + self.context.task_id,
+                    FailureRole.SUPERVISOR, requests[0].selected_profile_identity,
+                    session_identity, requests[0].provider_attempt_id,
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                now=101,
+            )
+
+        def exercise(run, repository, _budget):
+            holder["repository"] = repository
+            holder["identity"] = TaskIdentity(
+                self.context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright",
+                "codex/supervisor-sequence", "C:/private/supervisor-sequence", self.context.base_sha,
+            )
+            qualification = run()
+            self.assertEqual(
+                (
+                    qualification.failover.result.kind,
+                    qualification.failover.result.outcome_source,
+                    qualification.failover.result.failure,
+                    qualification.failover.result.session_identity,
+                    qualification.failover.result.turn_identity,
+                    qualification.receipt,
+                ),
+                (
+                    SupervisorResultKind.BLOCKED,
+                    SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED,
+                    CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+                    "session-1", None, None,
+                ),
+            )
+            self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 0, 0))
+            self.assertFalse(any(event[0] == "read" for event in self.events))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state, session_identity, external_turn_identity, accepted_review_identity FROM provider_attempts WHERE attempt_id=?",
+                    (requests[0].provider_attempt_id,),
+                ).fetchone(), ("prepared", "session-1", None, None))
+
+        qualify_supervisor_sequence(
+            adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+            evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+            trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+            review_authority_expectation=self.authority_expectation,
+            review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+            checkpoint_session=deny_at_session, checkpoint_turn=lambda *_: None, _exercise=exercise,
+        )
+
+    def test_real_qualification_response_time_denial_cannot_seal_pass(self):
+        """PASS lifecycle acceptance linearizes after the response-time stop."""
+
+        from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+            NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+        ))
+        original = Turn.read_response
+
+        def exercise(run, repository, _budget):
+            identity = TaskIdentity(
+                self.context.task_id, "supervisor-sequence-source", "ythdelmar68/roundwright",
+                "codex/supervisor-sequence", "C:/private/supervisor-sequence", self.context.base_sha,
+            )
+
+            def deny_after_read(turn):
+                response = original(turn)
+                record_durable_failure(
+                    repository, identity,
+                    classify(FailureBinding(
+                        self.context.candidate_sha, self.context.policy_digest,
+                        self.context.configuration_digest, "supervisor:" + self.context.task_id,
+                        FailureRole.SUPERVISOR, requests[0].selected_profile_identity,
+                        "session-1", requests[0].provider_attempt_id,
+                    ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                    now=101,
+                )
+                return response
+
+            with patch.object(Turn, "read_response", deny_after_read), self.assertRaisesRegex(
+                SupervisorShadowError, "lifecycle acceptance is denied",
+            ):
+                run()
+            self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 0, 0))
+            self.assertEqual(recorder.calls, ["prepare"])
+            record_identity = next(iter(lifecycle._records))
+            progress = lifecycle.read_progress(record_identity, evidence_time=101)
+            self.assertEqual((progress[2], progress[4]), ((), None))
+
+        qualify_supervisor_sequence(
+            adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+            evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+            trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+            review_authority_expectation=self.authority_expectation,
+            review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+            checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+        )
+
+    def test_qualification_acceptance_authenticates_complete_current_provider_binding(self):
+        """Response-time identity deletion or substitution cannot seal PASS."""
+
+        mutations = {
+            "turn": (
+                "UPDATE provider_attempts SET external_turn_identity='substituted-turn' "
+                "WHERE attempt_id=?"
+            ),
+            "dispatch-claim": "DELETE FROM provider_dispatch_claims WHERE attempt_id=?",
+            "session-checkpoint": "DELETE FROM provider_session_checkpoints WHERE attempt_id=?",
+            "candidate-seal": "DELETE FROM candidate_seals WHERE task_id=?",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(binding=name):
+                adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+                    NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+                ))
+                original = Turn.read_response
+
+                def exercise(run, repository, _budget):
+                    def mutate_after_read(turn):
+                        response = original(turn)
+                        parameter = self.context.task_id if name == "candidate-seal" else requests[0].provider_attempt_id
+                        with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                            connection.execute(statement, (parameter,))
+                        return response
+
+                    with patch.object(Turn, "read_response", mutate_after_read), self.assertRaisesRegex(
+                        SupervisorShadowError, "lifecycle acceptance is denied",
+                    ):
+                        run()
+                    record_identity = next(iter(lifecycle._records))
+                    progress = lifecycle.read_progress(record_identity, evidence_time=101)
+                    self.assertEqual((progress[2], progress[4]), ((), None))
+                    self.assertEqual(recorder.calls, ["prepare"])
+
+                qualify_supervisor_sequence(
+                    adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+                    evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+                    trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+                    review_authority_expectation=self.authority_expectation,
+                    review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+                    checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+                )
+
+    def test_qualification_acceptance_recomputes_runtime_health_and_checkpoint_binding(self):
+        """Coherent checkpoint substitution cannot replace the sealed context chain."""
+
+        mutations = {
+            "health-authorization": (("DELETE FROM provider_attempt_health_authorizations WHERE attempt_id=?", "attempt"),),
+            "health-seal": (("DELETE FROM provider_attempt_health_seals WHERE attempt_id=?", "attempt"),),
+            "runtime-binding": (("DELETE FROM runtime_configuration_bindings WHERE task_id=?", "task"),),
+            "checkpoint-fingerprints": (
+                ("UPDATE provider_checkpoints SET identity_fingerprint=? WHERE attempt_id=?", "fingerprint-attempt"),
+                ("UPDATE provider_session_checkpoints SET identity_fingerprint=? WHERE attempt_id=?", "fingerprint-attempt"),
+            ),
+            "worktree-context": (("UPDATE provider_attempt_contexts SET worktree_fingerprint=? WHERE attempt_id=?", "fingerprint-attempt"),),
+        }
+        for name, statements in mutations.items():
+            with self.subTest(binding=name):
+                adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+                    NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+                ))
+                original = Turn.read_response
+
+                def exercise(run, repository, _budget):
+                    def mutate_after_read(turn):
+                        response = original(turn)
+                        with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                            for statement, parameters in statements:
+                                if parameters == "task":
+                                    values = (self.context.task_id,)
+                                elif parameters == "attempt":
+                                    values = (requests[0].provider_attempt_id,)
+                                else:
+                                    values = ("f" * 64, requests[0].provider_attempt_id)
+                                connection.execute(statement, values)
+                        return response
+
+                    with patch.object(Turn, "read_response", mutate_after_read), self.assertRaisesRegex(
+                        SupervisorShadowError, "lifecycle acceptance is denied",
+                    ):
+                        run()
+                    record_identity = next(iter(lifecycle._records))
+                    progress = lifecycle.read_progress(record_identity, evidence_time=101)
+                    self.assertEqual((progress[2], progress[4]), ((), None))
+                    self.assertEqual(recorder.calls, ["prepare"])
+
+                qualify_supervisor_sequence(
+                    adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+                    evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+                    trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+                    review_authority_expectation=self.authority_expectation,
+                    review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+                    checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+                )
+
+    def test_qualification_rejects_coherently_substituted_health_case(self):
+        """A recomputed durable seal cannot replace the trusted health receipt."""
+
+        import roundwright.supervisor_shadow as supervisor_shadow
+
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((
+            NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+            NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),
+        ))
+        original = supervisor_shadow._require_complete_provider_dispatch_binding
+
+        def exercise(run, repository, _budget):
+            def substitute_before_acceptance(connection, identity, recovery_context, **kwargs):
+                attempt_id = kwargs["attempt_id"]
+                values = list(connection.execute(
+                    "SELECT contract_commit, candidate_sha, case_id, receipt_digest, "
+                    "selection_ordinal, fresh_until, health_contract_identity, "
+                    "provider_role, profile_identity FROM provider_attempt_health_authorizations "
+                    "WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone())
+                values[2] = "foreign-case"
+                authorization = provider_recovery._health_authorization_fingerprint(
+                    attempt_id, tuple(values),
+                )
+                checkpoint = provider_recovery._checkpoint_fingerprint(
+                    recovery_context, authorization,
+                )
+                connection.execute(
+                    "UPDATE provider_attempt_health_authorizations SET case_id=? WHERE attempt_id=?",
+                    (values[2], attempt_id),
+                )
+                connection.execute(
+                    "UPDATE provider_attempt_health_seals SET authorization_fingerprint=? WHERE attempt_id=?",
+                    (authorization, attempt_id),
+                )
+                connection.execute(
+                    "UPDATE provider_checkpoints SET identity_fingerprint=? WHERE attempt_id=?",
+                    (checkpoint, attempt_id),
+                )
+                connection.execute(
+                    "UPDATE provider_session_checkpoints SET identity_fingerprint=? WHERE attempt_id=?",
+                    (checkpoint, attempt_id),
+                )
+                return original(connection, identity, recovery_context, **kwargs)
+
+            with patch.object(
+                supervisor_shadow, "_require_complete_provider_dispatch_binding",
+                side_effect=substitute_before_acceptance,
+            ), self.assertRaisesRegex(
+                SupervisorShadowError, "lifecycle acceptance is denied",
+            ):
+                run()
+            record_identity = next(iter(lifecycle._records))
+            progress = lifecycle.read_progress(record_identity, evidence_time=101)
+            self.assertEqual((progress[2], progress[4]), ((), None))
+            self.assertEqual(recorder.calls, ["prepare"])
+
+        qualify_supervisor_sequence(
+            adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder,
+            evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(),
+            trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+            review_authority_expectation=self.authority_expectation,
+            review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+            checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+        )
+
+    def test_denial_before_correction_reservation_leaves_no_budget_or_successor(self):
+        """Scope admission and the correction debit share one lock order."""
+
+        import roundwright.supervisor_shadow as shadow
+        from roundwright.failure_recovery import EvidenceSource, FailureClass, classify, record_durable_failure
+
+        adapters, requests, readiness, binding, policy, _, recorder = self.native_sequence(("shape", "pass"))
+        with TemporaryDirectory() as directory:
+            lifecycle = FileSupervisorLifecycle(Path(directory), digest("pre-reservation-denial"))
+
+            def exercise(run, repository, budget):
+                original = shadow.begin_durable_recovery_route_reservation
+
+                def deny_after_fence(*args, **kwargs):
+                    acquired = original(*args, **kwargs)
+                    authorization = args[2]
+                    record_durable_failure(
+                        repository, args[1],
+                        classify(authorization.binding, FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                        now=101,
+                    )
+                    return acquired
+
+                with patch.object(shadow, "begin_durable_recovery_route_reservation", side_effect=deny_after_fence), self.assertRaises(CodexSupervisorError):
+                    run()
+                self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 0))
+                with closing(sqlite3.connect(budget)) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), [(1, 60, 4000)])
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM recovery_route_successor_admissions"
+                    ).fetchone(), (0,))
+                    route = connection.execute(
+                        "SELECT state, reservation_digest FROM recovery_route_authorizations"
+                    ).fetchone()
+                    self.assertEqual(route[0], "reserving")
+                    self.assertTrue(route[1].startswith("sha256:"))
+
+            qualify_supervisor_sequence(
+                adapters, requests, self.admissions(adapters, requests), readiness, binding, policy,
+                lifecycle, recorder, evidence_time=101, freshness_until=120,
+                runtime_store=FileSupervisorRuntimeStore(Path(directory) / "runtime", self.runtime_store().source_identity),
+                trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness),
+                review_authority_expectation=self.authority_expectation,
+                review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence,
+                checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise,
+            )
+
     def test_sequence_ambiguous_primary_is_terminal_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
         result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
@@ -471,7 +1322,7 @@ class SupervisorTests(unittest.TestCase):
             with self.subTest(kind=kind.value):
                 responses = (
                     NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
-                    NativeSupervisorResponse(SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD),
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
                     NativeSupervisorResponse(kind),
                 )
                 adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(responses)
@@ -480,14 +1331,42 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual((result.envelope.terminal, len(result.envelope.attempts), result.envelope.blocker, result.receipt, recorder.calls, durable.terminal.terminal, durable.terminal.blocker), (SupervisorSequenceTerminal(kind.value), 3, f"provider-outcome-{kind.value}", None, ["prepare"], kind.value, f"provider-outcome-{kind.value}"))
 
     def test_sequence_advances_invalid_primary_to_valid_fallback(self):
-        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX), NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
-        result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
-        self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), "findings", ["prepare", "seal", "verify"]))
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(
+            (
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX),
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "findings", "findings": ["missing-evidence"]}),
+            ),
+            coordinates=((self.profiles[0], 1, 0), (self.profiles[0], 1, 1)),
+        )
+        result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters, requests), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
+        self.assertEqual((tuple(item.result_kind for item in result.envelope.attempts), tuple(item.profile_identity for item in result.envelope.attempts), result.envelope.accepted_verdict, recorder.calls), (("invalid", "accepted"), (adapters[0].profile_identity, adapters[0].profile_identity), "findings", ["prepare", "seal", "verify"]))
 
     def test_sequence_exhaustion_is_typed_and_unsealed(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(tuple(NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SYNTAX) for _profile in self.profiles))
         result = qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
         self.assertEqual((result.failover.exhausted, result.envelope.terminal, result.envelope.blocker, result.receipt, recorder.calls), (True, SupervisorSequenceTerminal.EXHAUSTED, "attempt-budget-exhausted", None, ["prepare"]))
+
+    def test_format_exhaustion_never_authorizes_the_next_profile(self):
+        self.configure_supervisors(4)
+        adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture(
+            (NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),) * 3
+            + (NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),),
+            coordinates=tuple((self.profiles[0], 1, ordinal) for ordinal in range(3)) + ((self.profiles[1], 2, 0),),
+        )
+        def exercise(run, repository, budget):
+            class ProcessDeath(BaseException): pass
+            with patch.object(lifecycle, "finalize", side_effect=ProcessDeath), self.assertRaises(ProcessDeath):
+                run()
+            self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 1, 1, 0))
+            result = run()
+            self.assertTrue(result.failover.exhausted)
+            self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 1, 1, 0))
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                records = connection.execute("SELECT record_json FROM failure_recovery_records").fetchall()
+                self.assertEqual(len(records), 3)
+                self.assertEqual({json.loads(row[0])["failure"] for row in records}, {"format-invalid"})
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM recovery_route_successor_admissions").fetchone(), (2,))
+        qualify_supervisor_sequence(adapters, requests, self.admissions(adapters, requests), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise)
 
     def test_sequence_rejects_binding_order_and_profile_drift(self):
         adapters, requests, readiness, binding, policy, lifecycle, recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS), NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS)))
@@ -570,6 +1449,91 @@ class SupervisorTests(unittest.TestCase):
                 with self.assertRaises(SupervisorShadowError): qualify_supervisor_sequence(adapters, requests, self.admissions(adapters), readiness, binding, policy, FileSupervisorLifecycle(Path(directory) / "qualifier", source), recorder, evidence_time=101, freshness_until=120, runtime_store=self.runtime_store(), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _identity: None, checkpoint_turn=lambda _session, _turn: None)
             self.assertEqual((self.events, recorder.calls), ([], []))
 
+    def test_file_lifecycle_exact_prepare_replay_recovers_the_existing_plan(self):
+        """A generic Supervisor restart can reread, not replace, its plan."""
+        _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        plan = SupervisorExpectedLifecycle(binding, policy.policy_digest, policy.configuration_digest, digest("replay-runtime"), 10, readiness.observation_identity)
+        with TemporaryDirectory() as directory:
+            lifecycle = FileSupervisorLifecycle(Path(directory) / "lifecycle", digest("replay-source"))
+            first = lifecycle.prepare(plan, freshness_until=20)
+            self.assertEqual(lifecycle.prepare(plan, freshness_until=20), first)
+            with self.assertRaises(SupervisorShadowError):
+                lifecycle.prepare(plan, freshness_until=21)
+
+    def test_qualification_restarts_exact_successor_after_each_durable_crash_boundary(self):
+        import roundwright.supervisor_shadow as shadow
+        import roundwright.codex_supervisor as dispatcher
+
+        class ProcessDeath(BaseException): pass
+        for boundary in ("plan", "initial-budget", "fence", "budget", "admission", "dispatch", "admission-drift", "budget-drift", "claim-drift"):
+            with self.subTest(boundary=boundary), TemporaryDirectory() as directory:
+                adapters, requests, readiness, binding, policy, _, recorder = self.native_sequence(("shape", "pass"))
+                lifecycle = FileSupervisorLifecycle(Path(directory), digest("crash-lifecycle"))
+                def exercise(run, repository, budget):
+                    if boundary == "plan":
+                        target, method = lifecycle, "prepare"
+                    elif boundary == "fence":
+                        target, method = shadow, "begin_durable_recovery_route_reservation"
+                    elif boundary in ("initial-budget", "budget"):
+                        target, method = dispatcher, "reserve_role_effect"
+                    elif boundary in ("admission", "admission-drift", "budget-drift", "claim-drift"):
+                        target, method = shadow, "commit_durable_recovery_route_successor_admission"
+                    else:
+                        target, method = adapters[1]._backend, "open_fresh_session"
+                    original = getattr(target, method)
+                    def die(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        dies_here = (
+                            boundary == "initial-budget"
+                            and kwargs["request_or_attempt_identity"] == requests[0].provider_attempt_id
+                        ) or (
+                            boundary == "budget"
+                            and kwargs["request_or_attempt_identity"] == requests[1].provider_attempt_id
+                        )
+                        if boundary not in ("initial-budget", "budget") or dies_here:
+                            raise ProcessDeath()
+                        return result
+                    with patch.object(target, method, side_effect=die), self.assertRaises(ProcessDeath):
+                        run()
+                    calls = tuple(adapter._backend.calls for adapter in adapters)
+                    if boundary.endswith("-drift"):
+                        connection = sqlite3.connect(budget if boundary == "budget-drift" else database_path(repository))
+                        try:
+                            if boundary == "admission-drift":
+                                connection.execute("UPDATE recovery_route_successor_admissions SET target_request_digest=?", (digest("changed-request"),))
+                            elif boundary == "budget-drift":
+                                connection.execute("UPDATE role_budget_usage SET tokens=tokens-1 WHERE rowid=(SELECT max(rowid) FROM role_budget_usage)")
+                            else:
+                                connection.execute("INSERT INTO provider_dispatch_claims(attempt_id,task_id,claim_fingerprint,claimed_at) VALUES (?,?,?,?)", (requests[1].provider_attempt_id, requests[1].context.task_id, requests[1].input_digest.removeprefix("sha256:"), 101))
+                            connection.commit()
+                        finally:
+                            connection.close()
+                        with self.assertRaises((SupervisorShadowError, CodexSupervisorError, RoleCapabilityError)):
+                            run()
+                        self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), calls)
+                        return
+                    if boundary == "dispatch":
+                        with self.assertRaises(SupervisorShadowError):
+                            run()
+                        self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), calls)
+                        return
+                    self.assertEqual(calls, (0, 0) if boundary in ("plan", "initial-budget") else (1, 0))
+                    result = run()
+                    self.assertEqual(result.envelope.accepted_ordinal, 2)
+                    self.assertEqual(tuple(adapter._backend.calls for adapter in adapters), (1, 1))
+                    connection = sqlite3.connect(budget)
+                    try:
+                        self.assertEqual(connection.execute("SELECT calls, duration_seconds, tokens FROM role_budget_usage").fetchall(), [(1, 60, 4000), (1, 60, 4000)])
+                    finally:
+                        connection.close()
+                    connection = sqlite3.connect(database_path(repository))
+                    try:
+                        self.assertEqual(connection.execute("SELECT state FROM recovery_route_authorizations").fetchall(), [("consumed",)])
+                        self.assertEqual(connection.execute("SELECT target_attempt_id FROM recovery_route_successor_admissions").fetchall(), [(requests[1].provider_attempt_id,)])
+                    finally:
+                        connection.close()
+                qualify_supervisor_sequence(adapters, requests, self.admissions(adapters, requests), readiness, binding, policy, lifecycle, recorder, evidence_time=101, freshness_until=120, runtime_store=FileSupervisorRuntimeStore(Path(directory) / "runtime", self.runtime_store().source_identity), trusted_policy_receipt=self.trusted_receipt(binding, policy, readiness), review_authority_expectation=self.authority_expectation, review_authority_store=self.authority_store, review_authority_evidence=self.authority_evidence, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, _exercise=exercise)
+
     @unittest.skipUnless(
         os.name == "nt" and hasattr(Path(), "is_junction") and shutil.which("cmd.exe"),
         "Windows cmd.exe junction creation is unavailable",
@@ -619,6 +1583,64 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNot(value.expected_plan, plan)
         self.assertIsNot(value.events[0], event)
         self.assertIsNot(value.terminal, terminal)
+
+    def test_historical_v2_inflight_and_accepted_file_records_retain_exact_identities(self):
+        def canonical(value): return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        def hashed(value): return "sha256:" + hashlib.sha256(canonical(value).encode()).hexdigest()
+        _, _, readiness, binding, policy, _, _ = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
+        # Literal base/main v2 payload and hash vocabulary, independent of the
+        # current serializer. Write these retained bytes before any product read.
+        payload = {"schema": "roundwright-supervisor-expected-lifecycle/v2", "binding": binding.__dict__,
+                   "policy_digest": policy.policy_digest, "configuration_digest": policy.configuration_digest,
+                   "runtime_identity": digest("retained-runtime"), "ready_at": 10,
+                   "observation_identity": readiness.observation_identity,
+                   "allowed_terminal": ["accepted", "exhausted", "ambiguous", "incomplete"],
+                   "accepted_next_action": "apply-bound-review-result", "exhausted_blocker": "attempt-budget-exhausted",
+                   "terminal_next_action": "retain-terminal-product-block"}
+        context = hashed({"task_id": binding.task_id, "base_sha": binding.base_sha, "candidate_sha": binding.candidate_sha,
+                          "requests": binding.request_identities, "profiles": binding.profile_identities, "runtime": binding.runtime_fingerprints,
+                          "epoch": binding.review_epoch, "round": binding.review_round, "mode": binding.review_mode, "capture_plan": binding.capture_plan_digest})
+        plan_id = hashed({**payload, "context_identity": context,
+                          "allowed_result_kinds": ["accepted", "blocked", "invalid", "incomplete", "ambiguous"], "attempt_budget": 3})
+        source = digest("retained-v2-source")
+        record_id = hashed({"source_identity": source, "plan_identity": plan_id, "observation_identity": readiness.observation_identity,
+                            "candidate_sha": binding.candidate_sha, "context_identity": context, "capture_plan_digest": binding.capture_plan_digest})
+        chain = SupervisorLifecycleChainBinding(record_id, source, readiness.observation_identity, binding.candidate_sha, context, plan_id, binding.capture_plan_digest, 10, 20)
+        prepared = LifecycleChainReceipt(chain, hashed(payload), hashed({"genesis": chain.binding_digest}), 0)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            record_dir = root / ("record-" + record_id.removeprefix("sha256:")); record_dir.mkdir()
+            (record_dir / "plan.json").write_text(canonical(payload), encoding="utf-8")
+            (record_dir / "plan-receipt.json").write_text(canonical(prepared.payload()), encoding="utf-8")
+            lifecycle = FileSupervisorLifecycle(root, source)
+            plan, read_receipt = lifecycle.read_plan(record_id, evidence_time=10)
+            self.assertEqual((plan.source_identity, plan.plan_identity, read_receipt), (hashed(payload), plan_id, prepared))
+            self.assertEqual(lifecycle.read_progress(record_id, evidence_time=10)[2:], ((), (), None, None))
+            invalid = SupervisorAttemptEvent(record_id, source, readiness.observation_identity, binding.candidate_sha, context, plan_id,
+                                              binding.capture_plan_digest, 1, prepared.receipt_digest, binding.request_identities[0],
+                                              binding.profile_identities[0], binding.runtime_fingerprints[0], "invalid", digest("retained-invalid"),
+                                              None, None, 10, 20)
+            invalid_receipt = lifecycle.append(record_id, invalid, evidence_time=10)
+            progress = FileSupervisorLifecycle(root, source).read_progress(record_id, evidence_time=10)
+            self.assertEqual((progress[0].plan_identity, progress[1], progress[2], progress[3], progress[4]),
+                             (plan_id, prepared, (invalid,), (invalid_receipt,), None))
+            event = SupervisorAttemptEvent(record_id, source, readiness.observation_identity, binding.candidate_sha, context, plan_id,
+                                            binding.capture_plan_digest, 2, invalid_receipt.receipt_digest, binding.request_identities[1],
+                                            binding.profile_identities[1], binding.runtime_fingerprints[1], "accepted", digest("retained-result"),
+                                            digest("retained-result"), "pass", 10, 20)
+            receipt = lifecycle.append(record_id, event, evidence_time=10)
+            terminal = SupervisorTerminalRecord(record_id, source, readiness.observation_identity, binding.candidate_sha, context, plan_id,
+                                                 binding.capture_plan_digest, receipt.receipt_digest, 2, "accepted", event.result_identity, None, "apply-bound-review-result", 10)
+            terminal_receipt = lifecycle.finalize(record_id, terminal, evidence_time=10)
+            retained = {path.name: path.read_bytes() for path in record_dir.iterdir()}
+            read = FileSupervisorLifecycle(root, source).read(record_id, evidence_time=10)
+            self.assertEqual((read.expected_plan.plan_identity, read.plan_receipt, read.terminal_receipt), (plan_id, prepared, terminal_receipt))
+            self.assertEqual({path.name: path.read_bytes() for path in record_dir.iterdir()}, retained)
+            for tampered in ({**payload, "allowed_terminal": payload["allowed_terminal"] + ["invalid"]},
+                             {**payload, "schema": "roundwright-supervisor-expected-lifecycle/v3"}):
+                (record_dir / "plan.json").write_text(canonical(tampered), encoding="utf-8")
+                with self.assertRaises(SupervisorShadowError):
+                    FileSupervisorLifecycle(root, source).read_plan(record_id, evidence_time=10)
 
     def test_legacy_v1_accepted_and_exhausted_records_retain_original_identities(self):
         _adapters, _requests, readiness, binding, policy, _old, _recorder = self.sequence_fixture((NativeSupervisorResponse(SupervisorResultKind.AMBIGUOUS),) * 3)
@@ -728,7 +1750,7 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual((returned_plan, returned_receipt), (plan, receipt))
             self.assertIsNot(returned_plan, plan)
             self.assertIsNot(returned_receipt, receipt)
-            with self.assertRaises(SupervisorShadowError): lifecycle.prepare(plan, freshness_until=20)
+            self.assertEqual(lifecycle.prepare(plan, freshness_until=20), receipt)
             record = root / ("record-" + receipt.record_identity.removeprefix("sha256:"))
             for filename, replacement in (("plan.json", "{}"), ("plan-receipt.json", "{}")):
                 original = (record / filename).read_text(encoding="utf-8")
@@ -949,7 +1971,7 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(value, runtime); self.assertIsNot(value, runtime)
             material = json.dumps(receipt.payload(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
             self.assertEqual(SupervisorRuntimeBindingReceipt.from_canonical(material), receipt)
-            with self.assertRaises(RuntimeBindingError): FileSupervisorRuntimeStore(root, source).persist(runtime, candidate_sha=candidate, context_identity=context, ready_at=10, freshness_until=20)
+            self.assertEqual(FileSupervisorRuntimeStore(root, source).persist(runtime, candidate_sha=candidate, context_identity=context, ready_at=10, freshness_until=20), receipt)
             record = root / ("record-" + receipt.record_identity.removeprefix("sha256:"))
             for filename, replacement in (("runtime.json", "{}"), ("receipt.json", "{}")):
                 original = (record / filename).read_text(encoding="utf-8")

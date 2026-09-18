@@ -46,10 +46,14 @@ from .coding_worker_state import (
     CodingToolEventStore,
     CodingWorkerStateError,
 )
-from .configuration import ProviderProfile
+from .configuration import ProviderProfile, RepositoryIdentity
 from .provider_health import CodexAdapterError, CodexFailure, ProviderHealthAuditIdentity
+from .provider_recovery import AttemptState, ProviderRole, RecoveryContext, SupervisorDispatchClaimState, claim_worker_dispatch, read_attempt, read_worker_dispatch_claim, record_external_turn, record_session_identity, recover_attempt
+from .failure_recovery import FailureBinding, FailureRole, classify_native_failure, read_durable_failure, record_durable_failure, require_scope_open, require_scope_effect_admission
+from .git_identity import TransitionLease
+from .state import TaskIdentity, _open_writable_connection
 from .role_capability_policy import TrustedProviderLaunchContext, RoleCapability, RoleCapabilityError, require_external_production_activation
-from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect
+from .role_capability_policy import RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, recover_role_effect_reservation, reserve_role_effect
 from .shadow import RecorderBinding
 from .worker_shadow import (
     ExternalCapturePlanReceipt,
@@ -779,6 +783,186 @@ def run_bounded_worker_adapter_qualification(*, backend: NativeCodexWorkerBacken
     return qualify_worker_adapter(adapter, request, readiness, binding, recorder, advisory_execution, reservation, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn, checkpoint_result=checkpoint_result)
 
 
+@dataclass(frozen=True)
+class ProductionWorkerFailureLifecycle:
+    """Host-owned durable identity for one future-production Worker attempt.
+
+    The installed entrypoint remains activation-denied in this candidate.  If
+    an external activation later admits it, this object prevents that path from
+    replacing durable task, candidate, session, or provider-attempt evidence
+    with a local callback or an event-store-only approximation.
+    """
+
+    repository: RepositoryIdentity
+    task_identity: TaskIdentity
+    recovery: RecoveryContext
+    lease: TransitionLease
+    observed_at: int
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.repository) is not RepositoryIdentity
+            or type(self.task_identity) is not TaskIdentity
+            or type(self.recovery) is not RecoveryContext
+            or type(self.lease) is not TransitionLease
+            or type(self.observed_at) is not int
+            or self.observed_at <= 0
+            or self.recovery.task_id != self.task_identity.task_id
+            or self.recovery.candidate_sha is None
+            or self.lease.repository_id != self.task_identity.repository_id
+        ):
+            raise WorkerShadowError("production Worker failure lifecycle is invalid")
+
+    def _require_request_binding(self, request: CodexWorkerRequest, receipt: CodingDispatchReceipt) -> None:
+        candidate = self.recovery.candidate_sha
+        candidate_fingerprint = self.recovery.candidate_fingerprint
+        assert candidate is not None
+        assert candidate_fingerprint is not None
+        context = request.context
+        expected = (
+            self.task_identity.task_id,
+            "sha256:" + self.recovery.repository_fingerprint,
+            "sha256:" + self.recovery.worktree_fingerprint,
+            "sha256:" + self.recovery.branch_fingerprint,
+            "sha256:" + self.recovery.base_fingerprint,
+            "sha256:" + candidate_fingerprint,
+            "sha256:" + self.recovery.policy_fingerprint,
+            self.recovery.runtime_binding.resolved_digest,
+        )
+        actual = (
+            context.task_id, context.repository_fingerprint, context.worktree_fingerprint,
+            context.branch_fingerprint, context.base_fingerprint, context.candidate_fingerprint,
+            context.policy_fingerprint, context.configuration_digest,
+        )
+        if (
+            actual != expected
+            or receipt.task_id != self.task_identity.task_id
+            or receipt.attempt_id != request.attempt_id
+            or receipt.candidate_sha != candidate
+        ):
+            raise WorkerShadowError("production Worker failure lifecycle has drifted")
+
+    def require_dispatchable(self, request: CodexWorkerRequest, receipt: CodingDispatchReceipt) -> None:
+        self._require_request_binding(request, receipt)
+        # Preparation cannot authorize dispatch after another attempt stops
+        # this scope. Read the current authenticated clearance history before
+        # the caller reserves budget or opens a provider session.
+        connection = _open_writable_connection(self.repository)
+        try:
+            require_scope_open(connection, self.task_identity.task_id, "worker:" + self.task_identity.task_id)
+        except Exception as error:
+            raise WorkerShadowError("production Worker dispatch scope is stopped") from error
+        finally:
+            connection.close()
+        try:
+            attempt = read_attempt(
+                self.repository, self.task_identity, request.attempt_id,
+                context=self.recovery, now=self.observed_at,
+            )
+        except Exception as error:
+            raise WorkerShadowError("production Worker attempt admission is unavailable") from error
+        if (
+            attempt.role is not ProviderRole.WORKER
+            or attempt.state is not AttemptState.PREPARED
+            or attempt.selected_profile_identity != self.recovery.runtime_binding.worker_profile_identity
+            or attempt.input_fingerprint != request.input_digest.removeprefix("sha256:")
+            or attempt.session_identity is not None
+            or attempt.external_turn_identity is not None
+            or attempt.output_pointer is not None
+            or attempt.completion_evidence_fingerprint is not None
+            or attempt.accepted_review_identity is not None
+            or read_worker_dispatch_claim(
+                self.repository, self.task_identity, self.recovery,
+                attempt_id=request.attempt_id,
+            ) is not SupervisorDispatchClaimState.UNCLAIMED
+        ):
+            raise WorkerShadowError("production Worker attempt is not dispatchable")
+
+    def claim_dispatch(self, request: CodexWorkerRequest) -> None:
+        """Consume the no-effect proof immediately before native dispatch."""
+
+        try:
+            claim_worker_dispatch(
+                self.repository, self.task_identity, self.recovery,
+                attempt_id=request.attempt_id, lease=self.lease, now=self.observed_at,
+            )
+        except Exception as error:
+            raise WorkerShadowError("production Worker dispatch claim is unavailable") from error
+
+    def require_effect_scope(self) -> None:
+        """Serialize one Worker effect admission with same-scope denials."""
+
+        try:
+            require_scope_effect_admission(
+                self.repository, self.task_identity, "worker:" + self.task_identity.task_id,
+            )
+        except Exception as error:
+            raise WorkerShadowError("production Worker dispatch scope is stopped") from error
+
+    def record_session(self, request: CodexWorkerRequest, session_identity: str) -> None:
+        try:
+            record_session_identity(
+                self.repository, self.task_identity, self.recovery,
+                attempt_id=request.attempt_id, session_identity=session_identity,
+                lease=self.lease, now=self.observed_at,
+            )
+        except Exception as error:
+            raise WorkerShadowError("production Worker session checkpoint failed") from error
+
+    def record_turn(self, request: CodexWorkerRequest, session_identity: str, turn_identity: str) -> None:
+        try:
+            record_external_turn(
+                self.repository, self.task_identity, self.recovery,
+                attempt_id=request.attempt_id, session_identity=session_identity,
+                external_turn_identity=turn_identity, lease=self.lease,
+                now=self.observed_at,
+            )
+        except Exception as error:
+            raise WorkerShadowError("production Worker turn checkpoint failed") from error
+
+    def record_terminal_failure(self, request: CodexWorkerRequest, result) -> None:
+        if (
+            result.failure is None or result.session_identity is None
+        ):
+            raise WorkerShadowError("production Worker terminal failure is incomplete")
+        try:
+            record = classify_native_failure(
+                FailureRole.WORKER,
+                FailureBinding(
+                    self.recovery.candidate_sha or self.task_identity.base_sha,
+                    "sha256:" + self.recovery.policy_fingerprint,
+                    self.recovery.runtime_binding.resolved_digest,
+                    "worker:" + self.task_identity.task_id,
+                    FailureRole.WORKER,
+                    self.recovery.runtime_binding.worker_profile_identity,
+                    result.session_identity,
+                    request.attempt_id,
+                ),
+                result.failure,
+            )
+            digest = record_durable_failure(
+                self.repository, self.task_identity, record, now=self.observed_at,
+            )
+            if read_durable_failure(self.repository, self.task_identity, digest) != record:
+                raise WorkerShadowError("production Worker failure read-back drifted")
+            recovered = recover_attempt(
+                self.repository, self.task_identity, self.recovery,
+                attempt_id=request.attempt_id, max_attempts=1,
+                lease=self.lease, now=self.observed_at,
+            )
+        except WorkerShadowError:
+            raise
+        except Exception as error:
+            raise WorkerShadowError("production Worker terminal failure persistence failed") from error
+        expected_state = (
+            AttemptState.BLOCKED
+            if result.turn_identity is None
+            else AttemptState.AMBIGUOUS
+        )
+        if recovered.state is not expected_state:
+            raise WorkerShadowError("production Worker terminal failure recovery is incomplete")
+
+
 class ProductionCodingWorkerRuntime:
     """Unavailable installed production coding seam.
 
@@ -787,12 +971,12 @@ class ProductionCodingWorkerRuntime:
     dispatch both independently require the externally issued activation
     capability that this candidate deliberately does not contain.
     """
-    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str], advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path) -> None:
+    def __init__(self, *, backend: NativeCodexWorkerBackend, profile: ProviderProfile, audit: ProviderHealthAuditIdentity, local_tools: BoundedCodingTools, dispatch_receipt: CodingDispatchReceipt, event_store: CodingToolEventStore, failure_lifecycle: "ProductionWorkerFailureLifecycle", candidate_probe: Callable[[], str], toolchain_receipt_probe: Callable[[], str], advisory_execution: SealedRoleExecution, execution_host: TrustedExecutionHostInputs, budget_ledger_path: Path) -> None:
         try:
             require_external_production_activation()
         except RoleCapabilityError as error:
             raise WorkerShadowError("production coding activation is unavailable") from error
-        if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore
+        if (type(dispatch_receipt) is not CodingDispatchReceipt or type(event_store) is not CodingToolEventStore or type(failure_lifecycle) is not ProductionWorkerFailureLifecycle
                 or not callable(candidate_probe) or not callable(toolchain_receipt_probe) or local_tools.reviewed_sandbox_identity != dispatch_receipt.sandbox_identity
                 or local_tools.capability_digest != dispatch_receipt.capability_digest
                 or type(advisory_execution) is not SealedRoleExecution or advisory_execution.seam is not RoleExecutionSeam.WORKER
@@ -802,6 +986,7 @@ class ProductionCodingWorkerRuntime:
         self._local_tools = local_tools
         self._dispatch_receipt = dispatch_receipt
         self._event_store = event_store
+        self._failure_lifecycle = failure_lifecycle
         self._candidate_probe = candidate_probe
         self._toolchain_receipt_probe = toolchain_receipt_probe
         self._advisory_execution = advisory_execution
@@ -822,16 +1007,35 @@ class ProductionCodingWorkerRuntime:
         if request.action is WorkerAction.PLANNING:
             raise WorkerShadowError("planning requests require the separate no-tools entrypoint")
         self._dispatch_receipt.validate_for(request, self._candidate_probe(), self._toolchain_receipt_probe())
+        self._failure_lifecycle.require_dispatchable(request, self._dispatch_receipt)
         request_material, preflight_material = self._adapter.effect_material(request)
         try:
-            reservation = reserve_role_effect(
-                self._advisory_execution, host_inputs=self._execution_host,
-                ledger_path=self._budget_ledger_path,
-                profile=self._adapter._profile,
-                request_or_attempt_identity=request.attempt_id,
-                request_material=request_material,
-                preflight_material=preflight_material,
-            )
+            from .failure_recovery import admit_scope_effect_reservation
+            try:
+                # Reuse only while require_dispatchable has proved that this
+                # exact PREPARED attempt has no session, turn, output, or
+                # pre-effect claim. A claimed/completed debit is never reset.
+                reservation = recover_role_effect_reservation(
+                    self._advisory_execution, host_inputs=self._execution_host,
+                    ledger_path=self._budget_ledger_path,
+                    profile=self._adapter._profile,
+                    request_or_attempt_identity=request.attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                )
+            except RoleCapabilityError:
+                reservation = admit_scope_effect_reservation(
+                    self._failure_lifecycle.repository, self._failure_lifecycle.task_identity,
+                    "worker:" + self._failure_lifecycle.task_identity.task_id,
+                    lambda: reserve_role_effect(
+                        self._advisory_execution, host_inputs=self._execution_host,
+                        ledger_path=self._budget_ledger_path,
+                        profile=self._adapter._profile,
+                        request_or_attempt_identity=request.attempt_id,
+                        request_material=request_material,
+                        preflight_material=preflight_material,
+                    ),
+                )
         except RoleCapabilityError as error:
             raise WorkerShadowError("production coding budget admission is denied") from error
         try:
@@ -844,12 +1048,14 @@ class ProductionCodingWorkerRuntime:
         acknowledged_sequences: set[int] = set()
 
         def record_session(session_identity: str) -> None:
+            self._failure_lifecycle.record_session(request, session_identity)
             checkpoint["session_identity"] = session_identity
             checkpoint_session(session_identity)
 
         def record_turn(session_identity: str, turn_identity: str) -> None:
             if checkpoint.get("session_identity") != session_identity:
                 raise WorkerShadowError("coding turn checkpoint is not session-bound")
+            self._failure_lifecycle.record_turn(request, session_identity, turn_identity)
             checkpoint["turn_identity"] = turn_identity
             checkpoint_turn(session_identity, turn_identity)
 
@@ -866,7 +1072,10 @@ class ProductionCodingWorkerRuntime:
             if state == "submitted": acknowledged_sequences.add(item.sequence)
 
         callback = execute if request.action is not WorkerAction.PLANNING else None
-        return self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, effect_reservation=reservation)
+        result = self._adapter.dispatch(request, checkpoint_session=record_session, checkpoint_turn=record_turn, execute_tool_request=callback, checkpoint_submission=submission if callback is not None else None, advisory_execution=self._advisory_execution, effect_reservation=reservation, scope_admission=self._failure_lifecycle.require_effect_scope, checkpoint_dispatch=lambda: self._failure_lifecycle.claim_dispatch(request))
+        if result.kind is WorkerResultKind.BLOCKED:
+            self._failure_lifecycle.record_terminal_failure(request, result)
+        return result
 
     def _execute_request(self, worker_request: CodexWorkerRequest, checkpoint: Mapping[str, str], request: NativeWorkerToolRequest, acknowledged_sequences: frozenset[int]) -> NativeWorkerToolResult:
         self._dispatch_receipt.validate_for(worker_request, self._candidate_probe(), self._toolchain_receipt_probe())
@@ -953,6 +1162,7 @@ class ProductionCodingWorkerEntrypointInputs:
     local_tools: BoundedCodingTools
     dispatch_receipt: CodingDispatchReceipt
     event_store: CodingToolEventStore
+    failure_lifecycle: ProductionWorkerFailureLifecycle
     candidate_probe: Callable[[], str]
     toolchain_receipt_probe: Callable[[], str]
     advisory_execution: SealedRoleExecution
@@ -962,7 +1172,7 @@ class ProductionCodingWorkerEntrypointInputs:
     def __post_init__(self) -> None:
         if (type(self.profile) is not ProviderProfile or type(self.audit) is not ProviderHealthAuditIdentity
                 or type(self.local_tools) is not BoundedCodingTools or type(self.dispatch_receipt) is not CodingDispatchReceipt
-                or type(self.event_store) is not CodingToolEventStore or not callable(self.candidate_probe) or not callable(self.toolchain_receipt_probe)
+                or type(self.event_store) is not CodingToolEventStore or type(self.failure_lifecycle) is not ProductionWorkerFailureLifecycle or not callable(self.candidate_probe) or not callable(self.toolchain_receipt_probe)
                 or type(self.advisory_execution) is not SealedRoleExecution or self.advisory_execution.seam is not RoleExecutionSeam.WORKER
                 or type(self.execution_host) is not TrustedExecutionHostInputs or not isinstance(self.budget_ledger_path, Path)
                 or not callable(getattr(self.backend, "open_session", None))):
@@ -988,7 +1198,7 @@ def run_production_coding_worker(*, inputs: ProductionCodingWorkerEntrypointInpu
     return ProductionCodingWorkerRuntime(
         backend=inputs.backend, profile=inputs.profile, audit=inputs.audit,
         local_tools=inputs.local_tools, dispatch_receipt=inputs.dispatch_receipt,
-        event_store=inputs.event_store, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe, advisory_execution=inputs.advisory_execution, execution_host=inputs.execution_host, budget_ledger_path=inputs.budget_ledger_path,
+        event_store=inputs.event_store, failure_lifecycle=inputs.failure_lifecycle, candidate_probe=inputs.candidate_probe, toolchain_receipt_probe=inputs.toolchain_receipt_probe, advisory_execution=inputs.advisory_execution, execution_host=inputs.execution_host, budget_ledger_path=inputs.budget_ledger_path,
     ).dispatch(request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn)
 
 

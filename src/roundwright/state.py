@@ -847,6 +847,179 @@ MIGRATIONS = (
             ("configured_source_inventories", "CREATE TABLE configured_source_inventories (inventory_digest TEXT PRIMARY KEY, candidate_sha TEXT NOT NULL, configuration_digest TEXT NOT NULL, source_set_digest TEXT NOT NULL, content_json TEXT NOT NULL)"),
         ),
     ),
+    Migration(
+        68,
+        (
+            "CREATE TABLE failure_recovery_records (record_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_json TEXT NOT NULL, recorded_at INTEGER NOT NULL CHECK(recorded_at > 0))",
+        ),
+        (
+            ("failure_recovery_records", "CREATE TABLE failure_recovery_records (record_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_json TEXT NOT NULL, recorded_at INTEGER NOT NULL CHECK(recorded_at > 0))"),
+        ),
+    ),
+    Migration(
+        69,
+        (
+            "CREATE TABLE provider_failure_admissions (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role IN ('planning', 'worker', 'supervisor', 'aggregation')), profile_identity TEXT NOT NULL, session_identity TEXT NOT NULL, attempt_identity TEXT NOT NULL, UNIQUE(task_id, provider_role, session_identity, attempt_identity))",
+        ),
+        (
+            ("provider_failure_admissions", "CREATE TABLE provider_failure_admissions (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role IN ('planning', 'worker', 'supervisor', 'aggregation')), profile_identity TEXT NOT NULL, session_identity TEXT NOT NULL, attempt_identity TEXT NOT NULL, UNIQUE(task_id, provider_role, session_identity, attempt_identity))"),
+        ),
+    ),
+    Migration(
+        70,
+        (
+            "CREATE TABLE failure_recovery_clearances (clearance_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_records(record_digest), clearance_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))",
+            "CREATE TABLE failure_recovery_clearance_revocations (revocation_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), clearance_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_clearances(clearance_digest), revocation_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))",
+        ),
+        (
+            ("failure_recovery_clearances", "CREATE TABLE failure_recovery_clearances (clearance_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_records(record_digest), clearance_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))"),
+            ("failure_recovery_clearance_revocations", "CREATE TABLE failure_recovery_clearance_revocations (revocation_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), clearance_digest TEXT NOT NULL UNIQUE REFERENCES failure_recovery_clearances(clearance_digest), revocation_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, sequence))"),
+        ),
+    ),
+    # ``within_round_attempt`` historically conflated the configured profile
+    # position with the number of times that profile had emitted a malformed
+    # format response.  Retain it for legacy read-back, but persist the two
+    # identities independently for every new accounting record.
+    Migration(
+        71,
+        (
+            "ALTER TABLE provider_attempts ADD COLUMN logical_profile_position INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE provider_attempts ADD COLUMN physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN logical_profile_position INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE diff_review_attempts ADD COLUMN physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN logical_profile_position INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE accepted_provider_reviews ADD COLUMN physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0",
+            # Historical rows contain one physical response for their one
+            # configured profile.  A contradictory pre-existing value is a
+            # migration failure rather than an opportunity to invent history.
+            "UPDATE provider_attempts SET logical_profile_position = COALESCE((SELECT within_round_attempt FROM diff_review_attempts WHERE provider_attempt_id = provider_attempts.attempt_id), 0), physical_format_output_ordinal = 0 WHERE logical_profile_position = 0 AND physical_format_output_ordinal = 0",
+            "UPDATE diff_review_attempts SET logical_profile_position = within_round_attempt, physical_format_output_ordinal = 0 WHERE logical_profile_position = 0 AND physical_format_output_ordinal = 0",
+            "UPDATE accepted_provider_reviews SET logical_profile_position = within_round_attempt, physical_format_output_ordinal = 0 WHERE logical_profile_position = 0 AND physical_format_output_ordinal = 0",
+        ),
+        (
+            ("provider_attempts", "CREATE TABLE \"provider_attempts\" (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), provider_role TEXT NOT NULL CHECK(provider_role IN ('planning', 'worker', 'supervisor', 'aggregation')), attempt_number INTEGER NOT NULL CHECK(attempt_number > 0), process_lease_id TEXT NOT NULL, process_lease_expires_at INTEGER NOT NULL CHECK(process_lease_expires_at > 0), session_identity TEXT, external_turn_identity TEXT, input_fingerprint TEXT NOT NULL, output_pointer TEXT, completion_evidence_fingerprint TEXT, accepted_review_identity TEXT, state TEXT NOT NULL CHECK(state IN ('prepared', 'dispatched', 'completed', 'accepted', 'ambiguous', 'blocked', 'invalidated')), selected_profile_identity TEXT NOT NULL DEFAULT '', logical_profile_position INTEGER NOT NULL DEFAULT 0, physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0, UNIQUE(task_id, provider_role, attempt_number), UNIQUE(task_id, provider_role, external_turn_identity), UNIQUE(task_id, accepted_review_identity), CHECK((external_turn_identity IS NULL AND state IN ('prepared', 'blocked', 'invalidated')) OR (external_turn_identity IS NOT NULL AND state != 'prepared')), CHECK((state IN ('completed', 'accepted') AND output_pointer IS NOT NULL AND completion_evidence_fingerprint IS NOT NULL) OR state NOT IN ('completed', 'accepted')), CHECK((accepted_review_identity IS NOT NULL AND provider_role = 'supervisor' AND state = 'accepted') OR accepted_review_identity IS NULL))"),
+            ("diff_review_attempts", "CREATE TABLE diff_review_attempts (diff_review_attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), implementation_attempt_id TEXT NOT NULL REFERENCES implementation_attempts(implementation_attempt_id), provider_attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), supervisor_session_identity TEXT NOT NULL UNIQUE, external_turn_identity TEXT NOT NULL, message_identity TEXT NOT NULL, base_sha TEXT NOT NULL, candidate_sha TEXT NOT NULL, input_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('dispatched', 'recorded', 'accepted')), created_at INTEGER NOT NULL CHECK(created_at > 0), verification_digest TEXT NOT NULL DEFAULT '', accepted_review_identity TEXT, within_round_attempt INTEGER NOT NULL DEFAULT 0, selected_profile_identity TEXT NOT NULL DEFAULT '', review_round INTEGER NOT NULL DEFAULT 0, review_mode TEXT NOT NULL DEFAULT '', review_max_rounds INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_epoch INTEGER NOT NULL DEFAULT 0, logical_profile_position INTEGER NOT NULL DEFAULT 0, physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0)"),
+            ("accepted_provider_reviews", "CREATE TABLE accepted_provider_reviews (accepted_review_identity TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), attempt_id TEXT NOT NULL UNIQUE REFERENCES provider_attempts(attempt_id), completion_evidence_fingerprint TEXT NOT NULL, configuration_schema_version TEXT NOT NULL DEFAULT '', configuration_digest TEXT NOT NULL DEFAULT '', worker_profile_identity TEXT NOT NULL DEFAULT '', supervisor_profile_identities TEXT NOT NULL DEFAULT '', selected_profile_identity TEXT NOT NULL DEFAULT '', within_round_attempt INTEGER NOT NULL DEFAULT 0, review_complete_rounds INTEGER NOT NULL DEFAULT 0, review_max_rounds INTEGER NOT NULL DEFAULT 0, review_max_supervisor_attempts_per_round INTEGER NOT NULL DEFAULT 0, review_on_final_findings TEXT NOT NULL DEFAULT '', review_policy_digest TEXT NOT NULL DEFAULT '', review_epoch INTEGER NOT NULL DEFAULT 0, logical_profile_position INTEGER NOT NULL DEFAULT 0, physical_format_output_ordinal INTEGER NOT NULL DEFAULT 0)"),
+        ),
+    ),
+    Migration(
+        72,
+        (
+            "CREATE TABLE failure_recovery_clearance_decisions (decision_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_id TEXT NOT NULL REFERENCES owner_command_records(command_id), decision_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, record_digest, sequence), UNIQUE(task_id, command_id))",
+        ),
+        (
+            ("failure_recovery_clearance_decisions", "CREATE TABLE failure_recovery_clearance_decisions (decision_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_id TEXT NOT NULL REFERENCES owner_command_records(command_id), decision_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, record_digest, sequence), UNIQUE(task_id, command_id))"),
+        ),
+    ),
+    Migration(
+        73,
+        (
+            "CREATE TABLE supervisor_attempt_coordinates (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), review_epoch INTEGER NOT NULL CHECK(review_epoch >= 0), review_round INTEGER NOT NULL CHECK(review_round >= 1), logical_profile_position INTEGER NOT NULL CHECK(logical_profile_position >= 1), physical_format_output_ordinal INTEGER NOT NULL CHECK(physical_format_output_ordinal BETWEEN 0 AND 2), profile_identity TEXT NOT NULL, UNIQUE(task_id, review_epoch, review_round, logical_profile_position, physical_format_output_ordinal))",
+        ),
+        (
+            ("supervisor_attempt_coordinates", "CREATE TABLE supervisor_attempt_coordinates (attempt_id TEXT PRIMARY KEY REFERENCES provider_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), review_epoch INTEGER NOT NULL CHECK(review_epoch >= 0), review_round INTEGER NOT NULL CHECK(review_round >= 1), logical_profile_position INTEGER NOT NULL CHECK(logical_profile_position >= 1), physical_format_output_ordinal INTEGER NOT NULL CHECK(physical_format_output_ordinal BETWEEN 0 AND 2), profile_identity TEXT NOT NULL, UNIQUE(task_id, review_epoch, review_round, logical_profile_position, physical_format_output_ordinal))"),
+        ),
+    ),
+    Migration(
+        74,
+        (
+            "CREATE TABLE dependency_review_failure_admissions (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'dependency-review'), profile_identity TEXT NOT NULL, session_identity TEXT NOT NULL, attempt_identity TEXT NOT NULL, UNIQUE(task_id, provider_role, session_identity, attempt_identity))",
+        ),
+        (
+            ("dependency_review_failure_admissions", "CREATE TABLE dependency_review_failure_admissions (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), candidate_sha TEXT NOT NULL, policy_digest TEXT NOT NULL, configuration_digest TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'dependency-review'), profile_identity TEXT NOT NULL, session_identity TEXT NOT NULL, attempt_identity TEXT NOT NULL, UNIQUE(task_id, provider_role, session_identity, attempt_identity))"),
+        ),
+    ),
+    # Security-denial clearance is intentionally not an owner review-item
+    # operation.  These four tables form a distinct authority namespace so a
+    # generic resolve/waive command can never be reinterpreted as a clearance.
+    Migration(
+        75,
+        (
+            "CREATE TABLE denial_clearance_authority_grants (grant_id TEXT PRIMARY KEY, owner_identity TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, candidate_sha TEXT NOT NULL, candidate_seal TEXT NOT NULL, authority_scope TEXT NOT NULL, target_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), authority_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'active'), UNIQUE(owner_identity, task_id, repository_id, candidate_sha, candidate_seal, authority_scope, target_digest))",
+            "CREATE TABLE denial_clearance_commands (command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, denial_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), authority_grant_id TEXT NOT NULL REFERENCES denial_clearance_authority_grants(grant_id), candidate_sha TEXT NOT NULL, candidate_seal TEXT NOT NULL, authority_scope TEXT NOT NULL, target_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_kind TEXT NOT NULL CHECK(command_kind = 'clear-denial'), command_digest TEXT NOT NULL, host_result_digest TEXT NOT NULL, result_digest TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state = 'consumed'), UNIQUE(task_id, command_id), UNIQUE(task_id, denial_digest, command_id))",
+            "CREATE TABLE denial_revocation_authority_grants (grant_id TEXT PRIMARY KEY, owner_identity TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, candidate_sha TEXT NOT NULL, candidate_seal TEXT NOT NULL, authority_scope TEXT NOT NULL, target_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), authority_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'active'), UNIQUE(owner_identity, task_id, repository_id, candidate_sha, candidate_seal, authority_scope, target_digest))",
+            "CREATE TABLE denial_revocation_commands (command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, denial_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), clearance_digest TEXT NOT NULL, authority_grant_id TEXT NOT NULL REFERENCES denial_revocation_authority_grants(grant_id), candidate_sha TEXT NOT NULL, candidate_seal TEXT NOT NULL, authority_scope TEXT NOT NULL, target_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_kind TEXT NOT NULL CHECK(command_kind = 'revoke-denial-clearance'), command_digest TEXT NOT NULL, host_result_digest TEXT NOT NULL, result_digest TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state = 'consumed'), UNIQUE(task_id, command_id), UNIQUE(task_id, denial_digest, command_id))",
+            "CREATE TABLE denial_clearance_decisions (decision_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_id TEXT NOT NULL, command_kind TEXT NOT NULL CHECK(command_kind IN ('clear-denial', 'revoke-denial-clearance')), decision_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, record_digest, sequence), UNIQUE(task_id, command_kind, command_id))",
+        ),
+        (
+            ("denial_clearance_authority_grants", "CREATE TABLE denial_clearance_authority_grants (grant_id TEXT PRIMARY KEY, owner_identity TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, candidate_sha TEXT NOT NULL, candidate_seal TEXT NOT NULL, authority_scope TEXT NOT NULL, target_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), authority_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'active'), UNIQUE(owner_identity, task_id, repository_id, candidate_sha, candidate_seal, authority_scope, target_digest))"),
+            ("denial_clearance_commands", "CREATE TABLE denial_clearance_commands (command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, denial_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), authority_grant_id TEXT NOT NULL REFERENCES denial_clearance_authority_grants(grant_id), candidate_sha TEXT NOT NULL, candidate_seal TEXT NOT NULL, authority_scope TEXT NOT NULL, target_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_kind TEXT NOT NULL CHECK(command_kind = 'clear-denial'), command_digest TEXT NOT NULL, host_result_digest TEXT NOT NULL, result_digest TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state = 'consumed'), UNIQUE(task_id, command_id), UNIQUE(task_id, denial_digest, command_id))"),
+            ("denial_revocation_authority_grants", "CREATE TABLE denial_revocation_authority_grants (grant_id TEXT PRIMARY KEY, owner_identity TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, candidate_sha TEXT NOT NULL, candidate_seal TEXT NOT NULL, authority_scope TEXT NOT NULL, target_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), authority_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'active'), UNIQUE(owner_identity, task_id, repository_id, candidate_sha, candidate_seal, authority_scope, target_digest))"),
+            ("denial_revocation_commands", "CREATE TABLE denial_revocation_commands (command_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, denial_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), clearance_digest TEXT NOT NULL, authority_grant_id TEXT NOT NULL REFERENCES denial_revocation_authority_grants(grant_id), candidate_sha TEXT NOT NULL, candidate_seal TEXT NOT NULL, authority_scope TEXT NOT NULL, target_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_kind TEXT NOT NULL CHECK(command_kind = 'revoke-denial-clearance'), command_digest TEXT NOT NULL, host_result_digest TEXT NOT NULL, result_digest TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, state TEXT NOT NULL CHECK(state = 'consumed'), UNIQUE(task_id, command_id), UNIQUE(task_id, denial_digest, command_id))"),
+            ("denial_clearance_decisions", "CREATE TABLE denial_clearance_decisions (decision_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), command_id TEXT NOT NULL, command_kind TEXT NOT NULL CHECK(command_kind IN ('clear-denial', 'revoke-denial-clearance')), decision_json TEXT NOT NULL, sequence INTEGER NOT NULL CHECK(sequence > 0), recorded_at INTEGER NOT NULL CHECK(recorded_at > 0), UNIQUE(task_id, record_digest, sequence), UNIQUE(task_id, command_kind, command_id))"),
+        ),
+    ),
+    Migration(
+        76,
+        (
+            "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))",
+        ),
+        (("recovery_route_authorizations", "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))"),),
+    ),
+    Migration(
+        77,
+        (
+            "ALTER TABLE recovery_route_authorizations RENAME TO recovery_route_authorizations_v76",
+            "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'reserving', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'reserving' AND reservation_digest IS NOT NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))",
+            "INSERT INTO recovery_route_authorizations SELECT route_digest, task_id, repository_id, record_digest, binding_json, target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest, state, reservation_digest, issued_at, consumed_at FROM recovery_route_authorizations_v76",
+            "DROP TABLE recovery_route_authorizations_v76",
+        ),
+        (("recovery_route_authorizations", "CREATE TABLE recovery_route_authorizations (route_digest TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, record_digest TEXT NOT NULL REFERENCES failure_recovery_records(record_digest), binding_json TEXT NOT NULL, target_role TEXT NOT NULL CHECK(target_role IN ('worker', 'supervisor', 'dependency-review')), target_profile_digest TEXT NOT NULL, target_route_digest TEXT NOT NULL, coordinate_digest TEXT NOT NULL, remaining_budget_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('issued', 'reserving', 'consumed')), reservation_digest TEXT, issued_at INTEGER NOT NULL CHECK(issued_at > 0), consumed_at INTEGER, CHECK((state = 'issued' AND reservation_digest IS NULL AND consumed_at IS NULL) OR (state = 'reserving' AND reservation_digest IS NOT NULL AND consumed_at IS NULL) OR (state = 'consumed' AND reservation_digest IS NOT NULL AND consumed_at IS NOT NULL)), UNIQUE(task_id, record_digest, target_route_digest, coordinate_digest))"),),
+    ),
+    Migration(
+        78,
+        (
+            "CREATE TABLE recovery_route_successor_admissions (route_digest TEXT PRIMARY KEY REFERENCES recovery_route_authorizations(route_digest), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, reservation_digest TEXT NOT NULL, target_attempt_id TEXT NOT NULL, target_request_digest TEXT NOT NULL, admitted_at INTEGER NOT NULL CHECK(admitted_at > 0), UNIQUE(task_id, target_attempt_id), UNIQUE(task_id, target_request_digest))",
+        ),
+        (("recovery_route_successor_admissions", "CREATE TABLE recovery_route_successor_admissions (route_digest TEXT PRIMARY KEY REFERENCES recovery_route_authorizations(route_digest), task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, reservation_digest TEXT NOT NULL, target_attempt_id TEXT NOT NULL, target_request_digest TEXT NOT NULL, admitted_at INTEGER NOT NULL CHECK(admitted_at > 0), UNIQUE(task_id, target_attempt_id), UNIQUE(task_id, target_request_digest))"),),
+    ),
+    Migration(
+        79,
+        (
+            "ALTER TABLE dependency_review_dispatch_claims RENAME TO dependency_review_dispatch_claims_v78",
+            "CREATE TABLE dependency_review_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT, turn_identity TEXT, state TEXT NOT NULL CHECK(state IN ('pre-dispatch', 'session-opened', 'turn-dispatched')), CHECK((session_identity IS NULL AND turn_identity IS NULL AND state = 'pre-dispatch') OR (session_identity IS NOT NULL AND turn_identity IS NULL AND state = 'session-opened') OR (session_identity IS NOT NULL AND turn_identity IS NOT NULL AND state = 'turn-dispatched')))",
+            "INSERT INTO dependency_review_dispatch_claims SELECT attempt_id, session_identity, turn_identity, state FROM dependency_review_dispatch_claims_v78",
+            "DROP TABLE dependency_review_dispatch_claims_v78",
+        ),
+        (("dependency_review_dispatch_claims", "CREATE TABLE dependency_review_dispatch_claims (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT, turn_identity TEXT, state TEXT NOT NULL CHECK(state IN ('pre-dispatch', 'session-opened', 'turn-dispatched')), CHECK((session_identity IS NULL AND turn_identity IS NULL AND state = 'pre-dispatch') OR (session_identity IS NOT NULL AND turn_identity IS NULL AND state = 'session-opened') OR (session_identity IS NOT NULL AND turn_identity IS NOT NULL AND state = 'turn-dispatched')))"),),
+    ),
+    Migration(
+        80,
+        ("CREATE TABLE diff_review_digest_versions (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), digest_version INTEGER NOT NULL CHECK(digest_version IN (1, 2)))",),
+        (("diff_review_digest_versions", "CREATE TABLE diff_review_digest_versions (diff_review_attempt_id TEXT PRIMARY KEY REFERENCES diff_review_attempts(diff_review_attempt_id), digest_version INTEGER NOT NULL CHECK(digest_version IN (1, 2)))"),),
+    ),
+    Migration(
+        81,
+        (
+            "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'supervisor'), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), UNIQUE(task_id, reservation_digest))",
+        ),
+        (("provider_effect_reservation_intents", "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'supervisor'), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), UNIQUE(task_id, reservation_digest))"),),
+    ),
+    Migration(
+        82,
+        (
+            "ALTER TABLE provider_effect_reservation_intents ADD COLUMN reservation_repository_identity TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE provider_effect_reservation_intents ADD COLUMN reservation_task_identity TEXT NOT NULL DEFAULT ''",
+        ),
+        (("provider_effect_reservation_intents", "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role = 'supervisor'), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), reservation_repository_identity TEXT NOT NULL DEFAULT '', reservation_task_identity TEXT NOT NULL DEFAULT '', UNIQUE(task_id, reservation_digest))"),),
+    ),
+    Migration(
+        83,
+        (
+            "ALTER TABLE provider_effect_reservation_intents RENAME TO provider_effect_reservation_intents_v82",
+            "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role IN ('supervisor', 'dependency-review')), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), reservation_repository_identity TEXT NOT NULL, reservation_task_identity TEXT NOT NULL, UNIQUE(task_id, reservation_digest))",
+            "INSERT INTO provider_effect_reservation_intents SELECT attempt_id, task_id, repository_id, authority_scope, provider_role, reservation_digest, state, reservation_repository_identity, reservation_task_identity FROM provider_effect_reservation_intents_v82",
+            "DROP TABLE provider_effect_reservation_intents_v82",
+        ),
+        (("provider_effect_reservation_intents", "CREATE TABLE provider_effect_reservation_intents (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), repository_id TEXT NOT NULL, authority_scope TEXT NOT NULL, provider_role TEXT NOT NULL CHECK(provider_role IN ('supervisor', 'dependency-review')), reservation_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state = 'reserving'), reservation_repository_identity TEXT NOT NULL, reservation_task_identity TEXT NOT NULL, UNIQUE(task_id, reservation_digest))"),),
+    ),
+    Migration(
+        84,
+        (
+            "CREATE TABLE dependency_review_accepted_result_dispatches (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT NOT NULL, turn_identity TEXT NOT NULL, output_digest TEXT NOT NULL, UNIQUE(session_identity, turn_identity))",
+        ),
+        (("dependency_review_accepted_result_dispatches", "CREATE TABLE dependency_review_accepted_result_dispatches (attempt_id TEXT PRIMARY KEY REFERENCES dependency_review_attempts(attempt_id), session_identity TEXT NOT NULL, turn_identity TEXT NOT NULL, output_digest TEXT NOT NULL, UNIQUE(session_identity, turn_identity))"),),
+    ),
 )
 
 
@@ -1598,6 +1771,7 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
             applied: dict[int, str] = {}
         else:
             applied = _read_applied(connection)
+        source_schema_version = max(applied, default=0)
         _validate_applied(applied, ordered)
         _validate_schema(connection, ordered[:len(applied)])
         for migration in ordered[len(applied):]:
@@ -1607,6 +1781,16 @@ def _apply_migrations(connection: sqlite3.Connection, migrations: Iterable[Migra
                 connection.execute(statement)
             if migration.version == 65:
                 _migrate_legacy_worker_objectives(connection)
+            if migration.version == 73:
+                _migrate_supervisor_attempt_coordinates(connection)
+            if migration.version == 80:
+                _migrate_diff_review_digest_versions(connection)
+            if migration.version == 81:
+                _migrate_legacy_generic_supervisor_positions(connection)
+            if migration.version == 84:
+                _migrate_dependency_review_evidence_bindings(
+                    connection, source_schema_version=source_schema_version,
+                )
             connection.execute(
                 "INSERT INTO schema_migrations(version, checksum) VALUES (?, ?)",
                 (migration.version, migration.checksum),
@@ -1635,6 +1819,321 @@ def _verify_migrations(connection: sqlite3.Connection, migrations: Iterable[Migr
     _validate_schema(connection, ordered)
     _validate_task_ownership(connection)
     return ordered[-1].version if ordered else 0, _read_state_identity(connection)
+
+
+def _supervisor_coordinate_transition_is_valid(
+    previous: tuple[int, int, int, int] | None,
+    current: tuple[int, int, int, int],
+) -> bool:
+    """Accept only the bounded supervisor profile/format coordinate sequence."""
+
+    epoch, review_round, logical_position, format_ordinal = current
+    if epoch < 0 or review_round < 1 or logical_position < 1 or format_ordinal not in (0, 1, 2):
+        return False
+    # The first durable row can be historical state which predates this ledger.
+    if previous is None:
+        return True
+    previous_epoch, previous_round, previous_logical, previous_format = previous
+    if epoch == previous_epoch and review_round == previous_round:
+        return (
+            logical_position == previous_logical and format_ordinal == previous_format + 1
+        ) or (
+            logical_position == previous_logical + 1 and format_ordinal == 0
+        )
+    if epoch == previous_epoch:
+        return review_round == previous_round + 1 and logical_position == 1 and format_ordinal == 0
+    return epoch == previous_epoch + 1 and review_round in {previous_round, 1} and logical_position == 1 and format_ordinal == 0
+
+
+def _migrate_diff_review_digest_versions(connection: sqlite3.Connection) -> None:
+    """Identify historical encodings by authenticating their unchanged digests."""
+    from types import SimpleNamespace
+    from .candidate_review import CandidateReviewError, _read_diff_dispatch_connection
+
+    for review_id, task_id in connection.execute("SELECT diff_review_attempt_id, task_id FROM diff_review_attempts").fetchall():
+        versions = []
+        for version in (1, 2):
+            try:
+                _read_diff_dispatch_connection(connection, SimpleNamespace(task_id=task_id), review_id, digest_version=version, validate_provider_output=True)
+            except (CandidateReviewError, TypeError, ValueError):
+                continue
+            versions.append(version)
+        if len(versions) != 1:
+            raise StateError("legacy diff review identity is unauthenticated or ambiguous")
+        connection.execute("INSERT INTO diff_review_digest_versions VALUES (?, ?)", (review_id, versions[0]))
+
+
+def _migrate_legacy_generic_supervisor_positions(connection: sqlite3.Connection) -> None:
+    """Recover only uniquely authenticated pre-coordinate Supervisor positions.
+
+    Schema-67 generic prepared attempts have no diff-review row, so v71 could
+    not copy their historical ``within_round_attempt`` value.  Their selected
+    profile and immutable attempt/runtime contexts still identify one exact
+    configured position.  Preserve replay by backfilling that position while
+    rejecting incomplete, duplicated, or drifted authority instead of
+    inventing a coordinate.
+    """
+
+    rows = connection.execute(
+        "SELECT attempts.attempt_id, attempts.task_id, attempts.selected_profile_identity, "
+        "contexts.task_id, contexts.configuration_schema_version, contexts.configuration_digest, "
+        "contexts.worker_profile_identity, contexts.supervisor_profile_identities, "
+        "runtime.schema_version, runtime.resolved_digest, runtime.worker_profile_identity, "
+        "runtime.supervisor_profile_identities "
+        "FROM provider_attempts AS attempts "
+        "LEFT JOIN provider_attempt_contexts AS contexts ON contexts.attempt_id = attempts.attempt_id "
+        "LEFT JOIN runtime_configuration_bindings AS runtime ON runtime.task_id = attempts.task_id "
+        "LEFT JOIN diff_review_attempts AS reviews ON reviews.provider_attempt_id = attempts.attempt_id "
+        "WHERE attempts.provider_role = 'supervisor' AND attempts.state = 'prepared' "
+        "AND attempts.logical_profile_position = 0 "
+        "AND attempts.physical_format_output_ordinal = 0 "
+        "AND reviews.provider_attempt_id IS NULL "
+        "ORDER BY attempts.task_id, attempts.attempt_number, attempts.attempt_id"
+    ).fetchall()
+    for row in rows:
+        (
+            attempt_id, task_id, selected_profile, context_task, context_schema,
+            context_digest, context_worker, context_supervisors, runtime_schema,
+            runtime_digest, runtime_worker, runtime_supervisors,
+        ) = row
+        try:
+            context_profiles = tuple(json.loads(context_supervisors))
+            runtime_profiles = tuple(json.loads(runtime_supervisors))
+        except (TypeError, json.JSONDecodeError):
+            raise StateError("legacy generic Supervisor position is unauthenticated") from None
+        if (
+            context_task != task_id
+            or context_schema != "roundwright-runtime/v1"
+            or runtime_schema != "roundwright-runtime/v1"
+            or context_digest != runtime_digest
+            or context_worker != runtime_worker
+            or context_profiles != runtime_profiles
+            or not isinstance(selected_profile, str)
+            or context_profiles.count(selected_profile) != 1
+        ):
+            raise StateError("legacy generic Supervisor position is unauthenticated")
+        logical_position = context_profiles.index(selected_profile) + 1
+        if connection.execute(
+            "UPDATE provider_attempts SET logical_profile_position = ? "
+            "WHERE attempt_id = ? AND task_id = ? AND provider_role = 'supervisor' "
+            "AND state = 'prepared' AND logical_profile_position = 0 "
+            "AND physical_format_output_ordinal = 0",
+            (logical_position, attempt_id, task_id),
+        ).rowcount != 1:
+            raise StateError("legacy generic Supervisor position is unavailable")
+
+
+def _migrate_dependency_review_evidence_bindings(
+    connection: sqlite3.Connection, *, source_schema_version: int,
+) -> None:
+    """Retain historical dependency identities without manufacturing claims."""
+
+    from .dependency_review import DependencyReviewError, DependencyReviewStore
+    from .failure_recovery import FailureRole, pre_dispatch_failure_identity
+
+    def opaque(value: object) -> bool:
+        return (
+            isinstance(value, str) and 1 <= len(value) <= 128
+            and value[0].isalnum()
+            and all(character.isalnum() or character in "._/-" for character in value)
+        )
+
+    def digest(value: object) -> bool:
+        return (
+            isinstance(value, str) and len(value) == 71
+            and value.startswith("sha256:")
+            and all(character in "0123456789abcdef" for character in value[7:])
+        )
+
+    accepted = connection.execute(
+        "SELECT attempts.attempt_id, claims.session_identity, claims.turn_identity, claims.state, "
+        "outcomes.outcome, outcomes.output_digest, proposals.proposal_digest "
+        "FROM dependency_review_attempts AS attempts "
+        "LEFT JOIN dependency_review_dispatch_claims AS claims ON claims.attempt_id = attempts.attempt_id "
+        "LEFT JOIN dependency_review_validation_outcomes AS outcomes ON outcomes.attempt_id = attempts.attempt_id "
+        "LEFT JOIN dependency_review_proposals AS proposals ON proposals.attempt_id = attempts.attempt_id "
+        "WHERE attempts.state = 'accepted' ORDER BY attempts.attempt_id"
+    ).fetchall()
+    authenticated_accepted: dict[str, tuple[str, str, str]] = {}
+    for attempt_id, session_identity, turn_identity, claim_state, outcome, output_digest, proposal_digest in accepted:
+        if (
+            not opaque(attempt_id) or attempt_id in authenticated_accepted
+            or claim_state != "turn-dispatched" or not opaque(session_identity)
+            or not opaque(turn_identity) or outcome != "accepted"
+            or not digest(output_digest) or output_digest != proposal_digest
+        ):
+            raise StateError("legacy accepted dependency evidence is unauthenticated")
+        authenticated_accepted[attempt_id] = (
+            session_identity, turn_identity, output_digest,
+        )
+
+    claims = connection.execute(
+        "SELECT attempts.attempt_id, attempts.task_id, attempts.profile_identity, "
+        "attempts.configuration_digest, subsets.task_id, subsets.candidate_sha, "
+        "subsets.policy_digest, subsets.configuration_digest, claims.session_identity, "
+        "claims.turn_identity, claims.state, tasks.base_sha, seals.base_sha, "
+        "seals.candidate_sha, seals.state_identity, runtime.schema_version, runtime.resolved_digest "
+        "FROM dependency_review_dispatch_claims AS claims "
+        "JOIN dependency_review_attempts AS attempts ON attempts.attempt_id = claims.attempt_id "
+        "JOIN dependency_review_subsets AS subsets ON subsets.snapshot_id = attempts.snapshot_id "
+        "JOIN tasks ON tasks.task_id = attempts.task_id "
+        "LEFT JOIN candidate_seals AS seals ON seals.task_id = attempts.task_id "
+        "LEFT JOIN runtime_configuration_bindings AS runtime ON runtime.task_id = attempts.task_id "
+        "ORDER BY attempts.attempt_id"
+    ).fetchall()
+    for (
+        attempt_id, task_id, profile_identity, attempt_configuration,
+        subset_task, candidate_sha, policy_digest, subset_configuration,
+        session_identity, turn_identity, claim_state, task_base_sha, seal_base_sha,
+        seal_candidate_sha, state_identity, runtime_schema, runtime_configuration,
+    ) in claims:
+        # Reconstruct the complete legacy request from its retained subset,
+        # members, trusted relations, input digest, proposal, edges, and
+        # outcome before any v84 authority is backfilled.  Scalar agreement
+        # among the joined rows is insufficient: a drifted old candidate can
+        # otherwise become internally consistent current recovery authority.
+        try:
+            retained_attempt, retained_subset = DependencyReviewStore._read_attempt(
+                connection, attempt_id,
+            )
+        except (DependencyReviewError, TypeError, ValueError) as error:
+            raise StateError(
+                "legacy dependency review dispatch is unauthenticated"
+            ) from error
+        if (
+            not opaque(attempt_id) or not opaque(task_id)
+            or subset_task != task_id
+            or attempt_configuration != subset_configuration
+            or not digest(profile_identity) or not digest(policy_digest)
+            or not digest(attempt_configuration)
+            or not isinstance(candidate_sha, str) or len(candidate_sha) != 40
+            or any(character not in "0123456789abcdef" for character in candidate_sha)
+            or (
+                (seal_base_sha, seal_candidate_sha, state_identity) != (None, None, None)
+                and (
+                    seal_base_sha != task_base_sha
+                    or not isinstance(seal_candidate_sha, str) or len(seal_candidate_sha) != 40
+                    or any(character not in "0123456789abcdef" for character in seal_candidate_sha)
+                    or not isinstance(state_identity, str) or not state_identity
+                )
+            )
+            or runtime_schema != "roundwright-runtime/v1"
+            or runtime_configuration != attempt_configuration
+            or retained_attempt[0] != task_id
+            or retained_attempt[1] != retained_subset.snapshot_id
+            or retained_attempt[2] != profile_identity
+            or retained_attempt[3] != attempt_configuration
+            or retained_subset.task_id != subset_task
+            or retained_subset.candidate_sha != candidate_sha
+            or retained_subset.policy_digest != policy_digest
+            or retained_subset.configuration_digest != subset_configuration
+        ):
+            raise StateError("legacy dependency review dispatch is unauthenticated")
+        if claim_state == "pre-dispatch":
+            if session_identity is not None or turn_identity is not None:
+                raise StateError("legacy dependency review dispatch is unauthenticated")
+            admitted_session = pre_dispatch_failure_identity(
+                FailureRole.DEPENDENCY_REVIEW, attempt_id,
+            )
+        elif claim_state == "session-opened":
+            if not opaque(session_identity) or turn_identity is not None:
+                raise StateError("legacy dependency review dispatch is unauthenticated")
+            admitted_session = session_identity
+        elif claim_state == "turn-dispatched":
+            if not opaque(session_identity) or not opaque(turn_identity):
+                raise StateError("legacy dependency review dispatch is unauthenticated")
+            admitted_session = session_identity
+        else:
+            raise StateError("legacy dependency review dispatch is unauthenticated")
+        # An accepted review for an older candidate remains authenticated
+        # history when the task has advanced to a newer seal.  It must not mint
+        # admission authority for the old candidate, just as if the seal were
+        # absent entirely.
+        historical_only = seal_candidate_sha != candidate_sha
+        if historical_only and attempt_id not in authenticated_accepted:
+            raise StateError("legacy dependency review dispatch is unauthenticated")
+        expected = (
+            task_id, candidate_sha, policy_digest, attempt_configuration,
+            "dependency-review:" + task_id, "dependency-review",
+            profile_identity, admitted_session, attempt_id,
+        )
+        existing = connection.execute(
+            "SELECT task_id, candidate_sha, policy_digest, configuration_digest, "
+            "authority_scope, provider_role, profile_identity, session_identity, "
+            "attempt_identity FROM dependency_review_failure_admissions WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is None:
+            if source_schema_version >= 74:
+                raise StateError("legacy dependency review admission is missing")
+            if attempt_id in authenticated_accepted and not historical_only:
+                connection.execute(
+                    "INSERT INTO dependency_review_failure_admissions"
+                    "(attempt_id, task_id, candidate_sha, policy_digest, configuration_digest, "
+                    "authority_scope, provider_role, profile_identity, session_identity, attempt_identity) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (attempt_id, *expected),
+                )
+        elif existing != expected:
+            raise StateError("legacy dependency review admission has drifted")
+
+    for attempt_id, expected in authenticated_accepted.items():
+        existing = connection.execute(
+            "SELECT session_identity, turn_identity, output_digest "
+            "FROM dependency_review_accepted_result_dispatches WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO dependency_review_accepted_result_dispatches"
+                "(attempt_id, session_identity, turn_identity, output_digest) VALUES (?, ?, ?, ?)",
+                (attempt_id, *expected),
+            )
+        elif existing != expected:
+            raise StateError("legacy accepted dependency evidence has drifted")
+
+
+def _migrate_supervisor_attempt_coordinates(connection: sqlite3.Connection) -> None:
+    """Bind pre-v73 diff-review attempts to one monotonic supervisor coordinate.
+
+    Migration must not invent a sequence from incomplete rows: a contradictory
+    legacy review record is unsafe to resume and therefore fails the upgrade.
+    """
+
+    rows = connection.execute(
+        "SELECT attempt.attempt_id, attempt.task_id, attempt.provider_role, attempt.attempt_number, "
+        "attempt.selected_profile_identity, review.review_epoch, review.review_round, "
+        "review.logical_profile_position, review.physical_format_output_ordinal, review.selected_profile_identity "
+        "FROM diff_review_attempts AS review "
+        "JOIN provider_attempts AS attempt "
+        "ON attempt.attempt_id = review.provider_attempt_id AND attempt.task_id = review.task_id "
+        "ORDER BY attempt.task_id, attempt.attempt_number, attempt.attempt_id"
+    ).fetchall()
+    previous_by_task: dict[str, tuple[int, int, int, int]] = {}
+    seen: set[tuple[str, int, int, int, int]] = set()
+    for attempt_id, task_id, role, _number, attempt_profile, epoch, review_round, logical, physical, review_profile in rows:
+        if (
+            role != "supervisor"
+            or not isinstance(task_id, str)
+            or not isinstance(attempt_profile, str)
+            or attempt_profile != review_profile
+            or not all(isinstance(value, int) for value in (epoch, review_round, logical, physical))
+        ):
+            raise StateError("legacy supervisor review coordinate is contradictory")
+        coordinate = (epoch, review_round, logical, physical)
+        key = (task_id, *coordinate)
+        if key in seen:
+            raise StateError("legacy supervisor review coordinates are duplicated")
+        if not _supervisor_coordinate_transition_is_valid(previous_by_task.get(task_id), coordinate):
+            raise StateError("legacy supervisor review coordinates are not monotonic")
+        seen.add(key)
+        previous_by_task[task_id] = coordinate
+        connection.execute(
+            "INSERT INTO supervisor_attempt_coordinates("
+            "attempt_id, task_id, review_epoch, review_round, logical_profile_position, "
+            "physical_format_output_ordinal, profile_identity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (attempt_id, task_id, epoch, review_round, logical, physical, attempt_profile),
+        )
 
 
 def _migrate_legacy_worker_objectives(connection: sqlite3.Connection) -> None:

@@ -20,27 +20,43 @@ from types import MappingProxyType
 from .configuration import RepositoryIdentity, ReviewMode
 from .candidate_review import (
     CandidateReviewError, DiffReviewOutput, DiffReviewVerdict, checkpoint_diff_review_session,
-    dispatch_diff_review, preflight_diff_review_session_checkpoint, record_diff_review,
+    dispatch_diff_review, preflight_diff_review_session_checkpoint, read_diff_review, record_diff_review,
 )
 from .codex_supervisor import (
     CodexSupervisorAdapter, CodexSupervisorCheckpointError, CodexSupervisorContext, CodexSupervisorRequest,
-    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorResponseContract, SupervisorResultKind, SupervisorVerdict,
+    CodexSupervisorScopeAdmissionError,
+    ACCOUNTING_TRANSITION_CRITERIA, ACCOUNTING_TRANSITION_OBJECTIVE, NativeCodexSupervisorBackend, SupervisorAccountingDecisionSemantic, SupervisorDiagnostic, SupervisorOutcomeSource, SupervisorResponseContract, SupervisorResultKind, SupervisorSdkTurnErrorCategory, SupervisorVerdict,
     supervisor_request_digest,
 )
 from .dependency_policy import CandidateBinding
 from .git_identity import CandidateSeal, GitIdentityError, TransitionLease, WorktreeBinding
 from .provider_health import ProviderHealthAuditIdentity
-from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, reserve_role_effect, trusted_provider_launch_context
+from .failure_recovery import (
+    EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, ScopeAdmissionDenied,
+    RecoveryAction as FailureRecoveryAction, classify,
+    abandon_durable_recovery_route_reservation,
+    begin_durable_recovery_route_reservation,
+    commit_durable_recovery_route_reservation,
+    issue_durable_recovery_route_authorization,
+    native_failure_class, parse_failure_record, pre_dispatch_failure_identity, read_durable_failure,
+    admit_scope_effect_reservation, release_unused_provider_effect_reservation,
+    begin_provider_effect_reservation_intent,
+    commit_provider_effect_reservation_intent, require_scope_effect_admission,
+)
+from .provider_health import CodexFailure
+from .role_capability_policy import RoleCapabilityError, RoleExecutionSeam, SealedRoleExecution, TrustedExecutionHostInputs, recovery_reservation_digest, recover_role_effect_reservation, reserve_role_effect, trusted_provider_launch_context
 from .provider_recovery import (
-    AttemptState, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
+    AttemptState, ProviderAttemptAbsentError, ProviderRecoveryError, RecoveryAction, RecoveryContext, block_session_without_turn,
     invalidate_supervisor_attempt, preflight_attempt_preparation, ProviderRole,
-    read_supervisor_terminal_failure, record_supervisor_terminal_failure,
+    read_supervisor_terminal_failure, record_supervisor_scope_denial, record_supervisor_terminal_failure,
     claim_supervisor_dispatch, read_supervisor_dispatch_claim, SupervisorDispatchClaimState, read_attempt, record_invalid_output, recover_attempt, prepare_attempt, read_supervisor_accounting_snapshot,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
     SupervisorAccountingBlocker, record_supervisor_accounting_blocker,
+    _require_complete_provider_dispatch_binding, _require_persisted_health_authorization,
+    _require_session_checkpoint,
 )
 from .runtime_binding import RuntimeBinding, RuntimeBindingError
-from .state import TaskIdentity, check_database, require_runtime_binding, task_projection
+from .state import TaskIdentity, _open_writable_connection, check_database, require_runtime_binding, task_projection
 from .worker_planning import ProviderDispatchControl
 from .supervisor_toolbox import HarnessNativeCodexSupervisorBackend
 from .worker_toolbox import CompletionDeadline
@@ -81,6 +97,10 @@ class ProviderAttemptCheckpointFailure(ProviderAttemptRuntimeError):
             f"local {stage} failed; session-present={str(session_present).lower()}; "
             f"turn-present={str(turn_present).lower()}"
         )
+
+
+class ProviderAttemptFormatCorrectionExhausted(ProviderAttemptRuntimeError):
+    """All three physical format slots for one logical profile were used."""
 
 
 def _digest(value: object) -> str:
@@ -232,6 +252,8 @@ class DiffReviewSelection:
     objective: str
     acceptance_criteria: tuple[str, ...]
     within_round_attempt: int = 1
+    logical_profile_position: int = 0
+    physical_format_output_ordinal: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -244,8 +266,15 @@ class DiffReviewSelection:
             or type(self.acceptance_criteria) is not tuple
             or not self.acceptance_criteria or any(type(item) is not str or not item.strip() for item in self.acceptance_criteria)
             or type(self.within_round_attempt) is not int or self.within_round_attempt < 1
+            or type(self.logical_profile_position) is not int or self.logical_profile_position < 0
+            or type(self.physical_format_output_ordinal) is not int or not 0 <= self.physical_format_output_ordinal <= 2
+            or (self.logical_profile_position and self.logical_profile_position != self.within_round_attempt)
         ):
             raise ProviderAttemptRuntimeError("provider attempt selection is invalid")
+
+    @property
+    def resolved_logical_profile_position(self) -> int:
+        return self.logical_profile_position or self.within_round_attempt
 
 
 @dataclass(frozen=True)
@@ -332,7 +361,8 @@ def provider_attempt_effect_material(
         "review_attempt_id": selection.diff_review_attempt_id,
         "provider_attempt_id": selection.provider_attempt_id,
         "selected_profile_identity": audit.profile_identity,
-        "within_round_attempt": selection.within_round_attempt,
+        "logical_profile_position": selection.resolved_logical_profile_position,
+        "physical_format_output_ordinal": selection.physical_format_output_ordinal,
         "context": context.__dict__,
         "objective": ACCOUNTING_TRANSITION_OBJECTIVE,
         "acceptance_criteria": ACCOUNTING_TRANSITION_CRITERIA,
@@ -408,9 +438,10 @@ class DurableDiffReviewRunner:
                 or not _matching_execution_host(item.advisory_execution, item.execution_host)
                 for item in entries
             )
-            or len(entries) > runtime.review_max_supervisor_attempts_per_round
-            or tuple(item.selection.within_round_attempt for item in entries) != tuple(range(1, len(entries) + 1))
-            or tuple(item.audit.profile_identity for item in entries) != runtime.supervisor_profile_identities[:len(entries)]
+            or len({item.selection.resolved_logical_profile_position for item in entries}) > runtime.review_max_supervisor_attempts_per_round
+            or any(item.selection.resolved_logical_profile_position > runtime.review_max_supervisor_attempts_per_round or item.audit.profile_identity != runtime.supervisor_profile_identities[item.selection.resolved_logical_profile_position - 1] for item in entries)
+            or tuple((item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) for item in entries) != tuple(sorted((item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) for item in entries))
+            or any(item.selection.physical_format_output_ordinal and not any(previous.selection.resolved_logical_profile_position == item.selection.resolved_logical_profile_position and previous.selection.physical_format_output_ordinal == item.selection.physical_format_output_ordinal - 1 for previous in entries) for item in entries)
             or len({item.selection.provider_attempt_id for item in entries}) != len(entries)
             or any(
                 item.recovery.task_id != self.recovery.task_id
@@ -447,8 +478,9 @@ class DurableDiffReviewRunner:
                     process_lease_id=selection.process_lease_id,
                     process_lease_expires_at=selection.process_lease_expires_at,
                     selected_profile_identity=entry.audit.profile_identity,
-                    within_round_attempt=selection.within_round_attempt,
+                    within_round_attempt=selection.resolved_logical_profile_position,
                     review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
                 )
                 preflight_attempt_preparation(
                     self.identity, entry.recovery,
@@ -457,6 +489,9 @@ class DurableDiffReviewRunner:
                     process_lease_expires_at=selection.process_lease_expires_at,
                     input_fingerprint=input_digest,
                     selected_profile_identity=entry.audit.profile_identity,
+                    logical_profile_position=selection.resolved_logical_profile_position,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                    review_epoch=self.review_epoch, review_round=self.review_round,
                     now=self.dispatch_control.now,
                 )
             # Every provider-free eligibility dependency is normalized here.
@@ -478,7 +513,7 @@ class DurableDiffReviewRunner:
                 self.repository, self.identity, first.selection.provider_attempt_id,
                 context=first.recovery, now=self.dispatch_control.now,
             )
-        except ProviderRecoveryError:
+        except ProviderAttemptAbsentError:
             self.materialize_prepared_snapshot(entries)
         else:
             if initial.state is AttemptState.PREPARED:
@@ -494,8 +529,47 @@ class DurableDiffReviewRunner:
                 else:
                     raise ProviderAttemptRuntimeError("provider attempt dispatch claim is already consumed")
         attempt_ids: list[str] = []
-        for entry in entries:
-            attempt_id, accepted = self._execute_selection(entry)
+        for position, entry in enumerate(entries):
+            route = None
+            format_predecessor = None
+            if position:
+                # A successor is not merely an ordered list item.  It must be
+                # be authorized from the exact *terminal* source before it
+                # can reserve budget, claim a dispatch, or open a provider
+                # session.  Same-profile format corrections are separately
+                # bounded durable accounting transitions, not fallbacks.
+                predecessor = entries[position - 1]
+                terminal = read_supervisor_terminal_failure(
+                    self.repository, self.identity,
+                    predecessor.selection.provider_attempt_id,
+                )
+                if entry.selection.resolved_logical_profile_position == predecessor.selection.resolved_logical_profile_position:
+                    # A same-profile successor is solely a parser-format
+                    # correction.  Durable INVALIDATED alone is deliberately
+                    # insufficient: a corrupted, contextual, candidate, or
+                    # non-final result must reconcile instead of spending a
+                    # second physical ordinal.
+                    if (
+                        entry.selection.physical_format_output_ordinal
+                        != predecessor.selection.physical_format_output_ordinal + 1
+                        or terminal is not None
+                    ):
+                        raise ProviderAttemptRuntimeError(
+                            "prior Supervisor outcome is not format-correction-eligible"
+                        )
+                    self._require_format_correction_predecessor(predecessor)
+                    format_predecessor = predecessor
+                elif terminal is not None:
+                    route = self._authorize_terminal_successor(predecessor, entry)
+                else:
+                    # A profile transition is never an implicit fallback.
+                    # Only an authenticated terminal source may authorize it.
+                    raise ProviderAttemptRuntimeError(
+                        "provider profile transition has no terminal recovery route"
+                    )
+            attempt_id, accepted = self._execute_selection(
+                entry, recovery_route=route, format_predecessor=format_predecessor,
+            )
             attempt_ids.append(attempt_id)
             if accepted:
                 return tuple(attempt_ids)
@@ -505,9 +579,218 @@ class DurableDiffReviewRunner:
             stored = read_attempt(self.repository, self.identity, attempt_id, context=self.recovery)
             if stored.state is AttemptState.AMBIGUOUS:
                 raise ProviderAttemptRuntimeError("ambiguous provider attempt blocks the bounded sequence")
+            terminal = read_supervisor_terminal_failure(
+                self.repository, self.identity, attempt_id,
+            )
+            if terminal is not None:
+                failure, evidence = native_failure_class(CodexFailure(terminal.failure_class.value))
+                if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
+                    raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
+                if position + 1 >= len(entries):
+                    raise ProviderAttemptRuntimeError("provider terminal failure has no pre-bound fallback")
+                successor = entries[position + 1].selection
+                if (
+                    successor.resolved_logical_profile_position
+                    != entry.selection.resolved_logical_profile_position + 1
+                    or successor.physical_format_output_ordinal != 0
+                ):
+                    raise ProviderAttemptRuntimeError("provider terminal failure cannot use a format correction route")
             if stored.state is not AttemptState.INVALIDATED:
                 raise ProviderAttemptRuntimeError("provider attempt recovery is incomplete")
         return tuple(attempt_ids)
+
+    def _format_correction_is_durable(self, attempt_id: str) -> bool:
+        """Accept only the two persisted parser-format INVALID outcomes.
+
+        The invalid-output table intentionally records only opaque
+        fingerprints.  Its two format marker values are deterministic, so a
+        restart can authenticate the original typed decision without storing
+        provider text or trusting a caller-supplied diagnostic.
+        """
+
+        from .state import _open_writable_connection
+
+        expected = {
+            hashlib.sha256(f"invalid:{diagnostic.value}".encode()).hexdigest()
+            for diagnostic in (SupervisorDiagnostic.SYNTAX, SupervisorDiagnostic.SHAPE)
+        }
+        connection = _open_writable_connection(self.repository)
+        try:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                "SELECT output_fingerprint, reason_fingerprint "
+                "FROM provider_invalid_outputs WHERE task_id = ? AND attempt_id = ?",
+                (self.identity.task_id, attempt_id),
+            ).fetchall()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            return False
+        finally:
+            connection.close()
+        return len(rows) == 1 and rows[0][0] == rows[0][1] and rows[0][0] in expected
+
+    def _require_format_correction_predecessor(
+        self, predecessor: DiffReviewSequenceEntry,
+    ) -> object:
+        """Authenticate the whole malformed turn and its original provider debit."""
+
+        selection = predecessor.selection
+        try:
+            stored = read_attempt(
+                self.repository, self.identity, selection.provider_attempt_id,
+                context=predecessor.recovery, now=self.dispatch_control.now,
+            )
+            expected_input = preflight_diff_review_session_checkpoint(
+                self.repository, self.identity, predecessor.recovery,
+                self.binding, self.seal, dependency_binding=self.dependency_binding,
+                control=self.dispatch_control,
+                implementation_attempt_id=selection.implementation_attempt_id,
+                provider_attempt_id=selection.provider_attempt_id,
+                message_identity=selection.message_identity,
+                process_lease_id=selection.process_lease_id,
+                process_lease_expires_at=selection.process_lease_expires_at,
+                selected_profile_identity=predecessor.audit.profile_identity,
+                within_round_attempt=selection.resolved_logical_profile_position,
+                review_round=self.review_round, review_epoch=self.review_epoch,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            self._require_exact_persisted_attempt(
+                predecessor, stored, expected_input,
+            )
+            if (
+                stored.state is not AttemptState.INVALIDATED
+                or not self._format_correction_is_durable(selection.provider_attempt_id)
+            ):
+                raise ProviderAttemptRuntimeError(
+                    "provider format-correction predecessor is unauthenticated"
+                )
+            self._recover_prepared_reservation(predecessor, required=True)
+            return stored
+        except (CandidateReviewError, GitIdentityError, ProviderRecoveryError, RoleCapabilityError) as error:
+            raise ProviderAttemptRuntimeError(
+                "provider format-correction predecessor is unauthenticated"
+            ) from error
+
+    def _recovery_route_material(self, entry: DiffReviewSequenceEntry) -> tuple[str, str, str, str]:
+        """Derive the immutable successor route, coordinate, and budget facts."""
+
+        selection = entry.selection
+        route = _digest({
+            "schema": "roundwright-supervisor-recovery-target/v1",
+            "attempt_id": selection.provider_attempt_id,
+            "message_identity": selection.message_identity,
+            "profile_identity": entry.audit.profile_identity,
+            "runtime_binding": entry.recovery.runtime_binding.resolved_digest,
+        })
+        coordinate = _digest({
+            "schema": "roundwright-supervisor-recovery-coordinate/v1",
+            "review_epoch": self.review_epoch,
+            "review_round": self.review_round,
+            "logical_profile_position": selection.resolved_logical_profile_position,
+            "physical_format_output_ordinal": selection.physical_format_output_ordinal,
+        })
+        remaining = _digest({
+            "schema": "roundwright-supervisor-recovery-budget/v1",
+            "maximum_profiles": entry.recovery.runtime_binding.review_max_supervisor_attempts_per_round,
+            "successor_position": selection.resolved_logical_profile_position,
+            "physical_format_output_ordinal": selection.physical_format_output_ordinal,
+            "profile_identity": entry.audit.profile_identity,
+        })
+        _context, request_material, preflight_material = provider_attempt_effect_material(
+            identity=self.identity, recovery=entry.recovery, seal=self.seal,
+            source_digest=self.source_digest, review_epoch=self.review_epoch,
+            review_round=self.review_round, selection=selection, audit=entry.audit,
+        )
+        reservation = recovery_reservation_digest(
+            entry.advisory_execution, host_inputs=entry.execution_host,
+            profile=entry.audit.profile,
+            request_or_attempt_identity=selection.provider_attempt_id,
+            request_material=request_material, preflight_material=preflight_material,
+        )
+        return route, coordinate, remaining, reservation
+
+    def _authorize_terminal_successor(
+        self, source: DiffReviewSequenceEntry, successor: DiffReviewSequenceEntry,
+    ) -> object:
+        """Issue and reread one durable route for a verified transient failure.
+
+        This intentionally runs on every restart.  An already-consumed route
+        remains readable, but its later consumption fails closed before any
+        successor provider effect can be claimed.
+        """
+
+        source_attempt = read_attempt(
+            self.repository, self.identity, source.selection.provider_attempt_id,
+            context=source.recovery, now=self.dispatch_control.now,
+        )
+        # A terminal classification cannot mint a second call by itself.  The
+        # exact source effect must still have its original sealed budget debit;
+        # authenticate it before issuing or replaying any fallback route.
+        self._recover_prepared_reservation(source, required=True)
+        terminal = read_supervisor_terminal_failure(
+            self.repository, self.identity, source.selection.provider_attempt_id,
+        )
+        source_session = source_attempt.session_identity or pre_dispatch_failure_identity(
+            FailureRole.SUPERVISOR, source.selection.provider_attempt_id,
+        )
+        if terminal is None:
+            raise ProviderAttemptRuntimeError("provider terminal recovery source is unavailable")
+        failure, evidence = native_failure_class(CodexFailure(terminal.failure_class.value))
+        if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
+            raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
+        # Read the immutable source binding from the failure ledger before
+        # deriving its route.  It catches a changed candidate/profile/session
+        # rather than reconstructing an apparently equivalent caller value.
+        from .state import _open_writable_connection
+        connection = _open_writable_connection(self.repository)
+        try:
+            rows = connection.execute(
+                "SELECT record_digest, record_json FROM failure_recovery_records WHERE task_id = ?",
+                (self.identity.task_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        matches = []
+        for digest, encoded in rows:
+            try:
+                record = parse_failure_record(json.loads(encoded))
+            except Exception:
+                continue
+            if (
+                record.digest == digest
+                and record.binding.role is FailureRole.SUPERVISOR
+                and record.binding.attempt_identity == source.selection.provider_attempt_id
+                and record.binding.session_identity == source_session
+            ):
+                matches.append(record)
+        if len(matches) != 1:
+            raise ProviderAttemptRuntimeError("provider terminal recovery source is unavailable")
+        record = matches[0]
+        binding = record.binding
+        try:
+            durable = read_durable_failure(self.repository, self.identity, record.digest)
+            if durable.action is not FailureRecoveryAction.PREBOUND_FALLBACK or not durable.retryable:
+                raise ProviderAttemptRuntimeError("provider terminal recovery source is not eligible")
+            route, coordinate, remaining, _reservation = self._recovery_route_material(successor)
+            issued = issue_durable_recovery_route_authorization(
+                self.repository, self.identity, record_digest=record.digest, binding=binding,
+                target_role=FailureRole.SUPERVISOR,
+                target_profile_digest=successor.audit.profile_identity,
+                target_route_digest=route, coordinate_digest=coordinate,
+                remaining_budget_digest=remaining, now=self.dispatch_control.now,
+            )
+            # Reread from durable state rather than trusting the freshly
+            # constructed authorization object across a restart boundary.
+            from .failure_recovery import read_durable_recovery_route_authorization
+            return read_durable_recovery_route_authorization(
+                self.repository, self.identity, issued.route_digest,
+            )
+        except Exception as error:
+            if isinstance(error, ProviderAttemptRuntimeError):
+                raise
+            raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
 
     def materialize_prepared_snapshot(
         self, entries: tuple[DiffReviewSequenceEntry, ...] | None = None,
@@ -540,7 +823,8 @@ class DurableDiffReviewRunner:
             process_lease_id=selection.process_lease_id,
             process_lease_expires_at=selection.process_lease_expires_at,
             selected_profile_identity=entry.audit.profile_identity,
-            within_round_attempt=selection.within_round_attempt, review_round=self.review_round, review_epoch=self.review_epoch,
+            within_round_attempt=selection.resolved_logical_profile_position, review_round=self.review_round, review_epoch=self.review_epoch,
+            physical_format_output_ordinal=selection.physical_format_output_ordinal,
             lease=self.lease, now=self.dispatch_control.now,
         )
         try:
@@ -549,6 +833,9 @@ class DurableDiffReviewRunner:
                 role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
                 process_lease_expires_at=selection.process_lease_expires_at,
                 input_fingerprint=input_fingerprint, selected_profile_identity=entry.audit.profile_identity,
+                logical_profile_position=selection.resolved_logical_profile_position,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                review_epoch=self.review_epoch, review_round=self.review_round,
                 lease=self.lease, now=self.dispatch_control.now,
             )
             if prepared.state is not AttemptState.PREPARED:
@@ -559,8 +846,9 @@ class DurableDiffReviewRunner:
                 case_id=self.case_id, ready_at=self.ready_at, review_epoch=self.review_epoch,
                 review_round=self.review_round, review_mode=context.review_mode.value,
                 current_attempt_id=selection.provider_attempt_id,
-                current_within_round_attempt=selection.within_round_attempt,
+                current_within_round_attempt=selection.resolved_logical_profile_position,
                 current_profile_identity=entry.audit.profile_identity, prior_attempts=(),
+                current_physical_format_output_ordinal=selection.physical_format_output_ordinal,
                 seal_state_identity=self.lease.state_identity,
             )
         except ProviderRecoveryError:
@@ -577,61 +865,390 @@ class DurableDiffReviewRunner:
         entries = self.preflight_checkpoint_prerequisites()
         first = entries[0]
         try:
-            current = read_attempt(
+            read_attempt(
                 self.repository, self.identity, first.selection.provider_attempt_id,
                 context=first.recovery, now=self.dispatch_control.now,
             )
-        except ProviderRecoveryError:
+        except ProviderAttemptAbsentError:
             return self.materialize_prepared_snapshot(entries)
         try:
-            if current.state is AttemptState.PREPARED:
-                claim = read_supervisor_dispatch_claim(
-                    self.repository, self.identity, first.recovery,
-                    attempt_id=first.selection.provider_attempt_id,
-                )
-                if claim is SupervisorDispatchClaimState.UNCLAIMED:
-                    return self.materialize_prepared_snapshot(entries)
-            for entry in entries:
+            current = None
+            previous = None
+            prepared_seen = False
+            for position, entry in enumerate(entries):
                 try:
                     stored = read_attempt(
                         self.repository, self.identity, entry.selection.provider_attempt_id,
                         context=entry.recovery, now=self.dispatch_control.now,
                     )
-                except ProviderRecoveryError:
+                except ProviderAttemptAbsentError:
                     # A later selection may correctly be absent after a
                     # terminal first attempt, but no existing row may drift.
                     continue
-                if stored.role is not ProviderRole.SUPERVISOR or stored.selected_profile_identity != entry.audit.profile_identity or stored.state not in {AttemptState.PREPARED, AttemptState.ACCEPTED, AttemptState.INVALIDATED, AttemptState.BLOCKED, AttemptState.AMBIGUOUS}:
+                selection = entry.selection
+                expected_input = preflight_diff_review_session_checkpoint(
+                    self.repository, self.identity, entry.recovery, self.binding, self.seal,
+                    dependency_binding=self.dependency_binding, control=self.dispatch_control,
+                    implementation_attempt_id=selection.implementation_attempt_id,
+                    provider_attempt_id=selection.provider_attempt_id,
+                    message_identity=selection.message_identity,
+                    process_lease_id=selection.process_lease_id,
+                    process_lease_expires_at=selection.process_lease_expires_at,
+                    selected_profile_identity=entry.audit.profile_identity,
+                    within_round_attempt=selection.resolved_logical_profile_position,
+                    review_round=self.review_round, review_epoch=self.review_epoch,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                if (prepared_seen
+                        or stored.role is not ProviderRole.SUPERVISOR
+                        or stored.selected_profile_identity != entry.audit.profile_identity
+                        or stored.input_fingerprint != expected_input
+                        or stored.process_lease_id != selection.process_lease_id
+                        or stored.process_lease_expires_at != selection.process_lease_expires_at
+                        or stored.logical_profile_position != selection.resolved_logical_profile_position
+                        or stored.physical_format_output_ordinal != selection.physical_format_output_ordinal
+                        or stored.state not in {AttemptState.PREPARED, AttemptState.ACCEPTED, AttemptState.INVALIDATED, AttemptState.BLOCKED, AttemptState.AMBIGUOUS}):
                     raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
-                if read_supervisor_dispatch_claim(
-                    self.repository, self.identity, entry.recovery,
-                    attempt_id=entry.selection.provider_attempt_id,
-                ) is not SupervisorDispatchClaimState.CLAIMED:
-                    raise ProviderAttemptRuntimeError("provider attempt restart history has drifted")
+                self._require_exact_persisted_attempt(entry, stored, expected_input)
+                if stored.state is AttemptState.INVALIDATED and position + 1 < len(entries):
+                    successor = entries[position + 1]
+                    if (
+                        successor.selection.resolved_logical_profile_position
+                        == selection.resolved_logical_profile_position
+                        and successor.selection.physical_format_output_ordinal
+                        == selection.physical_format_output_ordinal + 1
+                    ):
+                        self._require_format_correction_predecessor(entry)
+                if stored.state is AttemptState.PREPARED:
+                    self._classify_prepared_attempt(entries, position, previous)
+                    prepared_seen = True
+                current = stored
+                previous = stored
+            if current is None:
+                raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable")
             return current
-        except ProviderRecoveryError:
+        except (CandidateReviewError, GitIdentityError, ProviderRecoveryError):
             raise ProviderAttemptRuntimeError("provider attempt restart history is unavailable") from None
 
-    def _execute_selection(self, entry: DiffReviewSequenceEntry) -> tuple[str, bool]:
+    def _require_exact_unclaimed_prepared(
+        self, entry: DiffReviewSequenceEntry, stored: object, expected_input: str,
+    ) -> None:
+        """Compatibility wrapper for the shared persisted-state validator."""
+
+        self._require_exact_persisted_attempt(entry, stored, expected_input)
+        if stored.state is not AttemptState.PREPARED:
+            raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+
+    def _require_exact_persisted_attempt(
+        self, entry: DiffReviewSequenceEntry, stored: object, expected_input: str,
+    ) -> None:
+        """Validate one complete durable attempt for readiness and execution."""
+
+        if not hasattr(stored, "state"):
+            raise ProviderAttemptRuntimeError("provider attempt has drifted")
+        selection = entry.selection
+        if (
+            stored.role is not ProviderRole.SUPERVISOR
+            or stored.selected_profile_identity != entry.audit.profile_identity
+            or stored.input_fingerprint != expected_input
+            or stored.process_lease_id != selection.process_lease_id
+            or stored.process_lease_expires_at != selection.process_lease_expires_at
+            or stored.logical_profile_position != selection.resolved_logical_profile_position
+            or stored.physical_format_output_ordinal != selection.physical_format_output_ordinal
+        ):
+            raise ProviderAttemptRuntimeError("provider attempt has drifted")
+        connection = _open_writable_connection(self.repository)
+        try:
+            coordinate = connection.execute(
+                "SELECT task_id, review_epoch, review_round, logical_profile_position, "
+                "physical_format_output_ordinal, profile_identity "
+                "FROM supervisor_attempt_coordinates WHERE attempt_id=?",
+                (selection.provider_attempt_id,),
+            ).fetchone()
+            checkpoint = connection.execute(
+                "SELECT task_id, session_identity FROM provider_session_checkpoints WHERE attempt_id=?",
+                (selection.provider_attempt_id,),
+            ).fetchone()
+            formal_dispatch = connection.execute(
+                "SELECT provider_attempt_id, supervisor_session_identity, external_turn_identity, message_identity, input_digest, selected_profile_identity, logical_profile_position, physical_format_output_ordinal FROM diff_review_attempts WHERE diff_review_attempt_id=? AND task_id=?",
+                (selection.diff_review_attempt_id, self.identity.task_id),
+            ).fetchone()
+            failure_admission = connection.execute(
+                "SELECT task_id, candidate_sha, policy_digest, configuration_digest, "
+                "authority_scope, provider_role, profile_identity, session_identity, "
+                "attempt_identity FROM provider_failure_admissions WHERE attempt_id=?",
+                (selection.provider_attempt_id,),
+            ).fetchone()
+            try:
+                authorization_fingerprint = _require_persisted_health_authorization(
+                    connection, selection.provider_attempt_id, entry.recovery,
+                    ProviderRole.SUPERVISOR, entry.audit.profile_identity,
+                    self.dispatch_control.now,
+                )
+                if stored.session_identity is None:
+                    if checkpoint is not None:
+                        raise ProviderAttemptRuntimeError("provider session checkpoint has drifted")
+                else:
+                    _require_session_checkpoint(
+                        connection, self.identity.task_id, selection.provider_attempt_id,
+                        stored.session_identity, entry.recovery,
+                        authorization_fingerprint,
+                    )
+                    if stored.external_turn_identity is not None:
+                        _require_complete_provider_dispatch_binding(
+                            connection, self.identity, entry.recovery,
+                            attempt_id=selection.provider_attempt_id,
+                            role=ProviderRole.SUPERVISOR,
+                            profile_identity=entry.audit.profile_identity,
+                            session_identity=stored.session_identity,
+                            external_turn_identity=stored.external_turn_identity,
+                            input_fingerprint=expected_input,
+                            observed=self.dispatch_control.now,
+                        )
+            except ProviderRecoveryError as error:
+                raise ProviderAttemptRuntimeError("provider session checkpoint has drifted") from error
+            if stored.external_turn_identity is None:
+                if formal_dispatch is not None:
+                    raise ProviderAttemptRuntimeError("provider formal dispatch has drifted")
+            elif formal_dispatch != (
+                selection.provider_attempt_id, stored.session_identity,
+                stored.external_turn_identity, selection.message_identity,
+                expected_input, entry.audit.profile_identity,
+                selection.resolved_logical_profile_position,
+                selection.physical_format_output_ordinal,
+            ):
+                raise ProviderAttemptRuntimeError("provider formal dispatch has drifted")
+        finally:
+            connection.close()
+        if coordinate != (
+            self.identity.task_id, self.review_epoch, self.review_round,
+            selection.resolved_logical_profile_position,
+            selection.physical_format_output_ordinal, entry.audit.profile_identity,
+        ):
+            raise ProviderAttemptRuntimeError("provider attempt coordinate has drifted")
+        claim = read_supervisor_dispatch_claim(
+            self.repository, self.identity, entry.recovery,
+            attempt_id=selection.provider_attempt_id,
+        )
+        if stored.state is AttemptState.PREPARED:
+            if (
+                stored.session_identity is not None
+                or stored.external_turn_identity is not None
+                or stored.output_pointer is not None
+                or stored.completion_evidence_fingerprint is not None
+                or stored.accepted_review_identity is not None
+                or claim is not SupervisorDispatchClaimState.UNCLAIMED
+            ):
+                raise ProviderAttemptRuntimeError("provider prepared attempt has drifted or was claimed")
+            return
+        if claim is not SupervisorDispatchClaimState.CLAIMED:
+            raise ProviderAttemptRuntimeError("provider attempt dispatch claim has drifted")
+        admitted_session = (
+            stored.session_identity
+            if stored.session_identity is not None
+            else pre_dispatch_failure_identity(
+                FailureRole.SUPERVISOR, selection.provider_attempt_id,
+            )
+        )
+        if failure_admission != (
+            self.identity.task_id, entry.recovery.candidate_sha,
+            "sha256:" + entry.recovery.policy_fingerprint,
+            entry.recovery.runtime_binding.resolved_digest,
+            "supervisor:" + self.identity.task_id, FailureRole.SUPERVISOR.value,
+            entry.audit.profile_identity, admitted_session,
+            selection.provider_attempt_id,
+        ):
+            raise ProviderAttemptRuntimeError("provider failure admission has drifted")
+        if stored.state is AttemptState.ACCEPTED:
+            try:
+                accepted = read_diff_review(
+                    self.repository, self.identity, selection.diff_review_attempt_id,
+                    binding=self.binding, seal=self.seal, context=entry.recovery, lease=self.lease,
+                    invalidate_stale=False,
+                )
+            except (CandidateReviewError, GitIdentityError, ProviderRecoveryError) as error:
+                raise ProviderAttemptRuntimeError("provider accepted evidence has drifted") from error
+            if (
+                not accepted.accepted
+                or accepted.accepted_review_identity != selection.diff_review_attempt_id
+                or accepted.diff_review_attempt_id != selection.diff_review_attempt_id
+                or accepted.implementation_attempt_id != selection.implementation_attempt_id
+                or accepted.supervisor_session_identity != stored.session_identity
+                or accepted.message_identity != selection.message_identity
+                or accepted.base_sha != self.identity.base_sha
+                or accepted.candidate_sha != self.seal.candidate_sha
+                or stored.accepted_review_identity != selection.diff_review_attempt_id
+                or stored.external_turn_identity is None
+                or stored.output_pointer != "diff-review:" + selection.diff_review_attempt_id
+                or stored.completion_evidence_fingerprint is None
+            ):
+                raise ProviderAttemptRuntimeError("provider accepted evidence has drifted")
+
+    def _recover_prepared_reservation(self, entry: DiffReviewSequenceEntry, *, required: bool) -> object | None:
+        """Read the exact sealed debit for a prepared attempt when it exists."""
+
+        _context, request_material, preflight_material = provider_attempt_effect_material(
+            identity=self.identity, recovery=entry.recovery, seal=self.seal,
+            source_digest=self.source_digest, review_epoch=self.review_epoch,
+            review_round=self.review_round, selection=entry.selection, audit=entry.audit,
+        )
+        try:
+            return recover_role_effect_reservation(
+                entry.advisory_execution, host_inputs=entry.execution_host,
+                ledger_path=self.budget_ledger_path, profile=entry.audit.profile,
+                request_or_attempt_identity=entry.selection.provider_attempt_id,
+                request_material=request_material, preflight_material=preflight_material,
+            )
+        except RoleCapabilityError:
+            if required:
+                raise ProviderAttemptRuntimeError("provider prepared reservation is unavailable") from None
+            return None
+
+    def _classify_prepared_attempt(
+        self, entries: tuple[DiffReviewSequenceEntry, ...], position: int,
+        previous: object | None,
+    ) -> tuple[str, object | None]:
+        """One readiness/execution contract for every PREPARED coordinate."""
+
+        entry = entries[position]
+        selection = entry.selection
+        if position == 0:
+            if selection.resolved_logical_profile_position != 1 or selection.physical_format_output_ordinal != 0:
+                raise ProviderAttemptRuntimeError("provider prepared initial attempt has drifted")
+            return "initial", self._recover_prepared_reservation(entry, required=False)
+        predecessor_entry = entries[position - 1]
+        predecessor = predecessor_entry.selection
+        if (
+            selection.resolved_logical_profile_position == predecessor.resolved_logical_profile_position
+            and selection.physical_format_output_ordinal == predecessor.physical_format_output_ordinal + 1
+            and entry.audit.profile_identity == predecessor_entry.audit.profile_identity
+        ):
+            if previous is None or previous.state is not AttemptState.INVALIDATED:
+                raise ProviderAttemptRuntimeError("provider prepared correction is unauthenticated")
+            self._require_format_correction_predecessor(predecessor_entry)
+            return "format-correction", self._recover_prepared_reservation(entry, required=True)
+        if (
+            selection.resolved_logical_profile_position == predecessor.resolved_logical_profile_position + 1
+            and selection.physical_format_output_ordinal == 0
+            and entry.audit.profile_identity != predecessor_entry.audit.profile_identity
+        ):
+            authorization = self._authorize_terminal_successor(predecessor_entry, entry)
+            route, coordinate, remaining, reservation_digest = self._recovery_route_material(entry)
+            connection = _open_writable_connection(self.repository)
+            try:
+                persisted = connection.execute(
+                    "SELECT target_role, target_profile_digest, target_route_digest, coordinate_digest, remaining_budget_digest, state, reservation_digest FROM recovery_route_authorizations WHERE route_digest=? AND task_id=?",
+                    (authorization.route_digest, self.identity.task_id),
+                ).fetchone()
+            finally:
+                connection.close()
+            if persisted != (
+                FailureRole.SUPERVISOR.value, entry.audit.profile_identity,
+                route, coordinate, remaining, "reserving", reservation_digest,
+            ) and persisted != (
+                FailureRole.SUPERVISOR.value, entry.audit.profile_identity,
+                route, coordinate, remaining, "consumed", reservation_digest,
+            ):
+                raise ProviderAttemptRuntimeError("provider prepared fallback route has drifted")
+            return "profile-fallback", self._recover_prepared_reservation(entry, required=True)
+        raise ProviderAttemptRuntimeError("provider prepared successor is unauthenticated")
+
+    def _execute_selection(
+        self, entry: DiffReviewSequenceEntry, *, recovery_route: object | None = None,
+        format_predecessor: DiffReviewSequenceEntry | None = None,
+    ) -> tuple[str, bool]:
         """Use public durable APIs for exactly one observed native outcome."""
 
         selection, recovery, audit, backend = entry.selection, entry.recovery, entry.audit, entry.backend
         runtime = recovery.runtime_binding
+        def require_effect_scope() -> None:
+            try:
+                require_scope_effect_admission(
+                    self.repository, self.identity, "supervisor:" + self.identity.task_id,
+                )
+                # This callback is the adapter's last admission boundary before
+                # the native provider effect.  Re-read the malformed source
+                # turn here so a checkpoint deletion after preparation cannot
+                # race the earlier correction checks.
+                if format_predecessor is not None:
+                    self._require_format_correction_predecessor(format_predecessor)
+            except ScopeAdmissionDenied:
+                raise
+            except Exception as error:
+                raise ProviderAttemptRuntimeError("provider attempt scope reconciliation is unavailable") from error
+
+        # A stopped correction is rejected before preflight can materialize an
+        # attempt and before the separate budget ledger can record a debit.
+        try:
+            require_effect_scope()
+        except ScopeAdmissionDenied as error:
+            raise ProviderAttemptRuntimeError(
+                "provider attempt dispatch scope is stopped"
+            ) from error
+        existing_prepared = False
         try:
             existing = read_attempt(
                 self.repository, self.identity, selection.provider_attempt_id,
                 context=recovery, now=self.dispatch_control.now,
             )
             if existing.state is AttemptState.ACCEPTED:
+                accepted_input = preflight_diff_review_session_checkpoint(
+                    self.repository, self.identity, recovery, self.binding, self.seal,
+                    dependency_binding=self.dependency_binding, control=self.dispatch_control,
+                    implementation_attempt_id=selection.implementation_attempt_id,
+                    provider_attempt_id=selection.provider_attempt_id,
+                    message_identity=selection.message_identity,
+                    process_lease_id=selection.process_lease_id,
+                    process_lease_expires_at=selection.process_lease_expires_at,
+                    selected_profile_identity=audit.profile_identity,
+                    within_round_attempt=selection.resolved_logical_profile_position,
+                    review_round=self.review_round, review_epoch=self.review_epoch,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                self._require_exact_persisted_attempt(entry, existing, accepted_input)
                 return (existing.attempt_id, True)
             if existing.state is AttemptState.INVALIDATED:
+                invalidated_input = preflight_diff_review_session_checkpoint(
+                    self.repository, self.identity, recovery, self.binding, self.seal,
+                    dependency_binding=self.dependency_binding, control=self.dispatch_control,
+                    implementation_attempt_id=selection.implementation_attempt_id,
+                    provider_attempt_id=selection.provider_attempt_id,
+                    message_identity=selection.message_identity,
+                    process_lease_id=selection.process_lease_id,
+                    process_lease_expires_at=selection.process_lease_expires_at,
+                    selected_profile_identity=audit.profile_identity,
+                    within_round_attempt=selection.resolved_logical_profile_position,
+                    review_round=self.review_round, review_epoch=self.review_epoch,
+                    physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                self._require_exact_persisted_attempt(
+                    entry, existing, invalidated_input,
+                )
+                terminal = read_supervisor_terminal_failure(
+                    self.repository, self.identity, existing.attempt_id,
+                )
+                if terminal is not None:
+                    failure, evidence = native_failure_class(CodexFailure(terminal.failure_class.value))
+                    if failure is not FailureClass.TRANSIENT_SERVICE or evidence is not EvidenceSource.VERIFIED_SERVICE:
+                        raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
+                    return (existing.attempt_id, False)
+                if selection.physical_format_output_ordinal == 2:
+                    raise ProviderAttemptFormatCorrectionExhausted(
+                        "Supervisor format correction allowance is exhausted"
+                    )
                 return (existing.attempt_id, False)
             if existing.state is AttemptState.BLOCKED:
                 raise ProviderAttemptRuntimeError("provider attempt session ended before a durable turn checkpoint")
             if existing.state is not AttemptState.PREPARED:
                 raise ProviderAttemptRuntimeError("provider attempt restart requires durable recovery")
-        except ProviderRecoveryError:
+            existing_prepared = True
+        except ProviderAttemptAbsentError:
             pass
+        except ProviderRecoveryError as error:
+            raise ProviderAttemptRuntimeError("provider attempt has drifted") from error
         context, request_material, preflight_material = provider_attempt_effect_material(
             identity=self.identity, recovery=recovery, seal=self.seal,
             source_digest=self.source_digest, review_epoch=self.review_epoch,
@@ -644,30 +1261,241 @@ class DurableDiffReviewRunner:
             implementation_attempt_id=selection.implementation_attempt_id, provider_attempt_id=selection.provider_attempt_id,
             message_identity=selection.message_identity, process_lease_id=selection.process_lease_id,
             process_lease_expires_at=selection.process_lease_expires_at, selected_profile_identity=selected,
-            within_round_attempt=selection.within_round_attempt, review_round=self.review_round, review_epoch=self.review_epoch,
+            within_round_attempt=selection.resolved_logical_profile_position, review_round=self.review_round, review_epoch=self.review_epoch,
+            physical_format_output_ordinal=selection.physical_format_output_ordinal,
             lease=self.lease, now=self.dispatch_control.now,
         )
-        try:
-            # Reserve all three reviewed dimensions before any durable attempt
-            # mutation or native SDK effect.  Each fallback derives its own
-            # exact attempt identity while sharing only the SQLite file.
-            reservation = reserve_role_effect(
-                entry.advisory_execution, host_inputs=entry.execution_host,
-                ledger_path=self.budget_ledger_path, profile=audit.profile,
-                request_or_attempt_identity=selection.provider_attempt_id,
-                request_material=request_material,
-                preflight_material=preflight_material,
+        if selection.physical_format_output_ordinal > 0:
+            # An occupied correction coordinate owns its original identity.
+            # Reject a substituted attempt before it can reserve fresh cost.
+            connection = _open_writable_connection(self.repository)
+            try:
+                coordinate_owner = connection.execute(
+                    "SELECT attempt_id, profile_identity FROM supervisor_attempt_coordinates "
+                    "WHERE task_id=? AND review_epoch=? AND review_round=? "
+                    "AND logical_profile_position=? AND physical_format_output_ordinal=?",
+                    (self.identity.task_id, self.review_epoch, self.review_round,
+                     selection.resolved_logical_profile_position, selection.physical_format_output_ordinal),
+                ).fetchone()
+            finally:
+                connection.close()
+            if (coordinate_owner is not None and coordinate_owner != (selection.provider_attempt_id, selected)) or (existing_prepared and coordinate_owner is None):
+                raise ProviderAttemptRuntimeError("provider prepared correction coordinate has drifted")
+        if existing_prepared:
+            self._require_exact_unclaimed_prepared(entry, existing, input_fingerprint)
+            entries = self.validate_sequence()
+            position = next(
+                index for index, candidate in enumerate(entries)
+                if candidate.selection.provider_attempt_id == selection.provider_attempt_id
             )
-        except RoleCapabilityError as error:
+            previous = None
+            if position:
+                previous_entry = entries[position - 1]
+                previous = read_attempt(
+                    self.repository, self.identity,
+                    previous_entry.selection.provider_attempt_id,
+                    context=previous_entry.recovery, now=self.dispatch_control.now,
+                )
+            _prepared_kind, prepared_reservation = self._classify_prepared_attempt(
+                entries, position, previous,
+            )
+        else:
+            prepared_reservation = None
+        route_reserved = False
+        if recovery_route is not None:
+            route, coordinate, remaining, reservation_digest = self._recovery_route_material(entry)
+            try:
+                # A prepared successor is itself the durable admission.  It
+                # must recover the exact reservation and finish the route
+                # commit; attempting to acquire the route again would turn a
+                # restart into a spurious second successor reservation.
+                if not existing_prepared:
+                    route_reserved = begin_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                        target_role=FailureRole.SUPERVISOR,
+                        target_profile_digest=audit.profile_identity,
+                        target_route_digest=route, coordinate_digest=coordinate,
+                        remaining_budget_digest=remaining,
+                    )
+                if not route_reserved and not existing_prepared:
+                    # Reconcile an interruption before another reservation.
+                    try:
+                        recovered = recover_role_effect_reservation(
+                            entry.advisory_execution, host_inputs=entry.execution_host,
+                            ledger_path=self.budget_ledger_path, profile=audit.profile,
+                            request_or_attempt_identity=selection.provider_attempt_id,
+                            request_material=request_material, preflight_material=preflight_material,
+                        )
+                        abandon_durable_recovery_route_reservation(
+                            self.repository, self.identity, recovery_route,
+                            reservation_digest=reservation_digest,
+                            effect_reservation=recovered,
+                        )
+                    except RoleCapabilityError:
+                        abandon_durable_recovery_route_reservation(
+                            self.repository, self.identity, recovery_route,
+                            reservation_digest=reservation_digest,
+                        )
+                    route_reserved = begin_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest, target_role=FailureRole.SUPERVISOR,
+                        target_profile_digest=audit.profile_identity, target_route_digest=route,
+                        coordinate_digest=coordinate, remaining_budget_digest=remaining,
+                    )
+            except Exception as error:
+                raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
+        reservation = None
+        reservation_intent_digest = None
+        reservation_intent_created = False
+        if recovery_route is None:
+            try:
+                reservation_intent_digest = recovery_reservation_digest(
+                    entry.advisory_execution, host_inputs=entry.execution_host,
+                    profile=audit.profile,
+                    request_or_attempt_identity=selection.provider_attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                )
+                if not existing_prepared:
+                    reservation_intent_created = begin_provider_effect_reservation_intent(
+                        self.repository, self.identity,
+                        "supervisor:" + self.identity.task_id,
+                        attempt_id=selection.provider_attempt_id,
+                        reservation_digest=reservation_intent_digest,
+                        reservation_repository_identity=entry.execution_host.repository_identity,
+                        reservation_task_identity=entry.execution_host.task_identity,
+                    )
+            except (FailureRecoveryError, RoleCapabilityError) as error:
+                raise ProviderAttemptRuntimeError(
+                    "provider attempt reservation intent is unavailable"
+                ) from error
+        try:
+            # The durable route fence is written before the separate budget
+            # file.  Restart sees and reconciles that fence before it can
+            # create another reservation.
+            def reserve_exact_effect():
+                if reservation_intent_digest is not None and not reservation_intent_created:
+                    try:
+                        return recover_role_effect_reservation(
+                            entry.advisory_execution, host_inputs=entry.execution_host,
+                            ledger_path=self.budget_ledger_path, profile=audit.profile,
+                            request_or_attempt_identity=selection.provider_attempt_id,
+                            request_material=request_material,
+                            preflight_material=preflight_material,
+                        )
+                    except RoleCapabilityError:
+                        # The process may have stopped after persisting the
+                        # intent but before the separate budget transaction.
+                        # Only the exact intent may authorize the first debit.
+                        pass
+                return reserve_role_effect(
+                    entry.advisory_execution, host_inputs=entry.execution_host,
+                    ledger_path=self.budget_ledger_path, profile=audit.profile,
+                    request_or_attempt_identity=selection.provider_attempt_id,
+                    request_material=request_material,
+                    preflight_material=preflight_material,
+                )
+            reservation = (
+                prepared_reservation
+                if prepared_reservation is not None
+                else admit_scope_effect_reservation(
+                    self.repository, self.identity,
+                    "supervisor:" + self.identity.task_id,
+                    reserve_exact_effect,
+                )
+            )
+            if recovery_route is not None:
+                if reservation.recovery_digest != reservation_digest:
+                    raise ProviderAttemptRuntimeError("provider terminal recovery reservation has drifted")
+                reservation.require_recovery_route(entry.advisory_execution)
+            elif reservation.recovery_digest != reservation_intent_digest:
+                raise ProviderAttemptRuntimeError("provider attempt reservation intent has drifted")
+        except (RoleCapabilityError, ProviderAttemptRuntimeError) as error:
+            if recovery_route is not None and route_reserved:
+                try:
+                    abandon_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                        effect_reservation=reservation,
+                    )
+                except Exception:
+                    pass
             raise ProviderAttemptRuntimeError("provider attempt budget admission is denied") from error
-        prepared = prepare_attempt(
-            self.repository, self.identity, recovery, attempt_id=selection.provider_attempt_id,
-            role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
-            process_lease_expires_at=selection.process_lease_expires_at, input_fingerprint=input_fingerprint,
-            selected_profile_identity=selected, lease=self.lease, now=self.dispatch_control.now,
-        )
+        try:
+            prepared = prepare_attempt(
+                self.repository, self.identity, recovery, attempt_id=selection.provider_attempt_id,
+                role=ProviderRole.SUPERVISOR, process_lease_id=selection.process_lease_id,
+                process_lease_expires_at=selection.process_lease_expires_at, input_fingerprint=input_fingerprint,
+                selected_profile_identity=selected,
+                logical_profile_position=selection.resolved_logical_profile_position,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
+                review_epoch=self.review_epoch, review_round=self.review_round,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+        except Exception:
+            if recovery_route is not None and route_reserved:
+                try:
+                    abandon_durable_recovery_route_reservation(
+                        self.repository, self.identity, recovery_route,
+                        reservation_digest=reservation_digest,
+                        effect_reservation=reservation,
+                    )
+                except Exception:
+                    pass
+            elif reservation is not None and not existing_prepared:
+                try:
+                    release_unused_provider_effect_reservation(
+                        self.repository, self.identity,
+                        "supervisor:" + self.identity.task_id,
+                        attempt_id=selection.provider_attempt_id,
+                        effect_reservation=reservation,
+                    )
+                except Exception as release_error:
+                    raise ProviderAttemptRuntimeError(
+                        "unused provider reservation recovery failed"
+                    ) from release_error
+            raise
         if prepared.state is not AttemptState.PREPARED:
             raise ProviderAttemptRuntimeError("provider accounting current attempt is not prepared")
+        if reservation_intent_digest is not None:
+            try:
+                commit_provider_effect_reservation_intent(
+                    self.repository, self.identity,
+                    "supervisor:" + self.identity.task_id,
+                    attempt_id=selection.provider_attempt_id,
+                    reservation_digest=reservation_intent_digest,
+                )
+            except FailureRecoveryError as error:
+                raise ProviderAttemptRuntimeError(
+                    "provider attempt reservation intent commit failed"
+                ) from error
+        def accounting_snapshot():
+            entries = self.validate_sequence()
+            prior = tuple((item.selection.provider_attempt_id, item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal, item.audit.profile_identity) for item in entries if (item.selection.resolved_logical_profile_position, item.selection.physical_format_output_ordinal) < (selection.resolved_logical_profile_position, selection.physical_format_output_ordinal))
+            try:
+                return read_supervisor_accounting_snapshot(
+                    self.repository, self.identity, recovery, source_digest=self.source_digest, base_sha=self.identity.base_sha,
+                    candidate_sha=self.seal.candidate_sha, case_id=self.case_id, ready_at=self.ready_at,
+                    review_epoch=self.review_epoch, review_round=self.review_round, review_mode=context.review_mode.value,
+                    current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.resolved_logical_profile_position,
+                    current_profile_identity=selected, prior_attempts=prior, current_physical_format_output_ordinal=selection.physical_format_output_ordinal, seal_state_identity=self.lease.state_identity,
+                )
+            except ProviderRecoveryError as error:
+                raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from error
+
+        # Deterministic validation must precede route consumption and the claim.
+        decision_material = accounting_snapshot()
+        if decision_material.dispatch_claim is not SupervisorDispatchClaimState.UNCLAIMED:
+            raise ProviderAttemptRuntimeError("provider attempt dispatch claim is already consumed")
+        if recovery_route is not None:
+            try:
+                commit_durable_recovery_route_reservation(
+                    self.repository, self.identity, recovery_route,
+                    reservation_digest=reservation_digest, now=self.dispatch_control.now,
+                )
+            except Exception as error:
+                raise ProviderAttemptRuntimeError("provider terminal recovery route is unavailable") from error
         try:
             claim_supervisor_dispatch(
                 self.repository, self.identity, recovery,
@@ -676,37 +1504,28 @@ class DurableDiffReviewRunner:
             )
         except ProviderRecoveryError:
             raise ProviderAttemptRuntimeError("provider attempt dispatch claim is unavailable") from None
-        entries = self.validate_sequence()
-        prior = tuple((item.selection.provider_attempt_id, item.selection.within_round_attempt, item.audit.profile_identity) for item in entries if item.selection.within_round_attempt < selection.within_round_attempt)
-        try:
-            decision_material = read_supervisor_accounting_snapshot(
-                self.repository, self.identity, recovery, source_digest=self.source_digest, base_sha=self.identity.base_sha,
-                candidate_sha=self.seal.candidate_sha, case_id=self.case_id, ready_at=self.ready_at,
-                review_epoch=self.review_epoch, review_round=self.review_round, review_mode=context.review_mode.value,
-                current_attempt_id=selection.provider_attempt_id, current_within_round_attempt=selection.within_round_attempt,
-                current_profile_identity=selected, prior_attempts=prior, seal_state_identity=self.lease.state_identity,
-            )
-        except ProviderRecoveryError:
-            raise ProviderAttemptRuntimeError("provider accounting snapshot is unavailable") from None
+        decision_material = accounting_snapshot()
         if decision_material.dispatch_claim is not SupervisorDispatchClaimState.CLAIMED:
             raise ProviderAttemptRuntimeError("provider accounting dispatch claim has drifted")
         request = CodexSupervisorRequest(
             selection.diff_review_attempt_id, selection.provider_attempt_id, selected,
-            selection.within_round_attempt,
+            selection.resolved_logical_profile_position,
             supervisor_request_digest(
                 review_attempt_id=selection.diff_review_attempt_id,
                 provider_attempt_id=selection.provider_attempt_id,
                 selected_profile_identity=selected,
-                within_round_attempt=selection.within_round_attempt,
+                within_round_attempt=selection.resolved_logical_profile_position,
                 context=context, objective=ACCOUNTING_TRANSITION_OBJECTIVE,
                 acceptance_criteria=ACCOUNTING_TRANSITION_CRITERIA,
                 response_contract=SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING,
                 decision_material=decision_material,
                 decision_semantic=SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
             ),
             context, ACCOUNTING_TRANSITION_OBJECTIVE, ACCOUNTING_TRANSITION_CRITERIA,
             SupervisorResponseContract.PROVIDER_ATTEMPT_ACCOUNTING, decision_material,
             SupervisorAccountingDecisionSemantic.PRE_DISPATCH_ELIGIBILITY_V2,
+            selection.physical_format_output_ordinal,
         )
         session_checkpointed = False
         turn_checkpointed = False
@@ -723,8 +1542,9 @@ class DurableDiffReviewRunner:
                 process_lease_id=selection.process_lease_id,
                 process_lease_expires_at=selection.process_lease_expires_at,
                 selected_profile_identity=selected,
-                within_round_attempt=selection.within_round_attempt,
+                within_round_attempt=selection.resolved_logical_profile_position,
                 review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
             )
             session_checkpointed = True
 
@@ -740,16 +1560,23 @@ class DurableDiffReviewRunner:
                 message_identity=selection.message_identity,
                 process_lease_id=selection.process_lease_id,
                 process_lease_expires_at=selection.process_lease_expires_at,
-                selected_profile_identity=selected, within_round_attempt=selection.within_round_attempt,
+                selected_profile_identity=selected, within_round_attempt=selection.resolved_logical_profile_position,
                 review_round=self.review_round, review_epoch=self.review_epoch, lease=self.lease, now=self.dispatch_control.now,
+                physical_format_output_ordinal=selection.physical_format_output_ordinal,
             )
             turn_checkpointed = True
 
+        # The first check authorized successor materialization and budget.  A
+        # second check immediately before the native adapter preserves that
+        # predecessor binding across the durability boundary.
+        if format_predecessor is not None:
+            self._require_format_correction_predecessor(format_predecessor)
         try:
             result = CodexSupervisorAdapter(backend, audit.profile, audit).dispatch(
                 request, checkpoint_session=checkpoint_session, checkpoint_turn=checkpoint_turn,
                 advisory_execution=entry.advisory_execution,
                 effect_reservation=reservation,
+                scope_admission=require_effect_scope,
             )
         except CodexSupervisorCheckpointError as error:
             raise ProviderAttemptCheckpointFailure(
@@ -757,6 +1584,72 @@ class DurableDiffReviewRunner:
                 session_present=error.session_present,
                 turn_present=error.turn_present,
             ) from None
+        except CodexSupervisorScopeAdmissionError:
+            raise ProviderAttemptRuntimeError(
+                "provider attempt scope reconciliation is unavailable"
+            ) from None
+        if (
+            result.kind is SupervisorResultKind.BLOCKED
+            and result.outcome_source is SupervisorOutcomeSource.SCOPE_ADMISSION_DENIED
+        ):
+            durable_session = (
+                result.session_identity if session_checkpointed
+                else pre_dispatch_failure_identity(
+                    FailureRole.SUPERVISOR, selection.provider_attempt_id,
+                )
+            )
+            record_supervisor_scope_denial(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                session_identity=durable_session,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            raise ProviderAttemptRuntimeError("provider attempt dispatch scope is stopped")
+        if (
+            result.kind is SupervisorResultKind.BLOCKED
+            and result.outcome_source is SupervisorOutcomeSource.SDK_TURN_FAILED
+            and result.failure is CodexFailure.SANDBOX_OR_APPROVAL_DENIED
+            and result.sdk_error_category is SupervisorSdkTurnErrorCategory.SANDBOX
+        ):
+            durable_session = (
+                result.session_identity if session_checkpointed
+                else pre_dispatch_failure_identity(
+                    FailureRole.SUPERVISOR, selection.provider_attempt_id,
+                )
+            )
+            record_supervisor_scope_denial(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                session_identity=durable_session,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            raise ProviderAttemptRuntimeError("provider attempt native security denial stopped its scope")
+        if (
+            result.kind is SupervisorResultKind.BLOCKED
+            and result.outcome_source is SupervisorOutcomeSource.SDK_TURN_FAILED
+        ):
+            if result.failure is None or result.sdk_error_category is None or result.session_identity is None:
+                raise ProviderAttemptRuntimeError("Supervisor terminal failure projection is invalid")
+            record_supervisor_terminal_failure(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                session_identity=result.session_identity,
+                turn_identity=result.turn_identity,
+                failure_class=SupervisorTerminalFailureClass(result.failure.value),
+                outcome_source=SupervisorTerminalFailureSource(result.outcome_source.value),
+                sdk_error_category=SupervisorTerminalFailureSdkCategory(result.sdk_error_category.value),
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            recover_attempt(
+                self.repository, self.identity, recovery,
+                attempt_id=selection.provider_attempt_id,
+                max_attempts=runtime.review_max_supervisor_attempts_per_round,
+                lease=self.lease, now=self.dispatch_control.now,
+            )
+            failure, evidence = native_failure_class(result.failure)
+            if failure is FailureClass.TRANSIENT_SERVICE and evidence is EvidenceSource.VERIFIED_SERVICE:
+                return (selection.provider_attempt_id, False)
+            raise ProviderAttemptRuntimeError("provider terminal failure is not pre-bound-fallback-eligible")
         if not session_checkpointed:
             raise ProviderAttemptRuntimeError("native Supervisor did not provide a durable session checkpoint")
         if not turn_checkpointed:
@@ -772,24 +1665,6 @@ class DurableDiffReviewRunner:
             # This is an observed typed adapter outcome, not caller-supplied
             # provider text.  Ambiguity is durable and terminal for this
             # bounded sequence; only an explicit INVALID result may advance.
-            if result.kind is SupervisorResultKind.BLOCKED:
-                if result.failure is None or result.outcome_source is None or result.sdk_error_category is None:
-                    raise ProviderAttemptRuntimeError("Supervisor terminal failure projection is invalid")
-                record_supervisor_terminal_failure(
-                    self.repository, self.identity, recovery,
-                    attempt_id=selection.provider_attempt_id,
-                    failure_class=SupervisorTerminalFailureClass(result.failure.value),
-                    outcome_source=SupervisorTerminalFailureSource(result.outcome_source.value),
-                    sdk_error_category=SupervisorTerminalFailureSdkCategory(result.sdk_error_category.value),
-                    lease=self.lease, now=self.dispatch_control.now,
-                )
-                recover_attempt(
-                    self.repository, self.identity, recovery,
-                    attempt_id=selection.provider_attempt_id,
-                    max_attempts=runtime.review_max_supervisor_attempts_per_round,
-                    lease=self.lease, now=self.dispatch_control.now,
-                )
-                return (selection.provider_attempt_id, False)
             if result.kind is SupervisorResultKind.INCOMPLETE:
                 if result.terminal_blocker is None:
                     raise ProviderAttemptRuntimeError("provider accounting terminal decision is invalid")
@@ -808,6 +1683,14 @@ class DurableDiffReviewRunner:
                     lease=self.lease, now=self.dispatch_control.now,
                 )
                 raise ProviderAttemptRuntimeError("ambiguous provider attempt blocks the bounded sequence")
+            if result.diagnostic not in {SupervisorDiagnostic.SYNTAX, SupervisorDiagnostic.SHAPE}:
+                record_supervisor_accounting_blocker(
+                    self.repository, self.identity, recovery,
+                    attempt_id=selection.provider_attempt_id,
+                    blocker=SupervisorAccountingBlocker.INCOMPLETE_ACCOUNTING,
+                    lease=self.lease, now=self.dispatch_control.now,
+                )
+                raise ProviderAttemptRuntimeError("non-format Supervisor outcome is not correction-eligible")
             marker = hashlib.sha256((result.kind.value + ":" + (result.diagnostic.value if result.diagnostic else "none")).encode()).hexdigest()
             record_invalid_output(
                 self.repository, self.identity, recovery,
@@ -827,6 +1710,10 @@ class DurableDiffReviewRunner:
                 max_attempts=runtime.review_max_supervisor_attempts_per_round,
                 lease=self.lease, now=self.dispatch_control.now,
             )
+            if selection.physical_format_output_ordinal == 2:
+                raise ProviderAttemptFormatCorrectionExhausted(
+                    "Supervisor format correction allowance is exhausted"
+                )
             return (selection.provider_attempt_id, False)
         if result.session_identity is None or result.turn_identity is None or result.output_fingerprint is None or result.verdict is None:
             raise ProviderAttemptRuntimeError("native Supervisor result is incomplete")

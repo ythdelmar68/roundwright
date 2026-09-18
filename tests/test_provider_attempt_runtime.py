@@ -9,6 +9,7 @@ import os
 import sqlite3
 import sys
 import unittest
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import replace
@@ -21,7 +22,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from roundwright.configuration import RepositoryIdentity
 from roundwright import external_validation
-from roundwright.candidate_review import CandidateVerification, VerificationKind, VerificationOutcome
+from roundwright.candidate_review import CandidateReviewError, CandidateVerification, VerificationKind, VerificationOutcome
 from roundwright.codex_supervisor import (
     NativeSupervisorResponse, SupervisorDiagnostic, SupervisorOutcomeSource,
     SupervisorResultKind, SupervisorSdkTurnErrorCategory, canonical_supervisor_review_material, supervisor_request_digest,
@@ -34,11 +35,12 @@ from roundwright.provider_attempt_runtime import (
     ProviderAttemptRuntimeResources, ProviderAttemptCompletionPolicy, PRODUCTION_COMPLETION_POLICY,
     install_host_runtime, provider_attempt_effect_material,
 )
-from roundwright.provider_health import CodexFailure
+import roundwright.provider_attempt_runtime as provider_attempt_runtime
+from roundwright.provider_health import CodexAdapterError, CodexFailure
 from roundwright.role_capability_policy import AdvisoryRole, DurableRoleBudgetLedger, RoleBudget, RoleCapabilityError, trusted_provider_launch_context
 from roundwright.provider_recovery import (
     AttemptState, ProviderRecoveryError, ProviderRole, RecoveryContext, SupervisorAccountingSnapshot,
-    SupervisorTerminalFailure, claim_supervisor_dispatch, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
+    SupervisorTerminalFailure, claim_supervisor_dispatch, prepare_attempt, read_supervisor_dispatch_claim, read_attempt, read_supervisor_terminal_failure,
     record_supervisor_terminal_failure,
     SupervisorTerminalFailureClass, SupervisorTerminalFailureSource, SupervisorTerminalFailureSdkCategory,
 )
@@ -399,6 +401,336 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(runner.execute(), ("runtime-provider-one",))
             self.assertEqual(backend.calls, 1)
 
+    def test_scope_stop_during_response_read_cannot_commit_accepted_review(self) -> None:
+        """Completion evidence and scope admission linearize at acceptance."""
+
+        from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, classify, record_durable_failure
+
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+
+            class DenyingTurn:
+                def identity(inner): return "runtime-denial-turn"
+                def abort(inner): return None
+                def read_response(inner):
+                    record_durable_failure(
+                        repository, identity,
+                        classify(FailureBinding(
+                            recovery.candidate_sha, "sha256:" + recovery.policy_fingerprint,
+                            recovery.runtime_binding.resolved_digest, "supervisor:" + identity.task_id,
+                            FailureRole.SUPERVISOR, runner.audit.profile_identity,
+                            "runtime-denial-session", runner.selection.provider_attempt_id,
+                        ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                        now=runner.dispatch_control.now,
+                    )
+                    return NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED,
+                        {"status": "complete", "action": "accept-formal-review", "blocker": None},
+                    )
+
+            class DenyingSession:
+                def identity(inner): return "runtime-denial-session"
+                def close(inner): return None
+                def start_turn(inner, _request): return DenyingTurn()
+
+            class DenyingBackend:
+                def __init__(inner): inner.calls = 0
+                def open_fresh_session(inner, _profile):
+                    inner.calls += 1
+                    return DenyingSession()
+
+            backend = DenyingBackend()
+            denied = replace(runner, backend=backend, sequence=(self.sequence_entry(runner, backend=backend),))
+            with self.assertRaises(Exception):
+                denied.execute()
+            stored = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            self.assertEqual((stored.state, stored.accepted_review_identity, backend.calls), (AttemptState.COMPLETED, None, 1))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state, accepted_review_identity FROM diff_review_attempts WHERE provider_attempt_id=?",
+                    (runner.selection.provider_attempt_id,),
+                ).fetchone(), ("recorded", None))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM accepted_provider_reviews WHERE attempt_id=?",
+                    (runner.selection.provider_attempt_id,),
+                ).fetchone(), (0,))
+
+    def test_formal_pass_acceptance_reauthenticates_observed_dispatch_chain(self) -> None:
+        """Response-time dispatch deletion or turn substitution cannot accept PASS."""
+
+        mutations = {
+            "dispatch-claim": "DELETE FROM provider_dispatch_claims WHERE attempt_id=?",
+            "session-checkpoint": "DELETE FROM provider_session_checkpoints WHERE attempt_id=?",
+            "failure-admission": "DELETE FROM provider_failure_admissions WHERE attempt_id=?",
+            "after-dispatch-checkpoint": "DELETE FROM provider_checkpoints WHERE checkpoint_id=? || ':after-dispatch'",
+            "formal-turn": "UPDATE diff_review_attempts SET external_turn_identity='substituted-turn' WHERE provider_attempt_id=?",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(binding=name), TemporaryDirectory() as temporary:
+                runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED,
+                        {"verdict": "pass", "findings": []},
+                    ),
+                    suffix="pass-chain-" + name,
+                )
+
+                class MutatingTurn:
+                    def identity(inner): return "pass-chain-turn"
+                    def abort(inner): return None
+                    def read_response(inner):
+                        with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                            connection.execute(statement, (runner.selection.provider_attempt_id,))
+                        return NativeSupervisorResponse(
+                            SupervisorResultKind.ACCEPTED,
+                            {"status": "complete", "action": "accept-formal-review", "blocker": None},
+                        )
+
+                class MutatingSession:
+                    def identity(inner): return "pass-chain-session"
+                    def close(inner): return None
+                    def start_turn(inner, _request): return MutatingTurn()
+
+                class MutatingBackend:
+                    def __init__(inner): inner.calls = 0
+                    def open_fresh_session(inner, _profile):
+                        inner.calls += 1
+                        return MutatingSession()
+
+                backend = MutatingBackend()
+                changed = replace(
+                    runner, backend=backend,
+                    sequence=(self.sequence_entry(runner, backend=backend),),
+                )
+                with self.assertRaises((ProviderAttemptRuntimeError, CandidateReviewError)):
+                    changed.execute()
+                self.assertEqual(backend.calls, 1)
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT accepted_review_identity FROM diff_review_attempts "
+                        "WHERE provider_attempt_id=? AND accepted_review_identity IS NOT NULL",
+                        (runner.selection.provider_attempt_id,),
+                    ).fetchone())
+                    self.assertIsNone(connection.execute(
+                        "SELECT 1 FROM accepted_provider_reviews WHERE attempt_id=?",
+                        (runner.selection.provider_attempt_id,),
+                    ).fetchone())
+    def test_scope_denial_before_session_or_turn_is_durable_without_invented_turn(self) -> None:
+        """Each pre-turn scope stop closes the claim with only authentic identity."""
+
+        from roundwright.failure_recovery import FailureRecoveryError, FailureRole, ScopeAdmissionDenied, require_scope_open
+
+        for stage, denied_call, expected_session in (
+            ("before-session", 2, None),
+            ("before-session-checkpoint", 4, None),
+            ("before-turn", 5, "session-runtime-before-turn"),
+            ("before-turn-checkpoint", 6, "session-runtime-before-turn-checkpoint"),
+        ):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                runner, backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED,
+                        {"verdict": "pass", "findings": []},
+                    ),
+                    suffix=stage,
+                )
+                original = provider_attempt_runtime.require_scope_effect_admission
+                calls = 0
+
+                def deny_at_boundary(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == denied_call:
+                        raise ScopeAdmissionDenied("injected authoritative scope stop")
+                    return original(*args, **kwargs)
+
+                with patch.object(
+                    provider_attempt_runtime, "require_scope_effect_admission",
+                    side_effect=deny_at_boundary,
+                ), self.assertRaisesRegex(ProviderAttemptRuntimeError, "scope is stopped"):
+                    runner.execute()
+                stored = read_attempt(
+                    repository, identity, runner.selection.provider_attempt_id,
+                    context=recovery,
+                )
+                self.assertEqual(
+                    (stored.state, stored.session_identity, stored.external_turn_identity),
+                    (AttemptState.BLOCKED, expected_session, None),
+                )
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    record = connection.execute(
+                        "SELECT record_json FROM failure_recovery_records WHERE task_id=?",
+                        (identity.task_id,),
+                    ).fetchone()
+                    self.assertIsNotNone(record)
+                    payload = json.loads(record[0])
+                    self.assertEqual(payload["action"], "stop-scope")
+                    self.assertEqual(
+                        payload["binding"]["session_identity"],
+                        expected_session or provider_attempt_runtime.pre_dispatch_failure_identity(
+                            FailureRole.SUPERVISOR, runner.selection.provider_attempt_id,
+                        ),
+                    )
+                    with self.assertRaisesRegex(FailureRecoveryError, "scope remains stopped"):
+                        require_scope_open(
+                            connection, identity.task_id, "supervisor:" + identity.task_id,
+                        )
+                calls_before_restart = backend.calls
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "scope is stopped"):
+                    runner.execute()
+                self.assertEqual(backend.calls, calls_before_restart)
+
+    def test_scope_storage_failure_never_becomes_verified_host_denial(self) -> None:
+        """A locked scope ledger remains a storage failure with zero provider calls."""
+
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED,
+                    {"verdict": "pass", "findings": []},
+                ),
+                suffix="scope-storage",
+            )
+            original = provider_attempt_runtime.require_scope_effect_admission
+            calls = 0
+
+            def fail_second(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise sqlite3.OperationalError("database is locked")
+                return original(*args, **kwargs)
+
+            with patch.object(
+                provider_attempt_runtime, "require_scope_effect_admission",
+                side_effect=fail_second,
+            ), self.assertRaisesRegex(
+                ProviderAttemptRuntimeError, "scope reconciliation is unavailable",
+            ):
+                runner.execute()
+            self.assertEqual(backend.calls, 0)
+            stored = read_attempt(
+                repository, identity, runner.selection.provider_attempt_id,
+                context=recovery,
+            )
+            self.assertEqual(stored.state, AttemptState.PREPARED)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM failure_recovery_records WHERE task_id=?",
+                    (identity.task_id,),
+                ).fetchone(), (0,))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM provider_recovery_outcomes WHERE attempt_id=?",
+                    (runner.selection.provider_attempt_id,),
+                ).fetchone(), (0,))
+
+    def test_native_security_denial_before_session_or_turn_is_durable(self) -> None:
+        """Authenticated SDK denial outranks generic missing-checkpoint recovery."""
+
+        from roundwright.failure_recovery import FailureRole
+
+        for stage in ("open-session", "start-turn"):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED,
+                        {"verdict": "pass", "findings": []},
+                    ),
+                    suffix="native-" + stage,
+                )
+
+                class DeniedSession:
+                    def identity(self) -> str:
+                        return "session-native-start-turn"
+                    def close(self) -> None:
+                        return None
+                    def start_turn(self, _request: object) -> object:
+                        raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
+
+                class DeniedBackend:
+                    def __init__(self) -> None:
+                        self.calls = 0
+                    def open_fresh_session(self, _profile: object) -> object:
+                        self.calls += 1
+                        if stage == "open-session":
+                            raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
+                        return DeniedSession()
+
+                backend = DeniedBackend()
+                denied = replace(
+                    runner, backend=backend,
+                    sequence=(self.sequence_entry(runner, backend=backend),),
+                )
+                with self.assertRaisesRegex(
+                    ProviderAttemptRuntimeError, "native security denial",
+                ):
+                    denied.execute()
+                stored = read_attempt(
+                    repository, identity, runner.selection.provider_attempt_id,
+                    context=recovery,
+                )
+                expected_session = (
+                    None if stage == "open-session" else "session-native-start-turn"
+                )
+                self.assertEqual(
+                    (stored.state, stored.session_identity, stored.external_turn_identity),
+                    (AttemptState.BLOCKED, expected_session, None),
+                )
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    payload = json.loads(connection.execute(
+                        "SELECT record_json FROM failure_recovery_records WHERE task_id=?",
+                        (identity.task_id,),
+                    ).fetchone()[0])
+                    self.assertEqual(
+                        (payload["failure"], payload["evidence"], payload["action"]),
+                        ("host-security-denial", "verified-host", "stop-scope"),
+                    )
+                    self.assertEqual(
+                        payload["binding"]["session_identity"],
+                        expected_session or provider_attempt_runtime.pre_dispatch_failure_identity(
+                            FailureRole.SUPERVISOR,
+                            runner.selection.provider_attempt_id,
+                        ),
+                    )
+                    self.assertEqual(connection.execute(
+                        "SELECT recovery_action, blocker FROM provider_recovery_outcomes "
+                        "WHERE attempt_id=?", (runner.selection.provider_attempt_id,),
+                    ).fetchone(), ("blocked-ambiguous-turn", "scope-stopped"))
+                self.assertEqual(backend.calls, 1)
+
+    def test_readiness_and_execution_share_complete_accepted_state_validation(self) -> None:
+        """Claims, coordinates, and formal acceptance are all mandatory."""
+
+        mutations = {
+            "dispatch-claim": ("DELETE FROM provider_dispatch_claims WHERE attempt_id=?",),
+            "coordinate": ("DELETE FROM supervisor_attempt_coordinates WHERE attempt_id=?",),
+            "formal-acceptance": ("DELETE FROM accepted_provider_reviews WHERE attempt_id=?",),
+            "session-checkpoint": ("DELETE FROM provider_session_checkpoints WHERE attempt_id=?",),
+            "formal-turn": ("UPDATE diff_review_attempts SET external_turn_identity='substituted-turn' WHERE provider_attempt_id=?",),
+        }
+        for name, (statement,) in mutations.items():
+            with self.subTest(drift=name), TemporaryDirectory() as temporary:
+                runner, backend, repository, _identity, _recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    suffix=name,
+                )
+                self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+                with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                    connection.execute(statement, (runner.selection.provider_attempt_id,))
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    runner.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    runner.execute()
+                self.assertEqual(backend.calls, 1)
+
     def test_host_supervisor_execution_drift_blocks_before_attempt_or_backend(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, backend, repository, identity, _recovery, _seal = self.durable_runner(
@@ -435,17 +767,14 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(runner.execute(), ("runtime-provider-one",))
             self.assertNotEqual(read_attempt(repository, identity, "runtime-provider-one", context=recovery).state, AttemptState.ACCEPTED)
             # Reuse the same actual repository lifecycle with a fresh selected
-            # provider identity; the accepted result is created only by its
+            # same-profile physical ordinal; the accepted result is created only by its
             # observed typed native response.
-            second_recovery = provider_context(
-                recovery, identity, ProviderRole.SUPERVISOR,
-                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
-            )
+            second_recovery = recovery
             second_backend = Backend("runtime-two", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), [])
             second_selection = DiffReviewSelection(
                 "runtime-review-two", runner.selection.implementation_attempt_id,
                 "runtime-provider-two", "runtime-message-two", "runtime-lease-two",
-                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 1, physical_format_output_ordinal=1,
             )
             accepted = replace(runner, sequence=(
                 self.sequence_entry(runner),
@@ -458,11 +787,587 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(accepted.execute(), ("runtime-provider-one", "runtime-provider-two"))
             self.assertEqual(read_attempt(repository, identity, "runtime-provider-two", context=recovery).state, AttemptState.ACCEPTED)
 
+    def test_same_profile_format_ordinals_are_durable_and_exhaust_before_a_fourth_dispatch(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            entries = []
+            for ordinal in range(3):
+                selection = runner.selection if ordinal == 0 else DiffReviewSelection(
+                    f"runtime-format-review-{ordinal}", runner.selection.implementation_attempt_id,
+                    f"runtime-format-provider-{ordinal}", f"runtime-format-message-{ordinal}",
+                    f"runtime-format-lease-{ordinal}", runner.selection.process_lease_expires_at,
+                    "Review the immutable candidate.", ("Return a strict verdict.",), 1,
+                    logical_profile_position=1, physical_format_output_ordinal=ordinal,
+                )
+                backend = Backend(f"runtime-format-{ordinal}", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), [])
+                entries.append(self.sequence_entry(runner, selection=selection, backend=backend))
+            exhausted = replace(runner, sequence=tuple(entries))
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "format correction allowance is exhausted"):
+                exhausted.execute()
+            calls = tuple(entry.backend.calls for entry in entries)
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "format correction allowance is exhausted"):
+                exhausted.execute()
+            self.assertEqual(tuple(entry.backend.calls for entry in entries), calls)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE task_id = ? AND (attempt_id = ? OR attempt_id LIKE 'runtime-format-provider-%') ORDER BY attempt_number", (identity.task_id, runner.selection.provider_attempt_id)).fetchall(), [(1, 0), (1, 1), (1, 2)])
+                self.assertEqual(connection.execute("SELECT review_epoch, review_round, logical_profile_position, physical_format_output_ordinal FROM supervisor_attempt_coordinates WHERE task_id = ? ORDER BY logical_profile_position, physical_format_output_ordinal", (identity.task_id,)).fetchall(), [(1, 1, 1, 0), (1, 1, 1, 1), (1, 1, 1, 2)])
+            finally:
+                connection.close()
+
+    def test_restart_continues_same_profile_at_next_physical_format_ordinal(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner, backend=Backend("runtime-restart-zero", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), []))
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            next_selection = DiffReviewSelection("runtime-restart-one", runner.selection.implementation_attempt_id, "runtime-restart-provider-one", "runtime-restart-message-one", "runtime-restart-lease-one", runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 1, logical_profile_position=1, physical_format_output_ordinal=1)
+            second = self.sequence_entry(runner, selection=next_selection, backend=Backend("runtime-restart-one", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), []))
+            restarted = replace(runner, sequence=(first, second))
+            self.assertEqual(restarted.execute(), (runner.selection.provider_attempt_id, next_selection.provider_attempt_id))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT attempt_id, logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE attempt_id IN (?, ?) ORDER BY attempt_number", (runner.selection.provider_attempt_id, next_selection.provider_attempt_id)).fetchall(), [(runner.selection.provider_attempt_id, 1, 0), (next_selection.provider_attempt_id, 1, 1)])
+                self.assertEqual(connection.execute("SELECT attempt_id, review_epoch, review_round, logical_profile_position, physical_format_output_ordinal FROM supervisor_attempt_coordinates WHERE attempt_id IN (?, ?) ORDER BY logical_profile_position, physical_format_output_ordinal", (runner.selection.provider_attempt_id, next_selection.provider_attempt_id)).fetchall(), [(runner.selection.provider_attempt_id, 1, 1, 1, 0), (next_selection.provider_attempt_id, 1, 1, 1, 1)])
+            finally:
+                connection.close()
+
+    def test_restarted_format_correction_authenticates_complete_predecessor_before_debit(self) -> None:
+        """A durable INVALID row is not authority without its complete source chain."""
+
+        mutations = {
+            "dispatch-claim": "DELETE FROM provider_dispatch_claims WHERE attempt_id=?",
+            "session-checkpoint": "DELETE FROM provider_session_checkpoints WHERE attempt_id=?",
+            "failure-admission": "DELETE FROM provider_failure_admissions WHERE attempt_id=?",
+        }
+        for name, statement in mutations.items():
+            with self.subTest(binding=name), TemporaryDirectory() as temporary:
+                runner, _, repository, _identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                    suffix="correction-auth-" + name,
+                )
+                first = self.sequence_entry(runner)
+                self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+                successor = replace(
+                    runner.selection, diff_review_attempt_id="correction-auth-review",
+                    provider_attempt_id="correction-auth-provider",
+                    message_identity="correction-auth-message",
+                    process_lease_id="correction-auth-lease",
+                    physical_format_output_ordinal=1,
+                )
+                backend = Backend(
+                    "correction-auth-successor",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    [],
+                )
+                restarted = replace(runner, sequence=(
+                    first,
+                    self.sequence_entry(runner, selection=successor, recovery=recovery, backend=backend),
+                ))
+                with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                    connection.execute(statement, (runner.selection.provider_attempt_id,))
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                    before = connection.execute("SELECT COUNT(*) FROM role_budget_usage").fetchone()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.execute()
+                self.assertEqual(backend.calls, 0)
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM role_budget_usage").fetchone(), before)
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT 1 FROM provider_attempts WHERE attempt_id=?", (successor.provider_attempt_id,),
+                    ).fetchone())
+
+    def test_format_correction_preserves_predecessor_binding_through_dispatch(self) -> None:
+        """Deletion after the first durability check still prevents provider effects."""
+
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, _identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                suffix="correction-race",
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(
+                replace(runner, sequence=(first,)).execute(),
+                (runner.selection.provider_attempt_id,),
+            )
+            successor = replace(
+                runner.selection, diff_review_attempt_id="correction-race-review",
+                provider_attempt_id="correction-race-provider",
+                message_identity="correction-race-message",
+                process_lease_id="correction-race-lease",
+                physical_format_output_ordinal=1,
+            )
+            backend = Backend(
+                "correction-race-successor",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                [],
+            )
+            restarted = replace(runner, sequence=(
+                first, self.sequence_entry(runner, selection=successor, recovery=recovery, backend=backend),
+            ))
+            original = provider_attempt_runtime.require_scope_effect_admission
+            admissions = 0
+
+            def delete_at_adapter_admission(*args, **kwargs):
+                nonlocal admissions
+                admitted = original(*args, **kwargs)
+                admissions += 1
+                # The first admission is preflight; the second is the
+                # adapter's serialized, immediately-before-effect boundary.
+                if admissions == 2:
+                    with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                        connection.execute(
+                            "DELETE FROM provider_checkpoints WHERE checkpoint_id=?",
+                            (runner.selection.provider_attempt_id + ":after-dispatch",),
+                        )
+                return admitted
+
+            with patch.object(
+                provider_attempt_runtime, "require_scope_effect_admission",
+                side_effect=delete_at_adapter_admission,
+            ):
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.execute()
+            self.assertEqual(backend.calls, 0)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertNotEqual(connection.execute(
+                    "SELECT state FROM provider_attempts WHERE attempt_id=?",
+                    (successor.provider_attempt_id,),
+                ).fetchone(), (AttemptState.ACCEPTED.value,))
+
+    def test_format_correction_requires_original_sealed_provider_debit(self) -> None:
+        """Missing or conflicting source cost cannot authorize another call."""
+
+        for mutation in ("missing", "conflicting"):
+            with self.subTest(cost=mutation), TemporaryDirectory() as temporary:
+                runner, _, _repository, _identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                    suffix="correction-cost-" + mutation,
+                )
+                first = self.sequence_entry(runner)
+                self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+                successor = replace(
+                    runner.selection, diff_review_attempt_id="correction-cost-review-" + mutation,
+                    provider_attempt_id="correction-cost-provider-" + mutation,
+                    message_identity="correction-cost-message-" + mutation,
+                    process_lease_id="correction-cost-lease-" + mutation,
+                    physical_format_output_ordinal=1,
+                )
+                backend = Backend(
+                    "correction-cost-successor-" + mutation,
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    [],
+                )
+                restarted = replace(runner, sequence=(
+                    first, self.sequence_entry(runner, selection=successor, recovery=recovery, backend=backend),
+                ))
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection, connection:
+                    if mutation == "missing":
+                        connection.execute("DELETE FROM role_budget_usage")
+                    else:
+                        connection.execute("UPDATE role_budget_usage SET calls=calls-1")
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.execute()
+                self.assertEqual(backend.calls, 0)
+
+    def test_same_format_ordinal_replay_is_inert_but_changed_attempt_identity_is_rejected(self) -> None:
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, _ = self.durable_runner(Path(temporary) / "repository", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE))
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            self.assertEqual(backend.calls, 1)
+            with self.assertRaisesRegex(ProviderRecoveryError, "replay conflicts"):
+                prepare_attempt(repository, identity, recovery, attempt_id=runner.selection.provider_attempt_id, role=ProviderRole.SUPERVISOR, process_lease_id=runner.selection.process_lease_id, process_lease_expires_at=runner.selection.process_lease_expires_at, input_fingerprint="c" * 64, selected_profile_identity=runner.audit.profile_identity, logical_profile_position=1, physical_format_output_ordinal=0, lease=runner.lease, now=runner.dispatch_control.now)
+            self.assertEqual(backend.calls, 1)
+
+    def test_prepared_format_correction_reuses_exact_reservation_after_crash(self) -> None:
+        import roundwright.provider_attempt_runtime as runtime_module
+        class ProcessDeath(BaseException): pass
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE))
+            first = self.sequence_entry(runner)
+            selection = replace(runner.selection, diff_review_attempt_id="crash-review", provider_attempt_id="crash-provider",
+                                message_identity="crash-message", process_lease_id="crash-lease", physical_format_output_ordinal=1)
+            second = self.sequence_entry(runner, selection=selection,
+                                         backend=Backend("crash-correction", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), []))
+            restarted = replace(runner, sequence=(first, second))
+            original = runtime_module.prepare_attempt
+            def interrupt(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    raise ProcessDeath
+                return result
+            with patch.object(runtime_module, "prepare_attempt", side_effect=interrupt):
+                with self.assertRaises(ProcessDeath): restarted.execute()
+            self.assertEqual((first.backend.calls, second.backend.calls), (1, 0))
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                before = connection.execute("SELECT * FROM role_budget_usage").fetchall()
+            self.assertEqual(len(before), 2)
+            for changed in (
+                replace(selection, provider_attempt_id="substituted-provider"),
+                replace(selection, message_identity="substituted-message"),
+                replace(selection, process_lease_id="substituted-lease"),
+                replace(selection, physical_format_output_ordinal=2),
+                replace(selection, logical_profile_position=2, within_round_attempt=2),
+            ):
+                with self.subTest(selection=changed):
+                    with self.assertRaises((ProviderAttemptRuntimeError, ProviderRecoveryError, RoleCapabilityError)):
+                        drifted = self.sequence_entry(runner, selection=changed, backend=second.backend)
+                        replace(runner, sequence=(first, drifted)).execute()
+                    self.assertEqual((first.backend.calls, second.backend.calls), (1, 0))
+                    with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                        self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+            self.assertEqual(replace(restarted).execute(), (first.selection.provider_attempt_id, selection.provider_attempt_id))
+            self.assertEqual((first.backend.calls, second.backend.calls), (1, 1))
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+            self.assertEqual(replace(restarted).execute(), (first.selection.provider_attempt_id, selection.provider_attempt_id))
+            self.assertEqual((first.backend.calls, second.backend.calls), (1, 1))
+
+    def test_readiness_accepts_only_exact_unclaimed_prepared_correction(self) -> None:
+        """Validate resumes the same debit/checkpoint but rejects claim or binding drift."""
+
+        import roundwright.provider_attempt_runtime as runtime_module
+        class ProcessDeath(BaseException): pass
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner)
+            selection = replace(
+                runner.selection, diff_review_attempt_id="readiness-review",
+                provider_attempt_id="readiness-provider", message_identity="readiness-message",
+                process_lease_id="readiness-lease", physical_format_output_ordinal=1,
+            )
+            second = self.sequence_entry(
+                runner, selection=selection,
+                backend=Backend("readiness-correction", NativeSupervisorResponse(
+                    SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE,
+                ), []),
+            )
+            restarted = replace(runner, sequence=(first, second))
+            original = runtime_module.prepare_attempt
+            def interrupt(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    raise ProcessDeath
+                return result
+            with patch.object(runtime_module, "prepare_attempt", side_effect=interrupt), self.assertRaises(ProcessDeath):
+                restarted.execute()
+            before = read_attempt(repository, identity, selection.provider_attempt_id, context=recovery)
+            self.assertEqual((before.state, read_supervisor_dispatch_claim(
+                repository, identity, recovery, attempt_id=selection.provider_attempt_id,
+            )), (AttemptState.PREPARED, "unclaimed"))
+            self.assertEqual(restarted.validate_accounting_checkpoint(), before)
+            drifted = replace(
+                restarted, sequence=(first, replace(second, selection=replace(
+                    selection, message_identity="readiness-message-drift",
+                ))),
+            )
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "drifted"):
+                drifted.validate_accounting_checkpoint()
+            claim_supervisor_dispatch(
+                repository, identity, recovery, attempt_id=selection.provider_attempt_id,
+                lease=runner.lease, now=runner.dispatch_control.now,
+            )
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "drifted"):
+                restarted.validate_accounting_checkpoint()
+
+    def test_initial_prepared_reservation_resumes_after_crash_without_double_debit(self) -> None:
+        """Physical ordinal zero reuses an exact untouched sealed debit."""
+
+        class ProcessDeath(BaseException): pass
+        with TemporaryDirectory() as temporary:
+            runner, backend, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+            )
+            runner.validate_accounting_checkpoint()
+            original = provider_attempt_runtime.prepare_attempt
+            reserved_usage = []
+
+            def interrupt(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if not runner.budget_ledger_path.is_file():
+                    return result
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                    reserved_usage.extend(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall())
+                raise ProcessDeath
+
+            with patch.object(provider_attempt_runtime, "prepare_attempt", side_effect=interrupt), self.assertRaises(ProcessDeath):
+                runner.execute()
+            self.assertEqual(backend.calls, 0)
+            before = reserved_usage
+            self.assertEqual(before, [(1, 60, 4000)])
+            self.assertEqual(runner.validate_accounting_checkpoint().state, AttemptState.PREPARED)
+            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id,))
+            self.assertEqual(backend.calls, 1)
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute("SELECT calls, duration_seconds, tokens FROM role_budget_usage").fetchall(), before)
+
+    def test_process_death_after_correction_debit_before_prepare_recovers_exact_intent(self) -> None:
+        """A real interruption boundary neither strands nor repeats the correction debit."""
+
+        class ProcessDeath(BaseException):
+            pass
+
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(
+                    SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE,
+                ),
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(
+                replace(runner, sequence=(first,)).execute(),
+                (first.selection.provider_attempt_id,),
+            )
+            selection = replace(
+                runner.selection, diff_review_attempt_id="intent-review",
+                provider_attempt_id="intent-provider", message_identity="intent-message",
+                process_lease_id="intent-lease", physical_format_output_ordinal=1,
+            )
+            backend = Backend(
+                "intent-correction",
+                NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                ), [],
+            )
+            correction = self.sequence_entry(runner, selection=selection, backend=backend)
+            restarted = replace(runner, sequence=(first, correction))
+            original = provider_attempt_runtime.prepare_attempt
+
+            def die_before_prepare(*args, **kwargs):
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    raise ProcessDeath
+                return original(*args, **kwargs)
+
+            with patch.object(
+                provider_attempt_runtime, "prepare_attempt", side_effect=die_before_prepare,
+            ), self.assertRaises(ProcessDeath):
+                restarted.execute()
+            self.assertEqual(backend.calls, 0)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM provider_attempts WHERE attempt_id = ?",
+                    (selection.provider_attempt_id,),
+                ).fetchone())
+                self.assertEqual(connection.execute(
+                    "SELECT task_id, authority_scope, provider_role, state "
+                    "FROM provider_effect_reservation_intents WHERE attempt_id = ?",
+                    (selection.provider_attempt_id,),
+                ).fetchone(), (
+                    identity.task_id, "supervisor:" + identity.task_id,
+                    "supervisor", "reserving",
+                ))
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                before = connection.execute(
+                    "SELECT ledger_key, calls, duration_seconds, tokens "
+                    "FROM role_budget_usage ORDER BY ledger_key"
+                ).fetchall()
+            self.assertEqual(len(before), 2)
+            self.assertEqual(restarted.execute(), (
+                first.selection.provider_attempt_id, selection.provider_attempt_id,
+            ))
+            self.assertEqual(backend.calls, 1)
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT ledger_key, calls, duration_seconds, tokens "
+                    "FROM role_budget_usage ORDER BY ledger_key"
+                ).fetchall(), before)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM provider_effect_reservation_intents WHERE attempt_id = ?",
+                    (selection.provider_attempt_id,),
+                ).fetchone())
+            self.assertEqual(read_attempt(
+                repository, identity, selection.provider_attempt_id, context=recovery,
+            ).state, AttemptState.ACCEPTED)
+
+    def test_unused_correction_debit_is_recovered_when_preparation_fails(self) -> None:
+        """No attempt, claim, or call means the scoped debit is recoverable."""
+
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            selection = replace(
+                runner.selection, diff_review_attempt_id="unused-review",
+                provider_attempt_id="unused-provider", message_identity="unused-message",
+                process_lease_id="unused-lease", physical_format_output_ordinal=1,
+            )
+            correction = replace(runner, sequence=(first, self.sequence_entry(
+                runner, selection=selection,
+                backend=Backend("unused-correction", NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                ), []),
+            )))
+            original = provider_attempt_runtime.prepare_attempt
+
+            def reject_new_attempt(*args, **kwargs):
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    raise ProviderRecoveryError("injected preparation rejection")
+                return original(*args, **kwargs)
+
+            with patch.object(provider_attempt_runtime, "prepare_attempt", side_effect=reject_new_attempt), self.assertRaises(ProviderRecoveryError):
+                correction.execute()
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM provider_attempts WHERE attempt_id=?", (selection.provider_attempt_id,),
+                ).fetchone())
+            with closing(sqlite3.connect(correction.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT sum(calls), sum(duration_seconds), sum(tokens) FROM role_budget_usage"
+                ).fetchone(), (1, 60, 4000))
+
+    def test_unused_correction_refund_rejects_foreign_reservation_owner(self) -> None:
+        """A product intent cannot refund a debit rebound to another repository."""
+
+        with TemporaryDirectory() as temporary:
+            runner, _backend, repository, identity, _recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            selection = replace(
+                runner.selection, diff_review_attempt_id="foreign-refund-review",
+                provider_attempt_id="foreign-refund-provider", message_identity="foreign-refund-message",
+                process_lease_id="foreign-refund-lease", physical_format_output_ordinal=1,
+            )
+            correction = replace(runner, sequence=(first, self.sequence_entry(
+                runner, selection=selection,
+                backend=Backend("foreign-refund-correction", NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                ), []),
+            )))
+            original = provider_attempt_runtime.prepare_attempt
+
+            def reject_after_owner_substitution(*args, **kwargs):
+                if kwargs["attempt_id"] == selection.provider_attempt_id:
+                    with closing(sqlite3.connect(database_path(repository))) as connection:
+                        connection.execute(
+                            "UPDATE provider_effect_reservation_intents "
+                            "SET reservation_repository_identity=? WHERE attempt_id=?",
+                            (digest("foreign-repository"), selection.provider_attempt_id),
+                        )
+                        connection.commit()
+                    raise ProviderRecoveryError("injected preparation rejection")
+                return original(*args, **kwargs)
+
+            with patch.object(
+                provider_attempt_runtime, "prepare_attempt",
+                side_effect=reject_after_owner_substitution,
+            ), self.assertRaisesRegex(
+                ProviderAttemptRuntimeError, "unused provider reservation recovery failed",
+            ):
+                correction.execute()
+            with closing(sqlite3.connect(correction.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT sum(calls), sum(duration_seconds), sum(tokens) FROM role_budget_usage"
+                ).fetchone(), (2, 120, 8000))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT reservation_repository_identity FROM provider_effect_reservation_intents "
+                    "WHERE attempt_id=?", (selection.provider_attempt_id,),
+                ).fetchone(), (digest("foreign-repository"),))
+
+    def test_stopped_scope_rejects_correction_before_any_state_or_budget_change(self) -> None:
+        """A denied correction is inert across product and budget ledgers."""
+
+        from roundwright.failure_recovery import (
+            EvidenceSource, FailureBinding, FailureClass, FailureRole, classify,
+            record_durable_failure,
+        )
+        with TemporaryDirectory() as temporary:
+            runner, _, repository, identity, recovery, _ = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+            )
+            first = self.sequence_entry(runner)
+            self.assertEqual(replace(runner, sequence=(first,)).execute(), (runner.selection.provider_attempt_id,))
+            source = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
+            assert source.session_identity is not None
+            record_durable_failure(
+                repository, identity,
+                classify(FailureBinding(
+                    recovery.candidate_sha, "sha256:" + recovery.policy_fingerprint,
+                    recovery.runtime_binding.resolved_digest, "supervisor:" + identity.task_id,
+                    FailureRole.SUPERVISOR, first.audit.profile_identity,
+                    source.session_identity, source.attempt_id,
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+            )
+            selection = replace(
+                runner.selection, diff_review_attempt_id="denied-review",
+                provider_attempt_id="denied-provider", message_identity="denied-message",
+                process_lease_id="denied-lease", physical_format_output_ordinal=1,
+            )
+            backend = Backend("denied-correction", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), [])
+            denied = replace(runner, sequence=(first, self.sequence_entry(
+                runner, selection=selection, backend=backend,
+            )))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                product_before = {
+                    table: connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                    for table in (
+                        "provider_attempts", "supervisor_attempt_coordinates",
+                        "provider_dispatch_claims", "recovery_route_authorizations",
+                        "provider_invalid_outputs",
+                    )
+                }
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                budget_before = connection.execute("SELECT * FROM role_budget_usage ORDER BY 1").fetchall()
+            def denied_writer(_index):
+                try:
+                    denied.execute()
+                except ProviderAttemptRuntimeError as error:
+                    return str(error)
+                return "unexpected-success"
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                outcomes = tuple(pool.map(denied_writer, range(4)))
+            self.assertTrue(all("scope is stopped" in outcome for outcome in outcomes), outcomes)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual({
+                    table: connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+                    for table in product_before
+                }, product_before)
+            with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                self.assertEqual(connection.execute("SELECT * FROM role_budget_usage ORDER BY 1").fetchall(), budget_before)
+            self.assertEqual(backend.calls, 0)
+
     def test_fallback_reserves_its_own_exact_binding_and_reconstructs_without_redispatch(self) -> None:
         with TemporaryDirectory() as temporary:
             runner, primary, repository, identity, recovery, _seal = self.durable_runner(
                 Path(temporary) / "repository",
-                NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                NativeSupervisorResponse(
+                    SupervisorResultKind.BLOCKED,
+                    failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+                    outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                    sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
+                ),
             )
             second_recovery = provider_context(
                 recovery, identity, ProviderRole.SUPERVISOR,
@@ -501,6 +1406,240 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertEqual(shared.execute(), (runner.selection.provider_attempt_id, second.provider_attempt_id))
             self.assertEqual((primary.calls, fallback.calls), (1, 1))
 
+    def test_format_correction_then_verified_outage_falls_back_without_stranding(self) -> None:
+        from roundwright.failure_recovery import (
+            FailureRecoveryError, abandon_durable_recovery_route_reservation,
+            read_durable_recovery_route_authorization,
+        )
+        for interruption in (None, "prepared", "route-committed"):
+            with self.subTest(interruption=interruption), TemporaryDirectory() as temporary:
+                runner, primary, repository, identity, recovery, _ = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                )
+                correction = replace(runner.selection, diff_review_attempt_id="correction-review", provider_attempt_id="correction-provider", message_identity="correction-message", process_lease_id="correction-lease", physical_format_output_ordinal=1)
+                outage = Backend("correction", NativeSupervisorResponse(SupervisorResultKind.BLOCKED, failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE, outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED, sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD), [])
+                successor = replace(runner.selection, diff_review_attempt_id="fallback-review", provider_attempt_id="fallback-provider", message_identity="fallback-message", process_lease_id="fallback-lease", within_round_attempt=2)
+                successor_recovery = provider_context(recovery, identity, ProviderRole.SUPERVISOR, selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1])
+                fallback = Backend("fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), [])
+                sequence = replace(runner, sequence=(
+                    self.sequence_entry(runner, backend=primary),
+                    self.sequence_entry(runner, selection=correction, backend=outage),
+                    self.sequence_entry(runner, selection=successor, recovery=successor_recovery, audit=successor_recovery.health_receipt.audit_identity, backend=fallback),
+                ))
+                if interruption == "prepared":
+                    original = provider_attempt_runtime.read_supervisor_accounting_snapshot
+                    def invalid_snapshot(*args, **kwargs):
+                        if kwargs["current_attempt_id"] == successor.provider_attempt_id:
+                            raise ProviderRecoveryError("injected deterministic accounting rejection")
+                        return original(*args, **kwargs)
+                    with patch.object(provider_attempt_runtime, "read_supervisor_accounting_snapshot", side_effect=invalid_snapshot), self.assertRaisesRegex(ProviderAttemptRuntimeError, "accounting snapshot is unavailable"):
+                        sequence.execute()
+                elif interruption == "route-committed":
+                    original = provider_attempt_runtime.commit_durable_recovery_route_reservation
+                    def interrupt_after_commit(*args, **kwargs):
+                        original(*args, **kwargs)
+                        raise ProviderRecoveryError("injected post-commit interruption")
+                    with patch.object(provider_attempt_runtime, "commit_durable_recovery_route_reservation", side_effect=interrupt_after_commit), self.assertRaisesRegex(ProviderAttemptRuntimeError, "recovery route is unavailable"):
+                        sequence.execute()
+                if interruption is not None:
+                    self.assertEqual((primary.calls, outage.calls, fallback.calls), (1, 1, 0))
+                    with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                        route_id, reservation, route_state = connection.execute("SELECT route_digest, reservation_digest, state FROM recovery_route_authorizations").fetchone()
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM provider_dispatch_claims WHERE attempt_id=?", (successor.provider_attempt_id,)).fetchone(), (0,))
+                        self.assertEqual(connection.execute("SELECT state FROM provider_attempts WHERE attempt_id=?", (successor.provider_attempt_id,)).fetchone(), ("prepared",))
+                    self.assertEqual(route_state, "reserving" if interruption == "prepared" else "consumed")
+                    self.assertEqual(sequence.validate_accounting_checkpoint().state, AttemptState.PREPARED)
+                    route = read_durable_recovery_route_authorization(repository, identity, route_id)
+                    with self.assertRaisesRegex(FailureRecoveryError, "successor is already admitted|route abandonment has drifted"):
+                        abandon_durable_recovery_route_reservation(repository, identity, route, reservation_digest=reservation)
+                    with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                        self.assertEqual(connection.execute("SELECT state, reservation_digest FROM recovery_route_authorizations WHERE route_digest=?", (route_id,)).fetchone(), (route_state, reservation))
+                expected = (runner.selection.provider_attempt_id, correction.provider_attempt_id, successor.provider_attempt_id)
+                self.assertEqual(sequence.execute(), expected)
+                self.assertEqual(sequence.execute(), expected)
+                self.assertEqual((primary.calls, outage.calls, fallback.calls), (1, 1, 1))
+                with closing(sqlite3.connect(sequence.budget_ledger_path)) as connection, connection:
+                    self.assertEqual(connection.execute("SELECT sum(calls), sum(duration_seconds), sum(tokens) FROM role_budget_usage").fetchone(), (3, 180, 12000))
+
+    def test_prepared_fallback_readiness_rejects_route_identity_claim_and_reservation_drift(self) -> None:
+        """The shared PREPARED fallback classifier fails closed on every binding."""
+
+        for drift in ("route", "identity", "claim", "reservation"):
+            with self.subTest(drift=drift), TemporaryDirectory() as temporary:
+                runner, primary, repository, identity, recovery, _ = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.BLOCKED,
+                        failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+                        outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                        sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
+                    ),
+                    suffix="prepared-" + drift,
+                )
+                successor_recovery = provider_context(
+                    recovery, identity, ProviderRole.SUPERVISOR,
+                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+                )
+                successor = replace(
+                    runner.selection, diff_review_attempt_id="prepared-review-" + drift,
+                    provider_attempt_id="prepared-provider-" + drift,
+                    message_identity="prepared-message-" + drift,
+                    process_lease_id="prepared-lease-" + drift,
+                    within_round_attempt=2,
+                )
+                fallback = Backend("prepared-fallback-" + drift, NativeSupervisorResponse(
+                    SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                ), [])
+                sequence = replace(runner, sequence=(
+                    self.sequence_entry(runner, backend=primary),
+                    self.sequence_entry(
+                        runner, selection=successor, recovery=successor_recovery,
+                        audit=successor_recovery.health_receipt.audit_identity,
+                        backend=fallback,
+                    ),
+                ))
+                original = provider_attempt_runtime.read_supervisor_accounting_snapshot
+                def interrupt_prepared(*args, **kwargs):
+                    if kwargs["current_attempt_id"] == successor.provider_attempt_id:
+                        raise ProviderRecoveryError("injected prepared fallback interruption")
+                    return original(*args, **kwargs)
+                with patch.object(provider_attempt_runtime, "read_supervisor_accounting_snapshot", side_effect=interrupt_prepared), self.assertRaises(ProviderAttemptRuntimeError):
+                    sequence.execute()
+                self.assertEqual(sequence.validate_accounting_checkpoint().state, AttemptState.PREPARED)
+                if drift == "claim":
+                    claim_supervisor_dispatch(
+                        repository, identity, successor_recovery,
+                        attempt_id=successor.provider_attempt_id,
+                        lease=sequence.lease, now=sequence.dispatch_control.now,
+                    )
+                else:
+                    statements = {
+                        "route": "UPDATE recovery_route_authorizations SET target_route_digest='sha256:" + "e" * 64 + "'",
+                        "identity": "UPDATE provider_attempts SET selected_profile_identity='sha256:" + "e" * 64 + "' WHERE attempt_id='" + successor.provider_attempt_id + "'",
+                        "reservation": "UPDATE recovery_route_authorizations SET reservation_digest='sha256:" + "e" * 64 + "'",
+                    }
+                    with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                        connection.execute(statements[drift])
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    sequence.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    sequence.execute()
+                self.assertEqual(fallback.calls, 0)
+
+    def test_format_invalid_cannot_jump_profiles_before_or_after_restart(self) -> None:
+        for ordinal in (0, 2):
+            with self.subTest(physical_ordinal=ordinal), TemporaryDirectory() as temporary:
+                runner, primary, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE),
+                )
+                entries = [self.sequence_entry(runner, backend=primary)]
+                for physical in range(1, ordinal + 1):
+                    selection = replace(runner.selection, diff_review_attempt_id=f"format-review-{physical}", provider_attempt_id=f"format-provider-{physical}", message_identity=f"format-message-{physical}", process_lease_id=f"format-lease-{physical}", physical_format_output_ordinal=physical)
+                    backend = Backend(f"format-{physical}", NativeSupervisorResponse(SupervisorResultKind.INVALID, diagnostic=SupervisorDiagnostic.SHAPE), [])
+                    entries.append(self.sequence_entry(runner, selection=selection, backend=backend))
+                next_recovery = provider_context(recovery, identity, ProviderRole.SUPERVISOR, selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1])
+                target = replace(runner.selection, diff_review_attempt_id="jump-review", provider_attempt_id="jump-provider", message_identity="jump-message", process_lease_id="jump-lease", within_round_attempt=2)
+                fallback = Backend("jump-fallback", NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}), [])
+                entries.append(self.sequence_entry(runner, selection=target, recovery=next_recovery, audit=next_recovery.health_receipt.audit_identity, backend=fallback))
+                sequence = replace(runner, sequence=tuple(entries))
+                for restart in (False, True):
+                    expected_error = "profile transition has no terminal recovery route" if ordinal == 0 else "format correction allowance is exhausted"
+                    with self.subTest(restart=restart), self.assertRaisesRegex(ProviderAttemptRuntimeError, expected_error):
+                        sequence.execute()
+                    self.assertEqual(fallback.calls, 0)
+                    self.assertEqual(primary.calls, 1)
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertIsNone(connection.execute("SELECT 1 FROM provider_attempts WHERE attempt_id=?", (target.provider_attempt_id,)).fetchone())
+                finally:
+                    connection.close()
+
+    def test_recovery_route_fence_interruption_reconciles_before_successor_dispatch(self) -> None:
+        """A crash after the route fence cannot strand or duplicate a successor."""
+
+        with TemporaryDirectory() as temporary:
+            runner, primary, repository, identity, recovery, _seal = self.durable_runner(
+                Path(temporary) / "repository",
+                NativeSupervisorResponse(
+                    SupervisorResultKind.BLOCKED,
+                    failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+                    outcome_source=SupervisorOutcomeSource.SDK_TURN_FAILED,
+                    sdk_error_category=SupervisorSdkTurnErrorCategory.OVERLOAD,
+                ),
+            )
+            successor_recovery = provider_context(
+                recovery, identity, ProviderRole.SUPERVISOR,
+                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+            )
+            successor = DiffReviewSelection(
+                "runtime-fence-review-two", runner.selection.implementation_attempt_id,
+                "runtime-fence-provider-two", "runtime-fence-message-two", "runtime-fence-lease-two",
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.",
+                ("Return a strict verdict.",), 2,
+            )
+            fallback = Backend("runtime-fence-two", NativeSupervisorResponse(
+                SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+            ), [])
+            restarted = replace(runner, sequence=(
+                self.sequence_entry(runner, backend=primary),
+                self.sequence_entry(
+                    runner, selection=successor, recovery=successor_recovery,
+                    audit=successor_recovery.health_receipt.audit_identity, backend=fallback,
+                ),
+            ))
+            original_begin = provider_attempt_runtime.begin_durable_recovery_route_reservation
+
+            def interrupt_after_fence(*args, **kwargs):
+                original_begin(*args, **kwargs)
+                raise RuntimeError("injected interruption after durable route fence")
+
+            with patch("roundwright.provider_attempt_runtime.begin_durable_recovery_route_reservation", side_effect=interrupt_after_fence):
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "recovery route is unavailable"):
+                    restarted.execute()
+            self.assertEqual((primary.calls, fallback.calls), (1, 0))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM recovery_route_authorizations"
+                ).fetchall(), [("reserving",)])
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM provider_attempts WHERE attempt_id = ?",
+                    (successor.provider_attempt_id,),
+                ).fetchall(), [])
+            finally:
+                connection.close()
+            connection = sqlite3.connect(restarted.budget_ledger_path)
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM role_budget_usage"
+                ).fetchone(), (1,))
+            finally:
+                connection.close()
+            # Restart first abandons the fence with no matching budget row,
+            # then admits exactly one prepared successor and commits the route.
+            self.assertEqual(restarted.execute(), (runner.selection.provider_attempt_id, successor.provider_attempt_id))
+            self.assertEqual((primary.calls, fallback.calls), (1, 1))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM recovery_route_authorizations"
+                ).fetchall(), [("consumed",)])
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM provider_attempts WHERE attempt_id = ?",
+                    (successor.provider_attempt_id,),
+                ).fetchall(), [("accepted",)])
+            finally:
+                connection.close()
+            connection = sqlite3.connect(restarted.budget_ledger_path)
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM role_budget_usage"
+                ).fetchone(), (2,))
+            finally:
+                connection.close()
+
     def test_shared_budget_final_slot_reservations_serialize(self) -> None:
         with TemporaryDirectory() as temporary:
             execution = sealed_execution(AdvisoryRole.SUPERVISOR, self.durable_runner(
@@ -523,7 +1662,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 self.assertEqual(sum(pool.map(reserve, ledgers)), 1)
 
-    def test_terminal_supervisor_failure_is_durable_and_fails_over_without_invalid_output(self) -> None:
+    def test_terminal_supervisor_failure_is_durable_and_never_fails_over_without_invalid_output(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary) / "repository"
             runner, first_backend, repository, identity, recovery, seal = self.durable_runner(
@@ -552,16 +1691,21 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 self.sequence_entry(runner, selection=second_selection, recovery=second_recovery, audit=second_recovery.health_receipt.audit_identity, backend=second_backend),
             ))
             first_only = replace(runner, sequence=(runner.sequence[0],))
-            self.assertEqual(first_only.execute(), (runner.selection.provider_attempt_id,))
+            with self.assertRaisesRegex(ProviderAttemptRuntimeError, "no pre-bound fallback"):
+                first_only.execute()
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             checkpoint_failure = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
             self.assertIsNotNone(checkpoint_failure)
+            self.assertEqual(
+                (first.attempt_id, checkpoint_failure.failure_class, first_backend.calls, second_backend.calls),
+                (runner.selection.provider_attempt_id, SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE, 1, 0),
+            )
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 0))
-            # Restart from the durable terminal-failure checkpoint may dispatch
-            # only the still-unseen configured secondary; it must not replay
-            # the first turn, failure record, or failover transition.
-            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
+            # A restart resumes only the already-selected successor profile.
+            restarted_attempts = runner.execute()
+            self.assertEqual(restarted_attempts, (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
+            self.assertEqual((len(restarted_attempts), len(set(restarted_attempts))), (2, 2))
             first = read_attempt(repository, identity, runner.selection.provider_attempt_id, context=recovery)
             self.assertEqual(first.state, AttemptState.INVALIDATED)
             terminal = read_supervisor_terminal_failure(repository, identity, first.attempt_id)
@@ -571,15 +1715,20 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 (terminal.failure_class, terminal.outcome_source, terminal.sdk_error_category),
                 (SupervisorTerminalFailureClass.TRANSPORT_OR_PROVIDER_OUTAGE, SupervisorTerminalFailureSource.SDK_TURN_FAILED, SupervisorTerminalFailureSdkCategory.OVERLOAD),
             )
-            self.assertEqual(read_attempt(repository, identity, second_selection.provider_attempt_id, context=recovery).state, AttemptState.ACCEPTED)
+            self.assertEqual(
+                read_attempt(repository, identity, second_selection.provider_attempt_id, context=second_recovery).state,
+                AttemptState.ACCEPTED,
+            )
             connection = sqlite3.connect(database_path(repository))
             try:
                 self.assertEqual(connection.execute(
                     "SELECT COUNT(*) FROM provider_invalid_outputs WHERE attempt_id = ?", (first.attempt_id,),
                 ).fetchone()[0], 0)
+                self.assertEqual(connection.execute(
+                    "SELECT logical_profile_position, physical_format_output_ordinal FROM provider_attempts WHERE attempt_id = ?", (first.attempt_id,),
+                ).fetchone(), (1, 0))
             finally:
                 connection.close()
-            self.assertEqual(runner.execute(), (runner.selection.provider_attempt_id, second_selection.provider_attempt_id))
             self.assertEqual((first_backend.calls, second_backend.calls), (1, 1))
             descriptor = ProviderAttemptRuntimeDescriptor.parse({
                 "schema": "roundwright-provider-attempt-runtime/v2", "resource_id": "runtime-terminal-45",
@@ -594,12 +1743,188 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                 runner.source_digest, descriptor.case_id, descriptor.ready_at, descriptor.capture_plan_digest,
                 descriptor.provider_profile_identity, 1, 1, runner,
             )
-            graph = MaterializedProviderAttemptContext(descriptor, resources).snapshot(
-                (runner.selection.provider_attempt_id, second_selection.provider_attempt_id),
-            )["event_graph"]
-            assert graph is not None
-            self.assertIn("provider-terminal-failure", tuple(item.event_kind for item in graph.events))
-            self.assertNotIn("invalid-output", tuple(item.event_kind for item in graph.events))
+            self.assertIsNone(MaterializedProviderAttemptContext(descriptor, resources).snapshot(
+                (runner.selection.provider_attempt_id,),
+            )["event_graph"])
+
+    def test_provider_outage_before_session_or_turn_checkpoint_is_durable_and_falls_back_after_restart(self) -> None:
+        """Typed pre-checkpoint outages retain classification and the pre-bound route."""
+
+        for stage in ("open-session", "start-turn"):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    suffix="outage-" + stage,
+                )
+
+                class OutageSession:
+                    def identity(self):
+                        return "session-provider-outage"
+                    def close(self):
+                        return None
+                    def start_turn(self, _request):
+                        raise CodexAdapterError(CodexFailure.PROVIDER_OUTAGE)
+
+                class OutageBackend:
+                    def __init__(self):
+                        self.calls = 0
+                    def open_fresh_session(self, _profile):
+                        self.calls += 1
+                        if stage == "open-session":
+                            raise CodexAdapterError(CodexFailure.PROVIDER_OUTAGE)
+                        return OutageSession()
+
+                outage = OutageBackend()
+                first = self.sequence_entry(runner, backend=outage)
+                first_only = replace(runner, backend=outage, sequence=(first,))
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "no pre-bound fallback"):
+                    first_only.execute()
+                stored = read_attempt(
+                    repository, identity, runner.selection.provider_attempt_id, context=recovery,
+                )
+                self.assertEqual(
+                    (stored.state, stored.session_identity, stored.external_turn_identity),
+                    (AttemptState.INVALIDATED, None if stage == "open-session" else "session-provider-outage", None),
+                )
+                terminal = read_supervisor_terminal_failure(repository, identity, stored.attempt_id)
+                self.assertEqual(
+                    terminal,
+                    SupervisorTerminalFailure(
+                        SupervisorTerminalFailureClass.PROVIDER_OUTAGE,
+                        SupervisorTerminalFailureSource.SDK_TURN_FAILED,
+                        SupervisorTerminalFailureSdkCategory.CONNECTION,
+                    ),
+                )
+                second_recovery = provider_context(
+                    recovery, identity, ProviderRole.SUPERVISOR,
+                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+                )
+                fallback = Backend(
+                    "provider-outage-fallback",
+                    NativeSupervisorResponse(SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []}),
+                    [],
+                )
+                second_selection = DiffReviewSelection(
+                    "provider-outage-review-two", runner.selection.implementation_attempt_id,
+                    "provider-outage-attempt-two", "provider-outage-message-two",
+                    "provider-outage-lease-two", runner.selection.process_lease_expires_at,
+                    "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                )
+                restarted = replace(runner, backend=outage, sequence=(
+                    first,
+                    self.sequence_entry(
+                        runner, selection=second_selection, recovery=second_recovery,
+                        audit=second_recovery.health_receipt.audit_identity, backend=fallback,
+                    ),
+                ))
+                self.assertEqual(
+                    restarted.execute(),
+                    (runner.selection.provider_attempt_id, second_selection.provider_attempt_id),
+                )
+                self.assertEqual((outage.calls, fallback.calls), (1, 1))
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    payload = json.loads(connection.execute(
+                        "SELECT record_json FROM failure_recovery_records WHERE task_id=?",
+                        (identity.task_id,),
+                    ).fetchone()[0])
+                    self.assertEqual(
+                        (payload["failure"], payload["evidence"], payload["action"]),
+                        ("transient-service", "verified-service", "prebound-fallback"),
+                    )
+
+    def test_provider_outage_fallback_requires_the_original_provider_debit(self) -> None:
+        """Neither outage stage can turn a deleted source debit into a second call."""
+
+        for stage in ("open-session", "start-turn"):
+            with self.subTest(stage=stage), TemporaryDirectory() as temporary:
+                runner, _backend, repository, identity, recovery, _seal = self.durable_runner(
+                    Path(temporary) / "repository",
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                    ),
+                    suffix="outage-debit-" + stage,
+                )
+
+                class OutageSession:
+                    def identity(self):
+                        return "session-provider-outage-debit"
+
+                    def close(self):
+                        return None
+
+                    def start_turn(self, _request):
+                        raise CodexAdapterError(CodexFailure.PROVIDER_OUTAGE)
+
+                class OutageBackend:
+                    def __init__(self):
+                        self.calls = 0
+
+                    def open_fresh_session(self, _profile):
+                        self.calls += 1
+                        if stage == "open-session":
+                            raise CodexAdapterError(CodexFailure.PROVIDER_OUTAGE)
+                        return OutageSession()
+
+                outage = OutageBackend()
+                first = self.sequence_entry(runner, backend=outage)
+                with self.assertRaisesRegex(ProviderAttemptRuntimeError, "no pre-bound fallback"):
+                    replace(runner, backend=outage, sequence=(first,)).execute()
+                self.assertEqual(
+                    read_attempt(
+                        repository, identity, runner.selection.provider_attempt_id,
+                        context=recovery,
+                    ).state,
+                    AttemptState.INVALIDATED,
+                )
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection, connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM role_budget_usage",
+                    ).fetchone(), (1,))
+                    connection.execute("DELETE FROM role_budget_usage")
+
+                second_recovery = provider_context(
+                    recovery, identity, ProviderRole.SUPERVISOR,
+                    selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
+                )
+                fallback = Backend(
+                    "provider-outage-debit-fallback-" + stage,
+                    NativeSupervisorResponse(
+                        SupervisorResultKind.ACCEPTED, {"verdict": "pass", "findings": []},
+                    ),
+                    [],
+                )
+                second_selection = DiffReviewSelection(
+                    "provider-outage-debit-review-two-" + stage,
+                    runner.selection.implementation_attempt_id,
+                    "provider-outage-debit-attempt-two-" + stage,
+                    "provider-outage-debit-message-two-" + stage,
+                    "provider-outage-debit-lease-two-" + stage,
+                    runner.selection.process_lease_expires_at,
+                    "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                )
+                restarted = replace(runner, backend=outage, sequence=(
+                    first,
+                    self.sequence_entry(
+                        runner, selection=second_selection, recovery=second_recovery,
+                        audit=second_recovery.health_receipt.audit_identity, backend=fallback,
+                    ),
+                ))
+                # Readiness describes the already-observed outage; fallback
+                # admission is the boundary that must authenticate its debit.
+                restarted.validate_accounting_checkpoint()
+                with self.assertRaises(ProviderAttemptRuntimeError):
+                    restarted.execute()
+                self.assertEqual((outage.calls, fallback.calls), (1, 0))
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertIsNone(connection.execute(
+                        "SELECT state FROM provider_attempts WHERE attempt_id=?",
+                        (second_selection.provider_attempt_id,),
+                    ).fetchone())
+                with closing(sqlite3.connect(runner.budget_ledger_path)) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT COUNT(*) FROM role_budget_usage",
+                    ).fetchone(), (0,))
 
     def test_accounting_terminal_blocker_is_durable_and_never_fails_over(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -698,14 +2023,11 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
                     return Session(self)
 
             second_backend = Backend()
-            second_recovery = provider_context(
-                recovery, identity, ProviderRole.SUPERVISOR,
-                selected_profile_identity=recovery.runtime_binding.supervisor_profile_identities[1],
-            )
+            second_recovery = recovery
             second = DiffReviewSelection(
                 "runtime-material-review-two", runner.selection.implementation_attempt_id,
                 "runtime-material-provider-two", "runtime-material-message-two", "runtime-material-lease-two",
-                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 2,
+                runner.selection.process_lease_expires_at, "Review the immutable candidate.", ("Return a strict verdict.",), 1, physical_format_output_ordinal=1,
             )
             runner = replace(runner, sequence=(
                 self.sequence_entry(runner, backend=first),
@@ -732,7 +2054,7 @@ class ProviderAttemptRuntimeTests(unittest.TestCase):
             self.assertNotIn("C:/", json.dumps(material, sort_keys=True))
             self.assertNotIn("findings", json.dumps(material, sort_keys=True))
             native = canonical_supervisor_review_material(request)
-            self.assertEqual(native["schema"], "roundwright-provider-attempt-accounting-material/v2")
+            self.assertEqual(native["schema"], "roundwright-provider-attempt-accounting-material/v3")
             self.assertEqual(native["decision_semantic"], "pre-dispatch-transition-eligibility/v2")
             self.assertIn("pre-dispatch eligibility", native["decision_rule"])
             self.assertIn("does not assert", native["decision_rule"])

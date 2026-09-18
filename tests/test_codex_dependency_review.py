@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from roundwright.codex_dependency_review import (
     CodexDependencyReviewAdapter, DependencyReviewRequest, DependencyReviewResultKind, DependencyReviewService,
     NativeDependencyReviewResponse, DependencyReviewDispatchError, prepare_dependency_review_host,
 )
+import roundwright.codex_dependency_review as codex_dependency_review
 from roundwright.dependency_review_toolbox import (
     HarnessNativeCodexDependencyReviewBackend, _Turn, _schema,
     dependency_review_native_control_contract, dependency_review_native_control_digest,
@@ -28,12 +30,15 @@ from roundwright import external_validation
 from roundwright.configuration import ProviderProfile, ReasoningEffort, RepositoryIdentity
 from roundwright.dependency_review import (
     AffectedMember, AffectedSubset, Confidence, DependencyReviewBinding, EdgeDirection,
-    EdgeKind, ProposedEdge, RequestedDisposition, SourceOwnedRelation, DependencyReviewStore,
+    EdgeKind, ProposedEdge, RequestedDisposition, SourceOwnedRelation, DependencyProposal,
+    DependencyReviewStore,
 )
 from roundwright.git_identity import acquire_transition_lease
-from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexRuntimeAudit, ProviderHealthAuditIdentity
-from roundwright.role_capability_policy import AdvisoryRole, trusted_provider_launch_context
-from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize
+from roundwright.provider_health import CodexAdapterError, CodexCapability, CodexFailure, CodexRuntimeAudit, ProviderHealthAuditIdentity
+from roundwright.role_capability_policy import AdvisoryRole, reserve_role_effect, trusted_provider_launch_context
+from roundwright.state import SourceSnapshot, TaskIdentity, admit_task, database_path, initialize, record_runtime_binding
+from roundwright.runtime_binding import RuntimeBinding
+from roundwright.failure_recovery import EvidenceSource, FailureBinding, FailureClass, FailureRole, FailureRecoveryError, classify, read_durable_failure, record_durable_failure, read_durable_recovery_route_authorization, release_durable_recovery_route_authorization, release_unused_provider_effect_reservation, require_scope_open
 from roundwright.shadow import DEPENDENCY_REVIEW_ATTEMPT_PROFILE, shadow_evidence_profile
 from tests.role_admission_fixture import independent_execution, sealed_execution, sealed_execution_for_effect, trusted_execution_host
 
@@ -132,7 +137,38 @@ class DependencyReviewServiceTests(unittest.TestCase):
         binding = DependencyReviewBinding(subset.candidate_sha, subset.policy_digest, subset.configuration_digest, digest("7"))
         profile = ProviderProfile("gpt-5.6-terra", ReasoningEffort.HIGH)
         audit = ProviderHealthAuditIdentity(CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile, binding.profile_identity)
+        self.bind_current_authority(repository, binding)
         return repository, subset, binding, profile, audit
+
+    def task_identity(self) -> TaskIdentity:
+        return TaskIdentity("task-116", "source-116", "repo-116", "codex/116", "C:/review-116", "a" * 40)
+
+    def bind_current_authority(self, repository: RepositoryIdentity, binding: DependencyReviewBinding) -> TaskIdentity:
+        """Seed the production-only authority chain independently of the adapter."""
+
+        identity = self.task_identity()
+        connection = sqlite3.connect(database_path(repository))
+        try:
+            expected = (identity.base_sha, binding.candidate_sha, "authority-116")
+            existing = connection.execute(
+                "SELECT base_sha, candidate_sha, state_identity FROM candidate_seals WHERE task_id=?",
+                (identity.task_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)",
+                    (identity.task_id, *expected),
+                )
+            elif existing != expected:
+                raise AssertionError("test dependency authority drifted")
+            connection.commit()
+        finally:
+            connection.close()
+        record_runtime_binding(
+            repository, identity,
+            RuntimeBinding("roundwright-runtime/v1", binding.configuration_digest, digest("8"), (digest("9"),)),
+        )
+        return identity
 
     def proposal(self, attempt_id: str) -> dict[str, object]:
         relation = SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6"))
@@ -242,6 +278,7 @@ class DependencyReviewServiceTests(unittest.TestCase):
     def test_fresh_no_tools_attempt_accepts_only_the_bound_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            self.bind_current_authority(repository, binding)
             backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116")))
             adapter = CodexDependencyReviewAdapter(backend, profile, audit)
             relations = (SourceOwnedRelation(EdgeKind.EXPLICIT, EdgeDirection.DEPENDS_ON, "member-a", "member-b", digest("5"), Confidence.HIGH, digest("6")),)
@@ -265,6 +302,30 @@ class DependencyReviewServiceTests(unittest.TestCase):
                     "mutation_count": 0, "credential_exposure_count": 0,
                 },
             )
+
+    def test_service_derives_durable_task_identity_and_rejects_missing_authority_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("identity-required"),
+            ))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                connection.execute(
+                    "DELETE FROM runtime_configuration_bindings WHERE task_id=?",
+                    (subset.task_id,),
+                )
+            effect = self.effect_kwargs(
+                repository, subset, binding, adapter, attempt_id="identity-required",
+            )
+            with self.assertRaisesRegex(Exception, "current authority"):
+                DependencyReviewService().run(
+                    repository, subset, attempt_id="identity-required", binding=binding,
+                    adapter=adapter, checkpoint_session=lambda _: None,
+                    checkpoint_turn=lambda *_: None, **effect,
+                )
+            self.assertEqual(backend.sessions, [])
+            self.assertFalse(effect["budget_ledger_path"].exists())
 
     def test_observed_tool_event_is_durable_terminal_and_ineligible(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -300,6 +361,277 @@ class DependencyReviewServiceTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_typed_blocked_turn_is_terminal_not_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.BLOCKED, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None, **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"))
+            self.assertEqual(result.kind, DependencyReviewResultKind.BLOCKED)
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-116'").fetchone(), ("blocked",))
+            finally:
+                connection.close()
+
+    def test_typed_blocked_turn_records_a_shared_durable_failure_from_the_session_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, _audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.BLOCKED, failure=CodexFailure.SANDBOX_OR_APPROVAL_DENIED,
+            ))
+            adapter = CodexDependencyReviewAdapter(backend, profile, ProviderHealthAuditIdentity(
+                CodexRuntimeAudit("1.2.3", "4.5.6", (CodexCapability(profile.model, profile.reasoning_effort.value),)), profile, binding.profile_identity,
+            ))
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity,
+                **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
+            )
+            self.assertEqual(result.kind, DependencyReviewResultKind.BLOCKED)
+            expected = classify(
+                FailureBinding(
+                    binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                    "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                    binding.profile_identity, "session-116", "attempt-116",
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST,
+            )
+            record = read_durable_failure(repository, identity, expected.digest)
+            self.assertEqual((record.binding.role, record.failure), (FailureRole.DEPENDENCY_REVIEW, FailureClass.HOST_SECURITY_DENIAL))
+            budget = repository.root / "attempt-116-role-budget.sqlite"
+            def snapshot():
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    state = tuple(connection.execute("SELECT * FROM " + table).fetchall() for table in
+                                  ("dependency_review_attempts", "dependency_review_successors", "recovery_route_authorizations"))
+                with closing(sqlite3.connect(budget)) as connection:
+                    return state, connection.execute("SELECT * FROM role_budget_usage").fetchall()
+            before = snapshot()
+            for attempt_id in ("fresh-denied", "fresh-denied", "another-denied", "attempt-116"):
+                effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id=attempt_id)
+                effect["budget_ledger_path"] = budget
+                with self.assertRaisesRegex(Exception, "scope is stopped"):
+                    DependencyReviewService().run(
+                        repository, subset, attempt_id=attempt_id, binding=binding, adapter=adapter,
+                        checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None,
+                        task_identity=identity, **effect,
+                    )
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(len(backend.sessions), 1)
+
+    def test_pre_session_typed_denial_records_dispatch_bound_stop(self) -> None:
+        """A typed SDK denial before a session exists remains verified and durable."""
+
+        class DeniedBackend:
+            calls = 0
+            def open_fresh_session(self, _profile):
+                self.calls += 1
+                raise CodexAdapterError(CodexFailure.SANDBOX_OR_APPROVAL_DENIED)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            backend = DeniedBackend()
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="pre-session-denial", binding=binding,
+                adapter=adapter, checkpoint_session=lambda _: None,
+                checkpoint_turn=lambda *_: None,
+                **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="pre-session-denial"),
+            )
+            self.assertEqual((result.kind, result.failure, result.turn_identity, backend.calls), (
+                DependencyReviewResultKind.BLOCKED,
+                CodexFailure.SANDBOX_OR_APPROVAL_DENIED, None, 1,
+            ))
+            assert result.session_identity is not None
+            self.assertTrue(result.session_identity.startswith("pre-dispatch-dependency-review-"))
+            identity = self.task_identity()
+            expected = classify(
+                FailureBinding(
+                    binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                    "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                    binding.profile_identity, result.session_identity, "pre-session-denial",
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST,
+            )
+            self.assertEqual(read_durable_failure(repository, identity, expected.digest), expected)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                with self.assertRaisesRegex(FailureRecoveryError, "scope remains stopped"):
+                    require_scope_open(connection, identity.task_id, "dependency-review:" + identity.task_id)
+
+    def test_prepared_dependency_retry_denial_is_inert_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="denied-source", binding=binding)
+            store.claim_pre_dispatch(repository, attempt_id="denied-source", task_identity=identity, binding=binding)
+            store.claim_session(repository, attempt_id="denied-source", session_identity="denied-session", task_identity=identity, binding=binding)
+            store.record_blocked(repository, attempt_id="denied-source", output_digest="sha256:" + "a" * 64,
+                                 reason_code="provider-blocked", owner_route="prebound-transient-route")
+            subset = replace(subset, snapshot_id="prepared-subset", creation_reason="denial-retry")
+            store.start_attempt(repository, subset, attempt_id="prepared-retry", binding=binding, supersedes_attempt_id="denied-source")
+            record_durable_failure(repository, identity, classify(FailureBinding(
+                binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                binding.profile_identity, "denied-session", "denied-source"),
+                FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            def snapshot():
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    return tuple(connection.execute("SELECT * FROM " + table).fetchall() for table in
+                                 ("dependency_review_attempts", "dependency_review_successors", "recovery_route_authorizations"))
+            before = snapshot()
+            for _ in range(2):
+                backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+                adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+                effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id="prepared-retry")
+                with self.assertRaisesRegex(DependencyReviewDispatchError, "scope is stopped"):
+                    DependencyReviewService().run(repository, subset, attempt_id="prepared-retry", binding=binding,
+                        adapter=adapter, task_identity=identity, supersedes_attempt_id="denied-source",
+                        checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, **effect)
+                self.assertEqual(snapshot(), before)
+                self.assertEqual(backend.sessions, [])
+                self.assertFalse(effect["budget_ledger_path"].exists())
+
+    def test_recovery_route_fence_interruption_reconciles_before_successor_session(self) -> None:
+        """A successor restart clears a fence without a budget row before it opens a session."""
+
+        class OutageTurn(Turn):
+            def read_response(self):
+                raise CodexAdapterError(CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE)
+
+        class OutageSession(Session):
+            def start_turn(self, request):
+                self.requests.append(request)
+                return OutageTurn(self.response, self._turn_identity)
+
+        class OutageBackend(Backend):
+            def open_fresh_session(self, profile):
+                session = OutageSession(self.response, self.session_identity, self.turn_identity)
+                self.sessions.append(session)
+                return session
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            source_backend = OutageBackend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.BLOCKED,
+                failure=CodexFailure.TRANSPORT_OR_PROVIDER_OUTAGE,
+            ))
+            source = CodexDependencyReviewAdapter(source_backend, profile, audit)
+            source_result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=source,
+                checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity,
+                **self.effect_kwargs(repository, subset, binding, source, attempt_id="attempt-116"),
+            )
+            self.assertEqual((source_result.kind, source_result.reason_code), (
+                DependencyReviewResultKind.BLOCKED, "sdk-turn-failed",
+            ))
+            successor_subset = replace(subset, snapshot_id="subset-117", creation_reason="transient-retry")
+            successor_binding = DependencyReviewBinding(
+                successor_subset.candidate_sha, successor_subset.policy_digest,
+                successor_subset.configuration_digest, binding.profile_identity,
+            )
+            successor_backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-117"),
+            ))
+            successor = CodexDependencyReviewAdapter(successor_backend, profile, audit)
+            effect = self.effect_kwargs(
+                repository, successor_subset, successor_binding, successor, attempt_id="attempt-117",
+            )
+            original_begin = codex_dependency_review.begin_durable_recovery_route_reservation
+
+            def interrupt_after_fence(*args, **kwargs):
+                original_begin(*args, **kwargs)
+                raise RuntimeError("injected interruption after durable route fence")
+
+            with patch("roundwright.codex_dependency_review.begin_durable_recovery_route_reservation", side_effect=interrupt_after_fence):
+                with self.assertRaisesRegex(DependencyReviewDispatchError, "recovery route is unavailable"):
+                    DependencyReviewService().run(
+                        repository, successor_subset, attempt_id="attempt-117", binding=successor_binding,
+                        adapter=successor, checkpoint_session=lambda _session: None,
+                        checkpoint_turn=lambda _session, _turn: None, task_identity=identity,
+                        supersedes_attempt_id="attempt-116", **effect,
+                    )
+            self.assertEqual(successor_backend.sessions, [])
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM recovery_route_authorizations"
+                ).fetchall(), [("reserving",)])
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-117'"
+                ).fetchall(), [])
+            finally:
+                connection.close()
+            result = DependencyReviewService().run(
+                repository, successor_subset, attempt_id="attempt-117", binding=successor_binding,
+                adapter=successor, checkpoint_session=lambda _session: None,
+                checkpoint_turn=lambda _session, _turn: None, task_identity=identity,
+                supersedes_attempt_id="attempt-116", **effect,
+            )
+            self.assertEqual((result.kind, len(successor_backend.sessions)), (DependencyReviewResultKind.ACCEPTED, 1))
+            connection = sqlite3.connect(database_path(repository))
+            try:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM recovery_route_authorizations"
+                ).fetchall(), [("consumed",)])
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id = 'attempt-117'"
+                ).fetchall(), [("accepted",)])
+                route_digest, reservation = connection.execute("SELECT route_digest, reservation_digest FROM recovery_route_authorizations").fetchone()
+            finally:
+                connection.close()
+            authorization = read_durable_recovery_route_authorization(repository, identity, route_digest)
+            with self.assertRaisesRegex(Exception, "already admitted"):
+                release_durable_recovery_route_authorization(repository, identity, authorization, reservation_digest=reservation)
+
+    def test_restart_of_an_authoritative_session_claim_has_zero_later_provider_or_budget_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="attempt-116", binding=binding)
+            store.claim_session(repository, attempt_id="attempt-116", session_identity="session-116", task_identity=identity, binding=binding)
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116")
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity, **effect,
+            )
+            self.assertEqual((result.kind, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, 0))
+            self.assertFalse(effect["budget_ledger_path"].exists())
+
+    def test_unknown_predecessor_requires_reconciliation_before_successor_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            first_backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            first = CodexDependencyReviewAdapter(first_backend, profile, audit)
+            DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=first,
+                checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity, **self.effect_kwargs(repository, subset, binding, first, attempt_id="attempt-116"),
+            )
+            successor_subset = replace(subset, snapshot_id="subset-117", creation_reason="reconcile-retry")
+            successor_binding = DependencyReviewBinding(
+                successor_subset.candidate_sha, successor_subset.policy_digest,
+                successor_subset.configuration_digest, binding.profile_identity,
+            )
+            successor_backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-117")))
+            successor = CodexDependencyReviewAdapter(successor_backend, profile, audit)
+            effect = self.effect_kwargs(repository, successor_subset, successor_binding, successor, attempt_id="attempt-117")
+            with self.assertRaisesRegex(DependencyReviewDispatchError, "reconciliation is incomplete"):
+                DependencyReviewService().run(
+                    repository, successor_subset, attempt_id="attempt-117", binding=successor_binding, adapter=successor,
+                    checkpoint_session=lambda _session: None, checkpoint_turn=lambda _session, _turn: None,
+                    task_identity=identity, supersedes_attempt_id="attempt-116", **effect,
+                )
+            self.assertEqual(successor_backend.sessions, [])
+            self.assertFalse(effect["budget_ledger_path"].exists())
+
     def test_restart_after_persisted_session_claim_blocks_without_a_second_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository, subset, binding, profile, audit = self.setup(Path(temporary))
@@ -314,6 +646,407 @@ class DependencyReviewServiceTests(unittest.TestCase):
                 **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
             )
             self.assertEqual((result.kind, result.reason_code, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, "uncertain-provider-turn", 0))
+
+    def test_restart_after_pre_dispatch_claim_blocks_before_native_session_open(self) -> None:
+        """The native-session boundary is fenced even before it has an ID."""
+        class ProcessDeath(BaseException): pass
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116")
+            def run():
+                return DependencyReviewService().run(
+                    repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                    checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                    task_identity=identity, **effect,
+                )
+            original = backend.open_fresh_session
+            def die(profile):
+                original(profile)
+                raise ProcessDeath()
+            with patch.object(backend, "open_fresh_session", side_effect=die), self.assertRaises(ProcessDeath):
+                run()
+            self.assertEqual(len(backend.sessions), 1)
+            # A different incoming task or request must not recover this claim.
+            other_identity = replace(identity, task_id="task-other", source_id="source-other", branch="codex/other", worktree="C:/other")
+            other_lease = acquire_transition_lease(repository, repository_id=identity.repository_id, owner="dependency-review-tests", ttl_seconds=60)
+            admit_task(repository, other_identity, (SourceSnapshot(other_identity.source_id, identity.repository_id, "a" * 64),), lease=other_lease)
+            with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                connection.execute("INSERT INTO candidate_seals(task_id, base_sha, candidate_sha, state_identity) VALUES (?, ?, ?, ?)", (other_identity.task_id, other_identity.base_sha, binding.candidate_sha, "authority-other"))
+            record_runtime_binding(repository, other_identity, RuntimeBinding("roundwright-runtime/v1", binding.configuration_digest, digest("8"), (digest("9"),)))
+            for incoming_identity, incoming_subset in (
+                (other_identity, replace(subset, task_id=other_identity.task_id, snapshot_id="subset-other", source_digest="a" * 64)),
+                (identity, replace(subset, creation_reason="changed-request")),
+            ):
+                with self.subTest(task=incoming_identity.task_id), self.assertRaisesRegex(Exception, "recovery identity has drifted"):
+                    DependencyReviewService().run(repository, incoming_subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, task_identity=incoming_identity, **effect)
+                with closing(sqlite3.connect(database_path(repository))) as connection, connection:
+                    self.assertEqual(connection.execute("SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-116'").fetchone(), ("prepared",))
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM dependency_review_validation_outcomes").fetchone(), (0,))
+                self.assertEqual(len(backend.sessions), 1)
+            connection = sqlite3.connect(effect["budget_ledger_path"])
+            try:
+                before = connection.execute("SELECT * FROM role_budget_usage").fetchall()
+            finally:
+                connection.close()
+            result = DependencyReviewService().run(
+                repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                task_identity=identity, **effect,
+            )
+            self.assertEqual((result.kind, len(backend.sessions)), (DependencyReviewResultKind.AMBIGUOUS, 1))
+            connection = sqlite3.connect(effect["budget_ledger_path"])
+            try:
+                self.assertEqual(connection.execute("SELECT * FROM role_budget_usage").fetchall(), before)
+            finally:
+                connection.close()
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            with patch.object(DependencyReviewStore, "claim_pre_dispatch", side_effect=RuntimeError("claim write failed")), self.assertRaisesRegex(RuntimeError, "claim write failed"):
+                DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, task_identity=identity, **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"))
+            self.assertEqual(backend.sessions, [])
+
+    def test_initial_reservation_intent_recovers_before_and_after_preparation(self) -> None:
+        """Both initial crash windows reuse one debit and dispatch exactly once."""
+
+        class ProcessDeath(BaseException):
+            pass
+
+        for boundary in ("before-preparation", "after-preparation"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                repository, subset, binding, profile, audit = self.setup(Path(temporary))
+                backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+                adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+                effect = self.effect_kwargs(
+                    repository, subset, binding, adapter, attempt_id="intent-restart",
+                )
+                original = DependencyReviewStore.start_attempt
+
+                def interrupt(instance, *args, **kwargs):
+                    if boundary == "after-preparation":
+                        original(instance, *args, **kwargs)
+                    raise ProcessDeath()
+
+                with patch.object(
+                    DependencyReviewStore, "start_attempt", autospec=True,
+                    side_effect=interrupt,
+                ), self.assertRaises(ProcessDeath):
+                    DependencyReviewService().run(
+                        repository, subset, attempt_id="intent-restart", binding=binding,
+                        adapter=adapter, checkpoint_session=lambda _: None,
+                        checkpoint_turn=lambda *_: None, **effect,
+                    )
+                self.assertEqual(backend.sessions, [])
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT provider_role, state FROM provider_effect_reservation_intents "
+                        "WHERE attempt_id='intent-restart'"
+                    ).fetchone(), ("dependency-review", "reserving"))
+                    self.assertEqual(connection.execute(
+                        "SELECT state FROM dependency_review_attempts WHERE attempt_id='intent-restart'"
+                    ).fetchone(), None if boundary == "before-preparation" else ("prepared",))
+                with closing(sqlite3.connect(effect["budget_ledger_path"])) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), [(1, 60, 4000)])
+                result = DependencyReviewService().run(
+                    repository, subset, attempt_id="intent-restart", binding=binding,
+                    adapter=adapter, checkpoint_session=lambda _: None,
+                    checkpoint_turn=lambda *_: None, **effect,
+                )
+                self.assertEqual(result.kind, DependencyReviewResultKind.AMBIGUOUS)
+                self.assertEqual(len(backend.sessions), 1)
+                with closing(sqlite3.connect(effect["budget_ledger_path"])) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), [(1, 60, 4000)])
+                with closing(sqlite3.connect(database_path(repository))) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT 1 FROM provider_effect_reservation_intents "
+                        "WHERE attempt_id='intent-restart'"
+                    ).fetchone(), None)
+
+    def test_invalid_predecessor_cannot_mint_a_successor_session_or_budget(self) -> None:
+        for prior in ("invalid", "accepted", "missing", "ambiguous", "unverified-transient", "missing-outcome", "drifted-input"):
+            with self.subTest(predecessor=prior), tempfile.TemporaryDirectory() as temporary:
+                repository, subset, binding, profile, audit = self.setup(Path(temporary))
+                identity = self.bind_current_authority(repository, binding)
+                store = DependencyReviewStore()
+                if prior == "accepted":
+                    source = CodexDependencyReviewAdapter(Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116"))), profile, audit)
+                    result = DependencyReviewService().run(repository, subset, attempt_id="attempt-116", binding=binding, adapter=source, checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None, task_identity=identity, **self.effect_kwargs(repository, subset, binding, source, attempt_id="attempt-116"))
+                    self.assertEqual(result.kind, DependencyReviewResultKind.ACCEPTED)
+                elif prior != "missing":
+                    store.start_attempt(repository, subset, attempt_id="attempt-116", binding=binding)
+                    if prior in ("ambiguous", "unverified-transient"):
+                        store.record_blocked(repository, attempt_id="attempt-116", output_digest=digest("a"), reason_code="uncertain-provider-turn" if prior == "ambiguous" else "sdk-turn-failed", owner_route="reconcile-required" if prior == "ambiguous" else "prebound-transient-route")
+                    else:
+                        store.record_invalid(repository, attempt_id="attempt-116", output_digest=digest("a"), reason_code="malformed-response")
+                        if prior in ("missing-outcome", "drifted-input"):
+                            connection = sqlite3.connect(database_path(repository))
+                            try:
+                                if prior == "missing-outcome":
+                                    connection.execute("DELETE FROM dependency_review_validation_outcomes WHERE attempt_id='attempt-116'")
+                                else:
+                                    connection.execute("UPDATE dependency_review_attempts SET input_digest=? WHERE attempt_id='attempt-116'", (digest("f"),))
+                                connection.commit()
+                            finally:
+                                connection.close()
+                successor_subset = replace(subset, snapshot_id="subset-117", creation_reason="invalid-retry")
+                successor_binding = DependencyReviewBinding(successor_subset.candidate_sha, successor_subset.policy_digest, successor_subset.configuration_digest, binding.profile_identity)
+                backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-117")))
+                adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+                effect = self.effect_kwargs(repository, successor_subset, successor_binding, adapter, attempt_id="attempt-117")
+                with patch("roundwright.codex_dependency_review.reserve_role_effect") as reserve, self.assertRaises(DependencyReviewDispatchError):
+                    DependencyReviewService().run(
+                        repository, successor_subset, attempt_id="attempt-117", binding=successor_binding,
+                        adapter=adapter, checkpoint_session=lambda _: None, checkpoint_turn=lambda _session, _turn: None,
+                        task_identity=identity, supersedes_attempt_id="attempt-116", **effect,
+                    )
+                reserve.assert_not_called()
+                self.assertEqual(backend.sessions, [])
+                self.assertFalse(effect["budget_ledger_path"].exists())
+                connection = sqlite3.connect(database_path(repository))
+                try:
+                    self.assertIsNone(connection.execute("SELECT 1 FROM dependency_review_attempts WHERE attempt_id='attempt-117'").fetchone())
+                    self.assertEqual(connection.execute("SELECT * FROM dependency_review_successors").fetchall(), [])
+                finally:
+                    connection.close()
+
+    def test_restart_scope_denial_blocks_before_dependency_provider_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = TaskIdentity("task-116", "source-116", "repo-116", "codex/116", "C:/review-116", "a" * 40)
+            # Dependency review has its own durable attempt ledger, not a
+            # provider-attempt/context admission.  An unadmitted synthetic
+            # failure record must not become an authority-bearing scope stop.
+            with self.assertRaisesRegex(Exception, "admission"):
+                record_durable_failure(repository, identity, classify(FailureBinding(subset.candidate_sha, subset.policy_digest, subset.configuration_digest, "dependency-review:" + subset.task_id, FailureRole.DEPENDENCY_REVIEW, binding.profile_identity, "prior-session", "prior-attempt"), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST))
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            DependencyReviewStore().start_attempt(repository, subset, attempt_id="changed-attempt", binding=binding)
+            self.assertEqual(backend.sessions, [])
+
+    def test_scope_denial_after_initial_check_blocks_before_reservation_and_session(self) -> None:
+        """The serialized effect fence closes the initial-read race."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            effect = self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116")
+            with patch(
+                "roundwright.codex_dependency_review.require_scope_effect_admission",
+                side_effect=FailureRecoveryError("failure scope remains stopped"),
+            ), patch("roundwright.codex_dependency_review.reserve_role_effect") as reserve, self.assertRaisesRegex(
+                DependencyReviewDispatchError, "scope is stopped",
+            ):
+                DependencyReviewService().run(
+                    repository, subset, attempt_id="attempt-116", binding=binding,
+                    adapter=adapter, checkpoint_session=lambda _value: None,
+                    checkpoint_turn=lambda _session, _turn: None,
+                    task_identity=identity,
+                    **effect,
+                )
+            reserve.assert_not_called()
+            self.assertEqual(backend.sessions, [])
+            self.assertFalse(effect["budget_ledger_path"].exists())
+
+    def test_response_time_scope_denial_records_blocked_not_accepted_or_invalid(self) -> None:
+        """Proposal acceptance and the denial decision share one transaction."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116"),
+            ))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            original = Turn.read_response
+
+            def deny_after_read(turn):
+                response = original(turn)
+                record_durable_failure(
+                    repository, identity,
+                    classify(FailureBinding(
+                        binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                        "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                        binding.profile_identity, "session-116", "attempt-116",
+                    ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+                )
+                return response
+
+            with patch.object(Turn, "read_response", deny_after_read):
+                result = DependencyReviewService().run(
+                    repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                    checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None,
+                    task_identity=identity,
+                    **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
+                )
+            self.assertEqual((result.kind, result.reason_code), (DependencyReviewResultKind.BLOCKED, "scope-stopped"))
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-116'"
+                ).fetchone(), ("blocked",))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM dependency_review_proposals").fetchone(), (0,))
+                self.assertEqual(connection.execute(
+                    "SELECT outcome, reason_code FROM dependency_review_validation_outcomes WHERE attempt_id='attempt-116'"
+                ).fetchone(), ("blocked", "scope-stopped"))
+            restarted = DependencyReviewService().run
+            with self.assertRaises(DependencyReviewDispatchError):
+                restarted(
+                    repository, subset, attempt_id="attempt-116", binding=binding, adapter=adapter,
+                    checkpoint_session=lambda _: None, checkpoint_turn=lambda *_: None,
+                    task_identity=identity,
+                    **self.effect_kwargs(repository, subset, binding, adapter, attempt_id="attempt-116"),
+                )
+            self.assertEqual(len(backend.sessions), 1)
+
+    def test_acceptance_reconciliation_failure_is_not_reclassified_as_denial(self) -> None:
+        """Only ScopeAdmissionDenied can produce the scope-stopped terminal."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, profile, audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            backend = Backend(NativeDependencyReviewResponse(
+                DependencyReviewResultKind.ACCEPTED, self.proposal("attempt-116"),
+            ))
+            adapter = CodexDependencyReviewAdapter(backend, profile, audit)
+            with patch.object(
+                DependencyReviewStore, "accept_proposal",
+                side_effect=FailureRecoveryError("malformed recovery evidence"),
+            ), patch.object(DependencyReviewStore, "record_scope_denied") as denied, self.assertRaisesRegex(
+                FailureRecoveryError, "malformed recovery evidence",
+            ):
+                DependencyReviewService().run(
+                    repository, subset, attempt_id="attempt-116", binding=binding,
+                    adapter=adapter, checkpoint_session=lambda _: None,
+                    checkpoint_turn=lambda *_: None, task_identity=identity,
+                    **self.effect_kwargs(
+                        repository, subset, binding, adapter, attempt_id="attempt-116",
+                    ),
+                )
+            denied.assert_not_called()
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id='attempt-116'"
+                ).fetchone(), ("prepared",))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM dependency_review_validation_outcomes"
+                ).fetchone(), (0,))
+
+    def test_default_acceptance_derives_production_task_and_rechecks_stopped_scope_after_restart(self) -> None:
+        """Omitting the optional identity cannot bypass a durable production stop."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository, subset, binding, _profile, _audit = self.setup(Path(temporary))
+            identity = self.bind_current_authority(repository, binding)
+            store = DependencyReviewStore()
+            store.start_attempt(repository, subset, attempt_id="default-accept", binding=binding)
+            store.claim_pre_dispatch(
+                repository, attempt_id="default-accept",
+                task_identity=identity, binding=binding,
+            )
+            store.claim_session(
+                repository, attempt_id="default-accept", session_identity="default-session",
+                task_identity=identity, binding=binding,
+            )
+            store.claim_turn(
+                repository, attempt_id="default-accept",
+                session_identity="default-session", turn_identity="default-turn",
+            )
+            record_durable_failure(
+                repository, identity,
+                classify(FailureBinding(
+                    binding.candidate_sha, binding.policy_digest, binding.configuration_digest,
+                    "dependency-review:" + identity.task_id, FailureRole.DEPENDENCY_REVIEW,
+                    binding.profile_identity, "default-session", "default-accept",
+                ), FailureClass.HOST_SECURITY_DENIAL, EvidenceSource.VERIFIED_HOST),
+            )
+            proposal = DependencyProposal.parse(self.proposal("default-accept"))
+            for restarted in (store, DependencyReviewStore()):
+                with self.assertRaisesRegex(FailureRecoveryError, "scope remains stopped"):
+                    restarted.accept_proposal(repository, proposal, binding=binding)
+            with closing(sqlite3.connect(database_path(repository))) as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT state FROM dependency_review_attempts WHERE attempt_id='default-accept'"
+                ).fetchone(), ("prepared",))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM dependency_review_proposals WHERE attempt_id='default-accept'"
+                ).fetchone(), (0,))
+
+    def test_dependency_review_reservations_are_never_refundable_by_provider_release(self) -> None:
+        """Prepared, claimed, and accepted dependency effects stay outside the refund API."""
+
+        for terminal in ("prepared", "claimed", "accepted"):
+            with self.subTest(state=terminal), tempfile.TemporaryDirectory() as temporary:
+                repository, subset, binding, profile, audit = self.setup(Path(temporary))
+                identity = self.bind_current_authority(repository, binding)
+                adapter = CodexDependencyReviewAdapter(
+                    Backend(NativeDependencyReviewResponse(DependencyReviewResultKind.AMBIGUOUS)),
+                    profile, audit,
+                )
+                attempt_id = "release-" + terminal
+                effect = self.effect_kwargs(
+                    repository, subset, binding, adapter, attempt_id=attempt_id,
+                )
+                material = DependencyReviewStore().model_input(
+                    subset, attempt_id=attempt_id, profile_identity=binding.profile_identity,
+                )
+                request = DependencyReviewRequest(
+                    attempt_id, material,
+                    "sha256:" + hashlib.sha256(json.dumps(
+                        material, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                    ).encode("utf-8")).hexdigest(),
+                    binding.profile_identity,
+                )
+                request_material, preflight_material = adapter.effect_material(request)
+                reservation = reserve_role_effect(
+                    effect["advisory_execution"], host_inputs=effect["execution_host"],
+                    ledger_path=effect["budget_ledger_path"], profile=adapter._profile,
+                    request_or_attempt_identity=attempt_id,
+                    request_material=request_material, preflight_material=preflight_material,
+                )
+                store = DependencyReviewStore()
+                store.start_attempt(repository, subset, attempt_id=attempt_id, binding=binding)
+                if terminal in {"claimed", "accepted"}:
+                    store.claim_pre_dispatch(
+                        repository, attempt_id=attempt_id,
+                        task_identity=identity, binding=binding,
+                    )
+                if terminal == "accepted":
+                    store.claim_session(
+                        repository, attempt_id=attempt_id, session_identity="release-session",
+                        task_identity=identity, binding=binding,
+                    )
+                    store.claim_turn(
+                        repository, attempt_id=attempt_id,
+                        session_identity="release-session", turn_identity="release-turn",
+                    )
+                    store.accept_proposal(
+                        repository, DependencyProposal.parse(self.proposal(attempt_id)),
+                        binding=binding,
+                        observed_session_identity="release-session",
+                        observed_turn_identity="release-turn",
+                        observed_output_digest=DependencyProposal.parse(
+                            self.proposal(attempt_id)
+                        ).proposal_digest,
+                    )
+                with self.assertRaisesRegex(FailureRecoveryError, "reservation has drifted"):
+                    release_unused_provider_effect_reservation(
+                        repository, identity, "dependency-review:" + identity.task_id,
+                        attempt_id=attempt_id, effect_reservation=reservation,
+                    )
+                with closing(sqlite3.connect(effect["budget_ledger_path"])) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT calls, duration_seconds, tokens FROM role_budget_usage"
+                    ).fetchall(), [(1, 60, 4000)])
 
     def test_digit_leading_native_ids_persist_the_exact_durable_turn_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -514,7 +1247,7 @@ class ProductionActivationTests(unittest.TestCase):
     def test_missing_external_root_denies_before_input_construction(self) -> None:
         with self.assertRaisesRegex(DependencyReviewDispatchError, "activation is unavailable"):
             prepare_dependency_review_host(
-                None, None, None, None, advisory_execution=None,
+                None, None, None, None, None, advisory_execution=None,
                 execution_host=None, budget_ledger_path=None,
             )  # type: ignore[arg-type]
 

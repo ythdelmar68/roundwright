@@ -1988,11 +1988,16 @@ def _require_persisted_health_authorization(
     require_trusted_receipt: bool = False,
 ) -> str:
     # Acceptance and complete-dispatch callers opt into comparing the durable
-    # row with the original receipt carried by their trusted recovery context.
-    # Terminal replay deliberately validates the sealed durable authorization
-    # without reapplying a later caller's availability/role decision.
+    # row with the original receipt when their recovery context carries one.
+    # Legacy contexts without external health evidence retain sealed-row
+    # validation, and terminal replay does not reapply a later caller's
+    # availability/role decision.
     trusted_values = None
-    if require_trusted_receipt:
+    health_values = (
+        context.health_contract_commit, context.shadow_case_id,
+        context.health_receipt,
+    )
+    if require_trusted_receipt and any(value is not None for value in health_values):
         trusted_receipt = _require_health_authorization(
             context, role, profile_identity, observed,
         )

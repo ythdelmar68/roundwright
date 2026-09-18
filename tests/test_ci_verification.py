@@ -515,10 +515,10 @@ class CiVerificationTests(unittest.TestCase):
         include:
           - os: ubuntu-latest
             python: "3.12"
-            timeout_minutes: 20
+            timeout_minutes: 35
           - os: macos-latest
             python: "3.12"
-            timeout_minutes: 35
+            timeout_minutes: 45
           - os: windows-latest
             python: "3.12"
             timeout_minutes: 90
